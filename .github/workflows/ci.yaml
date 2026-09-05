@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+      - run: zig fmt --check .
+      - run: zig build test --summary all
+      - run: zig build
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+      - name: Fuzz
+        run: |
+          timeout 300 zig build test --fuzz || code=$?
+          # The fuzzer never exits on its own; 124 means the time budget
+          # elapsed without a crash.
+          if [ "${code:-0}" -eq 124 ]; then exit 0; fi
+          exit "${code:-0}"
