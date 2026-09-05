@@ -1,71 +1,65 @@
-const std = @import("std");
-const Io = std.Io;
-
-const mdr = @import("mdr");
+//! Demo CLI: parses stdin (or a file given as the first argument) and prints
+//! each block-level element with its inline spans.
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
+    const io = init.io;
     const arena: std.mem.Allocator = init.arena.allocator();
 
-    // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+
+    var reader_buffer: [4096]u8 = undefined;
+    var file_reader: Io.File.Reader = undefined;
+    if (args.len > 1) {
+        const file = try Io.Dir.cwd().openFile(io, args[1], .{});
+        file_reader = .init(file, io, &reader_buffer);
+    } else {
+        file_reader = .init(.stdin(), io, &reader_buffer);
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    var doc = try mdr.Document.parse(&file_reader.interface, arena);
+    defer doc.deinit();
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    const stdout = &stdout_file_writer.interface;
 
-    try mdr.printAnotherMessage(stdout_writer);
+    while (doc.next()) |elem| {
+        switch (elem) {
+            .header => |h| {
+                try stdout.print("header h{d}: \"{s}\"\n", .{ h.level, h.content });
+                try printSpans(stdout, h.spans());
+            },
+            .paragraph => |p| {
+                try stdout.print("paragraph: \"{s}\"\n", .{p.content});
+                try printSpans(stdout, p.spans());
+            },
+            .code_block => |cb| {
+                if (cb.info) |info| {
+                    try stdout.print("code_block [{s}]: \"{s}\"\n", .{ info, cb.content });
+                } else {
+                    try stdout.print("code_block: \"{s}\"\n", .{cb.content});
+                }
+            },
+            .thematic_break => try stdout.print("thematic_break\n", .{}),
+        }
+    }
 
-    try stdout_writer.flush(); // Don't forget to flush!
+    try stdout.flush();
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+fn printSpans(stdout: *Io.Writer, spans: mdr.Document.Spans) !void {
+    var it = spans;
+    while (it.next()) |span| {
+        switch (span) {
+            inline else => |content, tag| try stdout.print("  {s}: \"{s}\"\n", .{ @tagName(tag), content }),
+        }
+    }
 }
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
+const std = @import("std");
+const Io = std.Io;
+const mdr = @import("mdr");
 
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+test {
+    _ = mdr;
 }

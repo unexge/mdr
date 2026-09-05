@@ -20,6 +20,7 @@ Make sure to run all after each change:
 
 ## Style
 - Keep regular imports at the end of the file just before tests, and keep test-only imports at the very end of the file
+  - Keep all testing utils after `test` blocks just before test-only imports
 - Import repeated functions or modules, like import `std.mem`, `std.testing`, `std.Io`, or `std.debug.assert` instead of fully qualifying
 - For struct-style files, like `Document.zig`, keep the struct at top-level
   - `const Document = @import("Document.zig")` instead of `@import("Document.zig").Document`
