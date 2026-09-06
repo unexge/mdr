@@ -77,38 +77,55 @@ pub fn defineVirtualPlacements(tty: *Io.Writer, placements: []const VirtualPlace
 pub fn syncPlacements(tty: *Io.Writer, previous: []const Placement, current: []const Placement) !void {
     if (!placementsChanged(previous, current)) return;
 
+    var removed: usize = 0;
+    for (previous) |old| {
+        for (current) |new| {
+            if (new.image_id == old.image_id) break;
+        } else removed += 1;
+    }
+    var changed: usize = 0;
+    for (current) |new| {
+        for (previous) |old| {
+            if (old.image_id == new.image_id) {
+                if (!old.eql(new)) changed += 1;
+                break;
+            }
+        } else changed += 1;
+    }
+    const replace_all = 1 + current.len < removed + 2 * changed;
+
     try tty.writeAll("\x1b[?2026h");
     errdefer {
         tty.writeAll("\x1b[?2026l") catch {};
         tty.flush() catch {};
     }
-    for (previous) |old| {
-        for (current) |new| {
-            if (new.image_id == old.image_id) break;
-        } else {
-            try tty.print(
-                "\x1b_Ga=d,d=i,i={d},q=2\x1b\\",
-                .{old.image_id},
-            );
+    if (replace_all) {
+        try tty.writeAll("\x1b_Ga=d,d=a,q=2\x1b\\");
+    } else {
+        for (previous) |old| {
+            for (current) |new| {
+                if (new.image_id == old.image_id) break;
+            } else {
+                try tty.print(
+                    "\x1b_Ga=d,d=i,i={d},q=2\x1b\\",
+                    .{old.image_id},
+                );
+            }
         }
     }
     for (current) |new| {
         const unchanged = for (previous) |old| {
             if (old.image_id == new.image_id) break old.eql(new);
         } else false;
-        if (unchanged) continue;
+        if (unchanged and !replace_all) continue;
 
-        try tty.print(
-            "\x1b_Ga=d,d=i,i={d},q=2\x1b\\",
-            .{new.image_id},
-        );
-        try tty.print(
-            "\x1b[{d};1H\x1b_Ga=p,i={d},p={d},q=2",
-            .{ new.row + 1, new.image_id, new.image_id },
-        );
-        if (new.source_y) |y| try tty.print(",y={d}", .{y});
-        if (new.source_height) |height| try tty.print(",h={d}", .{height});
-        try tty.print(",r={d},c={d},C=1\x1b\\", .{ new.rows, new.cols });
+        if (!replace_all) {
+            try tty.print(
+                "\x1b_Ga=d,d=i,i={d},q=2\x1b\\",
+                .{new.image_id},
+            );
+        }
+        try writePlacement(tty, new);
     }
     try tty.writeAll("\x1b[?2026l");
     try tty.flush();
@@ -158,6 +175,16 @@ const row_graphemes = [_][]const u8{
 
 fn idColor(image_id: u32) vaxis.Color {
     return .rgbFromUint(@truncate(image_id));
+}
+
+fn writePlacement(tty: *Io.Writer, placement: Placement) !void {
+    try tty.print(
+        "\x1b[{d};1H\x1b_Ga=p,i={d},p={d},q=2",
+        .{ placement.row + 1, placement.image_id, placement.image_id },
+    );
+    if (placement.source_y) |y| try tty.print(",y={d}", .{y});
+    if (placement.source_height) |height| try tty.print(",h={d}", .{height});
+    try tty.print(",r={d},c={d},C=1\x1b\\", .{ placement.rows, placement.cols });
 }
 
 fn placementsChanged(previous: []const Placement, current: []const Placement) bool {
@@ -252,6 +279,30 @@ test "stable placements update only when their layout changes" {
         writer.buffered(),
     );
     try expectQuietGraphicsCommands(writer.buffered());
+}
+
+test "stable placements batch viewport-wide changes" {
+    var buffer: [1024]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    const previous = [_]Placement{
+        .{ .image_id = 1, .row = 2, .rows = 2, .cols = 5 },
+        .{ .image_id = 2, .row = 6, .rows = 2, .cols = 5 },
+    };
+    const current = [_]Placement{
+        .{ .image_id = 1, .row = 1, .rows = 2, .cols = 5 },
+        .{ .image_id = 2, .row = 5, .rows = 2, .cols = 5 },
+    };
+
+    try syncPlacements(&writer, &previous, &current);
+
+    try testing.expectEqualStrings(
+        "\x1b[?2026h" ++
+            "\x1b_Ga=d,d=a,q=2\x1b\\" ++
+            "\x1b[2;1H\x1b_Ga=p,i=1,p=1,q=2,r=2,c=5,C=1\x1b\\" ++
+            "\x1b[6;1H\x1b_Ga=p,i=2,p=2,q=2,r=2,c=5,C=1\x1b\\" ++
+            "\x1b[?2026l",
+        writer.buffered(),
+    );
 }
 
 test "fuzz Kitty command framing" {
