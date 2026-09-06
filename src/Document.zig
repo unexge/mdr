@@ -12,7 +12,7 @@
 //! in the library; `init` borrows text already in memory. Markdown has no
 //! syntax errors, so parsing cannot fail.
 //!
-//! Not supported yet: indented code blocks, HTML and inline or reference
+//! Not supported yet: HTML and inline or reference
 //! images. Standalone direct images are block elements. Container nesting
 //! deeper than 8 levels degrades to plain text.
 
@@ -116,8 +116,12 @@ pub const Element = union(enum) {
         /// `lines` for the stripped, verbatim lines.
         content: []const u8,
         chain: Chain = .{},
+        /// Indented blocks pre-strip their first line; the chain carries
+        /// the remaining four-column strip for continuation lines.
+        indented: bool = false,
 
         pub fn lines(self: CodeBlock) LineIterator {
+            if (self.indented) return .{ .remaining = self.content, .chain = self.chain, .first = true };
             return .{ .remaining = self.content, .chain = self.chain, .first = false };
         }
     };
@@ -326,6 +330,8 @@ pub const Blocks = struct {
             const line = chainLine(self.chain, text, self.cursor, self.end, first);
             first = false;
             const extra = leadingSpaces(line.content);
+            // Four spaces indent code; nothing else here can start that deep.
+            if (extra >= 4) return self.parseIndentedCode(line);
             if (extra <= 3) {
                 const body = line.content[extra..];
                 if (parseAtxHeader(body)) |header| {
@@ -469,6 +475,32 @@ pub const Blocks = struct {
             .info = fence.info,
             .content = text[content_start..content_end],
             .chain = self.chain,
+        } };
+    }
+
+    fn parseIndentedCode(self: *Blocks, first: Line) Element {
+        const text = self.text;
+        const content_start = first.start + 4;
+        var content_end = first.raw_end;
+        var end_cursor = first.next;
+        var scan = first.next;
+        while (scan < self.end) {
+            const line = chainLine(self.chain, text, scan, self.end, false);
+            if (isBlankLine(line.content)) {
+                scan = line.next;
+                continue;
+            }
+            if (leadingSpaces(line.content) < 4) break;
+            content_end = line.raw_end;
+            end_cursor = line.next;
+            scan = line.next;
+        }
+        self.cursor = end_cursor;
+        return .{ .code_block = .{
+            .info = null,
+            .content = text[content_start..content_end],
+            .chain = self.chain.push(.{ .spaces = 4 }) orelse self.chain,
+            .indented = true,
         } };
     }
 
@@ -2183,6 +2215,47 @@ test "code fence edge cases" {
     try testing.expect(doc3.next().?.paragraph.content.len > 0);
 }
 
+test "indented code blocks" {
+    var doc = Document.init("    code\n      deeper\n\n    more\n");
+    const cb = doc.next().?.code_block;
+    try testing.expect(cb.info == null);
+    var lines = cb.lines();
+    try testing.expectEqualStrings("code", lines.next().?);
+    try testing.expectEqualStrings("  deeper", lines.next().?);
+    try testing.expectEqualStrings("", lines.next().?);
+    try testing.expectEqualStrings("more", lines.next().?);
+    try testing.expect(lines.next() == null);
+    try testing.expect(doc.next() == null);
+}
+
+test "indented code needs a blank line after paragraphs" {
+    var doc = Document.init("para\n    still para\n");
+    try testing.expectEqualStrings("para\n    still para", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+
+    var doc2 = Document.init("para\n\n    code\n");
+    try testing.expectEqualStrings("para", doc2.next().?.paragraph.content);
+    var cb_lines = doc2.next().?.code_block.lines();
+    try testing.expectEqualStrings("code", cb_lines.next().?);
+    try testing.expect(doc2.next() == null);
+}
+
+test "indented code in containers" {
+    var doc = Document.init("- a\n\n      code\n");
+    var items = doc.next().?.list.items;
+    var blocks = items.next().?.blocks;
+    try testing.expectEqualStrings("a", blocks.next().?.paragraph.content);
+    var lines = blocks.next().?.code_block.lines();
+    try testing.expectEqualStrings("code", lines.next().?);
+    try testing.expect(lines.next() == null);
+
+    var quote = Document.init(">     code\n");
+    var qblocks = quote.next().?.block_quote.blocks;
+    var qlines = qblocks.next().?.code_block.lines();
+    try testing.expectEqualStrings("code", qlines.next().?);
+    try testing.expect(qlines.next() == null);
+}
+
 test "bullet lists" {
     var doc = Document.init("- one\n- two\n\nafter\n");
     const list = doc.next().?.list;
@@ -3019,6 +3092,8 @@ pub const fuzz_corpus = [_][]const u8{
     "<https://example.com/?a=1&b=2>\n",
     "<user@example.com>\n",
     "<div>not autolink</div>\n",
+    "    indented\n    code\n",
+    "para\n\n    code after blank\n",
 };
 
 pub const fuzz_tokens = [_][]const u8{
