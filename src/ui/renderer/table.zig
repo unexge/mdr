@@ -1,5 +1,6 @@
-//! Tables: equal-width columns with ASCII `|` borders and a `-` separator
-//! row under the header. Cell text wraps through the shared text layout.
+//! Tables: content-weighted columns with ASCII `|` borders and a `-`
+//! separator row under the header. Cell text wraps through the shared
+//! text layout, honoring each column's alignment.
 
 /// One walk measures (null window: no writes, no clipping, no skipping)
 /// and renders, returning the row after the last content row.
@@ -8,7 +9,7 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
     if (ncols == 0 or ncols > Document.max_table_cols) return start_row;
     const cols_width: usize = if (win) |w| w.width else width;
     var widths: [Document.max_table_cols]usize = undefined;
-    computeWidths(cols_width, ncols, widths[0..ncols]);
+    computeWidths(cols_width, table, widths[0..ncols]);
     var borders: [Document.max_table_cols + 1]usize = undefined;
     var cells_x: [Document.max_table_cols]usize = undefined;
     borders[0] = 0;
@@ -36,7 +37,7 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
     const w = win.?;
     var row = start_row;
     var skip_rows = skip;
-    row = renderRow(w, header_cells[0..@min(header_count, ncols)], ncols, widths[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
+    row = renderRow(w, header_cells[0..@min(header_count, ncols)], ncols, widths[0..ncols], table.aligns[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
     if (row >= w.height) return row;
     if (skip_rows > 0) {
         skip_rows -= 1;
@@ -49,12 +50,12 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
     while (lines.next()) |line| {
         if (row >= w.height) break;
         const n = Document.splitCells(line, &buf);
-        row = renderRow(w, buf[0..@min(n, ncols)], ncols, widths[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
+        row = renderRow(w, buf[0..@min(n, ncols)], ncols, widths[0..ncols], table.aligns[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
     }
     return row;
 }
 
-fn renderRow(w: vaxis.Window, cells: [][]const u8, ncols: usize, widths: []usize, cells_x: []usize, borders: []usize, row: usize, skip_rows: *usize) usize {
+fn renderRow(w: vaxis.Window, cells: [][]const u8, ncols: usize, widths: []usize, aligns: []const Document.Alignment, cells_x: []usize, borders: []usize, row: usize, skip_rows: *usize) usize {
     const height = rowHeight(cells, ncols, widths);
     if (skip_rows.* >= height) {
         skip_rows.* -= height;
@@ -81,7 +82,7 @@ fn renderRow(w: vaxis.Window, cells: [][]const u8, ncols: usize, widths: []usize
             .width = @intCast(widths[i]),
             .height = w.height -| @as(u16, @intCast(row)),
         });
-        _ = text.layout(inner, cell, .{}, 0, cell_skip, widths[i], .{});
+        _ = text.layout(inner, cell, .{}, 0, cell_skip, widths[i], .{}, aligns[i]);
     }
     return row + visible;
 }
@@ -110,11 +111,54 @@ fn rowHeight(cells: [][]const u8, ncols: usize, widths: []usize) usize {
     return height;
 }
 
-fn computeWidths(width: usize, ncols: usize, out: []usize) void {
+fn computeWidths(width: usize, table: Document.Element.Table, out: []usize) void {
+    const ncols = table.ncols;
+    if (ncols == 0) return;
     const avail = width -| (3 * ncols + 1);
-    const base = avail / ncols;
-    const rem = avail % ncols;
-    for (out, 0..) |*w, i| w.* = @max(1, base + @intFromBool(i < rem));
+    var desired: [Document.max_table_cols]usize = undefined;
+    for (0..ncols) |i| desired[i] = 1;
+    var buf: [Document.max_table_cols][]const u8 = undefined;
+    const hn = Document.splitCells(table.header, &buf);
+    for (buf[0..@min(hn, ncols)], 0..) |cell, i| desired[i] = @max(desired[i], contentWidth(cell));
+    var lines = Document.LineIterator{ .remaining = table.body, .chain = table.chain, .first = false };
+    while (lines.next()) |line| {
+        const n = Document.splitCells(line, &buf);
+        for (buf[0..@min(n, ncols)], 0..) |cell, i| desired[i] = @max(desired[i], contentWidth(cell));
+    }
+    const fair = avail / ncols;
+    var used: usize = 0;
+    for (0..ncols) |i| {
+        out[i] = @min(desired[i], fair);
+        used += out[i];
+    }
+    const leftover = avail -| used;
+    const base = leftover / ncols;
+    const rem = leftover % ncols;
+    for (0..ncols) |i| out[i] = @max(1, out[i] + base + @intFromBool(i < rem));
+}
+
+/// Display width of a cell with markup removed, so weighting follows the
+/// rendered text rather than the source bytes.
+fn contentWidth(cell: []const u8) usize {
+    var width: usize = 0;
+    var spans = Document.Spans.init(cell);
+    while (spans.next()) |span| {
+        switch (span) {
+            .text => |t| width += gwidth(t),
+            .code => |t| width += gwidth(t),
+            .entity => |raw| {
+                var buf: [4]u8 = undefined;
+                width += gwidth(Document.decodeEntity(raw, &buf) orelse raw);
+            },
+            .escape => width += 1,
+            else => {},
+        }
+    }
+    return width;
+}
+
+fn gwidth(s: []const u8) usize {
+    return vaxis.gwidth.gwidth(s, .unicode);
 }
 
 const border_style: vaxis.Style = .{ .fg = .{ .index = 8 } };
@@ -168,6 +212,87 @@ test "renders borders and cell text" {
     try testing.expectEqualStrings("a", win.readCell(2, 0).?.char.grapheme);
     try testing.expectEqualStrings("-", win.readCell(1, 1).?.char.grapheme);
     try testing.expectEqualStrings("c", win.readCell(2, 2).?.char.grapheme);
+}
+
+test "weights columns by content" {
+    const table: Document.Element.Table = .{
+        .ncols = 2,
+        .aligns = [_]Document.Alignment{.left} ** Document.max_table_cols,
+        .header = "name | age",
+        .body = "Alice | 30",
+    };
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 3,
+        .screen = &screen,
+    };
+    const end = layout(win, table, 0, 0, win.width);
+    try testing.expectEqual(@as(usize, 3), end);
+    try testing.expectEqualStrings("A", win.readCell(2, 2).?.char.grapheme);
+    try testing.expectEqualStrings("3", win.readCell(13, 2).?.char.grapheme);
+}
+
+test "weighting ignores markup" {
+    const table: Document.Element.Table = .{
+        .ncols = 2,
+        .aligns = [_]Document.Alignment{.left} ** Document.max_table_cols,
+        .header = "*ab* | cdef",
+        .body = "",
+    };
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 2, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 2,
+        .screen = &screen,
+    };
+    _ = layout(win, table, 0, 0, win.width);
+    try testing.expectEqualStrings("c", win.readCell(11, 0).?.char.grapheme);
+}
+
+test "renders column alignment" {
+    var right_aligns = [_]Document.Alignment{.left} ** Document.max_table_cols;
+    right_aligns[0] = .right;
+    const right: Document.Element.Table = .{
+        .ncols = 1,
+        .aligns = right_aligns,
+        .header = "b",
+        .body = "",
+    };
+    var center_aligns = [_]Document.Alignment{.left} ** Document.max_table_cols;
+    center_aligns[0] = .center;
+    const center: Document.Element.Table = .{
+        .ncols = 1,
+        .aligns = center_aligns,
+        .header = "b",
+        .body = "",
+    };
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 4, .cols = 10, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 10,
+        .height = 4,
+        .screen = &screen,
+    };
+    _ = layout(win, right, 0, 0, win.width);
+    try testing.expectEqualStrings("|", win.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqualStrings("b", win.readCell(7, 0).?.char.grapheme);
+    _ = layout(win, center, 2, 0, win.width);
+    try testing.expectEqualStrings("b", win.readCell(4, 2).?.char.grapheme);
 }
 
 const testing = std.testing;

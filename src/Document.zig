@@ -1978,6 +1978,34 @@ test "table delimiter mismatch stays a paragraph" {
     try testing.expectEqual(@as(u8, 2), setext.next().?.header.level);
 }
 
+test "tables inside block quotes" {
+    var doc = Document.init("> | a | b |\n> |---|---|\n> | c | d |\n");
+    var blocks = doc.next().?.block_quote.blocks;
+    const table = blocks.next().?.table;
+    try testing.expectEqual(@as(usize, 2), table.ncols);
+    var lines = LineIterator{ .remaining = table.body, .chain = table.chain, .first = false };
+    try testing.expectEqualStrings("| c | d |", lines.next().?);
+    try testing.expect(lines.next() == null);
+    try testing.expect(blocks.next() == null);
+    try testing.expect(doc.next() == null);
+}
+
+test "tables inside lists" {
+    var doc = Document.init("- | a |\n  |---|\n  | b |\n");
+    const list = doc.next().?.list;
+    var items = list.items;
+    const item = items.next().?;
+    var blocks = item.blocks;
+    const table = blocks.next().?.table;
+    try testing.expectEqual(@as(usize, 1), table.ncols);
+    var lines = LineIterator{ .remaining = table.body, .chain = table.chain, .first = false };
+    try testing.expectEqualStrings("| b |", lines.next().?);
+    try testing.expect(lines.next() == null);
+    try testing.expect(blocks.next() == null);
+    try testing.expect(items.next() == null);
+    try testing.expect(doc.next() == null);
+}
+
 test "block quotes" {
     var doc = Document.init("> # Title\n> para\n>\n> more\n\nafter\n");
     const quote = doc.next().?.block_quote;

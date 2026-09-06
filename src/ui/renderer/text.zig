@@ -7,6 +7,9 @@
 /// word) flush early and may split mid-word.
 const max_word_pieces = 16;
 const max_style_depth = 8;
+/// Buffered cells per line when aligning center/right; wider lines fall
+/// back to left alignment for the overflowed remainder.
+const max_line_cells = 256;
 
 /// Entity decoding produces bytes that are not in the source text, and
 /// cells hold grapheme slices: decoded text is copied into this frame-
@@ -27,19 +30,20 @@ fn frameCopy(bytes: []const u8) ?[]const u8 {
 }
 
 pub fn measure(content: []const u8, width: usize, chain: Document.Chain) usize {
-    return layout(null, content, .{}, 0, 0, width, chain);
+    return layout(null, content, .{}, 0, 0, width, chain, .left);
 }
 
 pub fn render(win: vaxis.Window, content: []const u8, base: vaxis.Style, start_row: usize, skip: usize, chain: Document.Chain) usize {
-    return layout(win, content, base, start_row, skip, win.width, chain);
+    return layout(win, content, base, start_row, skip, win.width, chain, .left);
 }
 
-pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_row: usize, skip: usize, width: usize, chain: Document.Chain) usize {
+pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_row: usize, skip: usize, width: usize, chain: Document.Chain, alignment: Document.Alignment) usize {
     var lay: Lay = .{
         .win = win,
         .width = @max(width, 1),
         .row = start_row,
         .skip = skip,
+        .alignment = alignment,
     };
     lay.styles[0] = base;
     lay.depth = 1;
@@ -115,6 +119,7 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
         }
     }
     lay.flushWord();
+    lay.flushLine();
     if (lay.clipped() or lay.skip > 0) return lay.row;
     // The row counter only advances on breaks; count the drawn final line.
     return lay.row + @intFromBool(lay.col > 0);
@@ -129,16 +134,27 @@ const Piece = struct {
     style: vaxis.Style,
 };
 
+const LineCell = struct {
+    text: []const u8,
+    style: vaxis.Style,
+    width: usize,
+};
+
 const Lay = struct {
     win: ?vaxis.Window,
     width: usize,
     row: usize,
     skip: usize,
+    alignment: Document.Alignment = .left,
     col: usize = 0,
     pending_space: bool = false,
     pieces: [max_word_pieces]Piece = undefined,
     piece_count: usize = 0,
     word_width: usize = 0,
+    line: [max_line_cells]LineCell = undefined,
+    line_count: usize = 0,
+    line_width: usize = 0,
+    line_plain: bool = false,
     styles: [max_style_depth]vaxis.Style = undefined,
     depth: usize = 0,
 
@@ -161,6 +177,7 @@ const Lay = struct {
     }
 
     fn lineBreak(self: *Lay) void {
+        self.flushLine();
         if (self.skip > 0) {
             self.skip -= 1;
         } else {
@@ -170,17 +187,84 @@ const Lay = struct {
         self.pending_space = false;
     }
 
+    /// Writes the buffered line at its aligned offset; skipped, empty and
+    /// left-aligned lines need no work. Row and column accounting already
+    /// happened in `put`, so measuring never depends on this.
+    fn flushLine(self: *Lay) void {
+        defer {
+            self.line_count = 0;
+            self.line_width = 0;
+            self.line_plain = false;
+        }
+        if (self.line_plain or self.skip > 0 or self.alignment == .left) return;
+        const win = self.win orelse return;
+        if (self.row >= win.height or self.line_count == 0) return;
+        var x: usize = switch (self.alignment) {
+            .left => 0,
+            .center => (self.width -| self.line_width) / 2,
+            .right => self.width -| self.line_width,
+        };
+        for (self.line[0..self.line_count]) |c| {
+            win.writeCell(@intCast(x), @intCast(self.row), .{
+                .char = .{ .grapheme = c.text, .width = @intCast(c.width) },
+                .style = c.style,
+            });
+            x += c.width;
+        }
+    }
+
+    /// Overflow fallback: lines wider than the buffer flush left-aligned
+    /// and the rest of the line writes straight through.
+    fn flushLineLeft(self: *Lay) void {
+        if (self.win) |win| {
+            if (self.row < win.height) {
+                var x: usize = 0;
+                for (self.line[0..self.line_count]) |c| {
+                    win.writeCell(@intCast(x), @intCast(self.row), .{
+                        .char = .{ .grapheme = c.text, .width = @intCast(c.width) },
+                        .style = c.style,
+                    });
+                    x += c.width;
+                }
+            }
+        }
+        self.line_count = 0;
+        self.line_width = 0;
+        self.line_plain = true;
+    }
+
     fn put(self: *Lay, g: []const u8, style: vaxis.Style) void {
         const w = gwidth(g);
         if (w == 0) return;
         if (self.col + w > self.width) self.lineBreak();
-        if (self.skip == 0 and self.win != null and self.row < self.win.?.height) {
-            self.win.?.writeCell(@intCast(self.col), @intCast(self.row), .{
-                .char = .{ .grapheme = g, .width = @intCast(w) },
-                .style = style,
-            });
-        }
+        if (self.skip == 0) self.write(g, style, w);
         self.col += w;
+    }
+
+    fn write(self: *Lay, g: []const u8, style: vaxis.Style, w: usize) void {
+        const win = self.win orelse return;
+        if (self.alignment == .left or self.line_plain) {
+            if (self.row < win.height) {
+                win.writeCell(@intCast(self.col), @intCast(self.row), .{
+                    .char = .{ .grapheme = g, .width = @intCast(w) },
+                    .style = style,
+                });
+            }
+            return;
+        }
+        if (self.line_count >= max_line_cells) self.flushLineLeft();
+        if (self.line_plain) {
+            if (self.row < win.height) {
+                win.writeCell(@intCast(self.col), @intCast(self.row), .{
+                    .char = .{ .grapheme = g, .width = @intCast(w) },
+                    .style = style,
+                });
+            }
+            return;
+        }
+        self.line[self.line_count] = .{ .text = g, .style = style, .width = w };
+        self.line_count += 1;
+        self.line_width += w;
     }
 
     /// Writes graphemes directly, wrapping mid-word when needed.
@@ -293,6 +377,27 @@ test "spaces survive span boundaries" {
 test "line breaks and entities occupy rows" {
     try testing.expectEqual(@as(usize, 2), measure("end  \nnext", 40, .{}));
     try testing.expectEqual(@as(usize, 1), measure("&amp;", 40, .{}));
+}
+
+test "renders center and right alignment" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 4, .cols = 10, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 10,
+        .height = 4,
+        .screen = &screen,
+    };
+
+    _ = layout(win, "ab", .{}, 0, 0, 10, .{}, .center);
+    try testing.expectEqualStrings("a", win.readCell(4, 0).?.char.grapheme);
+    _ = layout(win, "ab", .{}, 1, 0, 10, .{}, .right);
+    try testing.expectEqualStrings("a", win.readCell(8, 1).?.char.grapheme);
+    _ = layout(win, "aa bb cc", .{}, 2, 0, 5, .{}, .center);
+    try testing.expectEqualStrings("c", win.readCell(1, 3).?.char.grapheme);
 }
 
 const testing = std.testing;

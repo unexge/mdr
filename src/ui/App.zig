@@ -433,6 +433,36 @@ test "block quotes render the bar and inset content" {
     try expectCell(win, 0, 1, ' ');
 }
 
+test "tables render inside block quotes" {
+    var doc = Document.init("> | hi |\n> |---|\n> | yo |\n");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+
+    app.width = 12;
+    try app.ensureVisible(math.maxInt(usize));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 4, .cols = 12, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 12,
+        .height = 4,
+        .screen = &screen,
+    };
+
+    app.renderViewport(win);
+    const bar = win.readCell(0, 0) orelse return error.TestUnexpectedCell;
+    try testing.expectEqualStrings("\u{2502}", bar.char.grapheme);
+    try expectCell(win, 2, 0, '|');
+    try expectCell(win, 4, 0, 'h');
+    try expectCell(win, 3, 1, '-');
+    try expectCell(win, 4, 2, 'y');
+    try expectCell(win, 0, 3, ' ');
+}
+
 // Rendering fuzz: arbitrary inputs are parsed, scrolled incrementally with
 // random resizes, and rendered. Asserts three properties that broke before:
 // no panics, measure/render agreement, and that incremental scrolling

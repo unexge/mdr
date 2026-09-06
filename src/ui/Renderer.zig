@@ -67,8 +67,8 @@ pub fn layoutBlocks(win: ?vaxis.Window, blocks: Document.Blocks, start_row: usiz
 
 fn layoutDepth(win: ?vaxis.Window, elem: Document.Element, row: usize, skip: usize, depth: usize, width: usize) usize {
     return switch (elem) {
-        .header => |h| text.layout(win, h.content, headerStyle(h.level), row, skip, width, h.chain),
-        .paragraph => |p| text.layout(win, p.content, .{}, row, skip, width, p.chain),
+        .header => |h| text.layout(win, h.content, headerStyle(h.level), row, skip, width, h.chain, .left),
+        .paragraph => |p| text.layout(win, p.content, .{}, row, skip, width, p.chain, .left),
         .code_block => |cb| code_block.layout(win, cb, row, skip, width),
         .thematic_break => thematic_break.layout(win, row, skip, width),
         .list => |l| list.layout(win, l, row, skip, depth, width),
