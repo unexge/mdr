@@ -1,14 +1,20 @@
-//! Zero-copy, lazily parsed Markdown.
+//! Zero-copy, lazily parsed Markdown (CommonMark flavored, plus GFM
+//! strikethrough and task lists).
 //!
 //! `Document` returns one block-level `Element` per `next` call; every slice
-//! it hands out points into the input text. `parse` reads a `std.Io.Reader`
-//! into a single buffer, the only allocation in the library; `init` borrows
-//! text already in memory. Markdown has no syntax errors, so parsing cannot
-//! fail.
+//! it hands out points into the input text. Containers carry iterators:
+//! `List.items` yields `ListItem`s, and lists, items and block quotes expose
+//! a `Blocks` iterator over their children. Inline formatting is an event
+//! stream: `Spans` yields open/close markers around nested emphasis,
+//! strikethrough and links, plus code spans, entities, escapes and line
+//! breaks. Text spans are single lines; soft breaks are events.
+//! `parse` reads a `std.Io.Reader` into a single buffer, the only allocation
+//! in the library; `init` borrows text already in memory. Markdown has no
+//! syntax errors, so parsing cannot fail.
 //!
-//! Supported: ATX and setext headers, fenced code blocks, thematic breaks,
-//! paragraphs, and inline bold/italic/code spans. Lists, block quotes,
-//! tables, indented code and nested emphasis are not supported yet.
+//! Not supported yet: indented code blocks, tables, HTML, images,
+//! autolinks and reference links. Container nesting deeper than 8 levels
+//! degrades to plain text.
 
 const Document = @This();
 
@@ -41,96 +47,14 @@ pub fn deinit(self: *Document) void {
 
 /// Returns the next block-level element, or null at the end.
 pub fn next(self: *Document) ?Element {
-    const text = self.text;
-
-    while (self.cursor < text.len) {
-        if (!isBlankLine(lineSlice(text, self.cursor))) break;
-        self.cursor = nextLineStart(text, self.cursor);
-    }
-    if (self.cursor >= text.len) return null;
-
-    const line = lineSlice(text, self.cursor);
-    const indent = leadingSpaces(line);
-    if (indent <= 3) {
-        const body = line[indent..];
-        if (parseAtxHeader(body)) |header| {
-            self.cursor = nextLineStart(text, self.cursor);
-            return .{ .header = header };
-        }
-        if (parseFence(body)) |fence| return self.parseCodeBlock(fence);
-        if (isThematicBreak(body)) {
-            self.cursor = nextLineStart(text, self.cursor);
-            return .thematic_break;
-        }
-    }
-    return self.parseParagraph();
-}
-
-fn parseParagraph(self: *Document) Element {
-    const text = self.text;
-
-    // `next` dispatches here only for lines that are not blank or another
-    // block, so the first line is always paragraph content.
-    var content_start = self.cursor;
-    while (content_start < text.len and
-        (text[content_start] == ' ' or text[content_start] == '\t'))
-    {
-        content_start += 1;
-    }
-    var content_end = lineEndTrimCr(text, self.cursor);
-    var scan = nextLineStart(text, self.cursor);
-
-    while (scan < text.len) {
-        const line = lineSlice(text, scan);
-        if (isBlankLine(line)) break;
-        const indent = leadingSpaces(line);
-        if (indent <= 3) {
-            const body = line[indent..];
-            // A `-` run under a paragraph is a setext h2, not an hr.
-            if (setextLevel(body)) |level| {
-                const content = trimBlockContent(text[content_start..content_end]);
-                self.cursor = nextLineStart(text, scan);
-                return .{ .header = .{ .level = level, .content = content } };
-            }
-            if (parseAtxHeader(body) != null) break;
-            if (parseFence(body) != null) break;
-            if (isThematicBreak(body)) break;
-        }
-        content_end = lineEndTrimCr(text, scan);
-        scan = nextLineStart(text, scan);
-    }
-
-    self.cursor = scan;
-    return .{ .paragraph = .{ .content = trimBlockContent(text[content_start..content_end]) } };
-}
-
-fn parseCodeBlock(self: *Document, fence: Fence) Element {
-    const text = self.text;
-    self.cursor = nextLineStart(text, self.cursor);
-    const content_start = self.cursor;
-    var content_end = content_start;
-
-    while (self.cursor < text.len) {
-        const line = lineSlice(text, self.cursor);
-        const indent = leadingSpaces(line);
-        if (indent <= 3) {
-            const body = line[indent..];
-            const close_len = runLen(body, 0, fence.ch);
-            if (close_len >= fence.len and isBlankLine(body[close_len..])) {
-                self.cursor = nextLineStart(text, self.cursor);
-                return .{ .code_block = .{
-                    .info = fence.info,
-                    .content = text[content_start..content_end],
-                } };
-            }
-        }
-        content_end = lineEndTrimCr(text, self.cursor);
-        self.cursor = nextLineStart(text, self.cursor);
-    }
-    return .{ .code_block = .{
-        .info = fence.info,
-        .content = text[content_start..content_end],
-    } };
+    var blocks: Blocks = .{
+        .text = self.text,
+        .cursor = self.cursor,
+        .end = self.text.len,
+    };
+    const elem = blocks.next() orelse return null;
+    self.cursor = blocks.cursor;
+    return elem;
 }
 
 /// One block-level element; all payloads are slices into `Document.text`.
@@ -139,124 +63,953 @@ pub const Element = union(enum) {
     paragraph: Paragraph,
     code_block: CodeBlock,
     thematic_break: ThematicBreak,
+    list: List,
+    block_quote: BlockQuote,
 
     pub const Header = struct {
         /// 1 to 6.
         level: u8,
         content: []const u8,
+        /// Container prefixes to strip per line (setext headers only).
+        chain: Chain = .{},
 
         pub fn spans(self: Header) Spans {
-            return .init(self.content);
+            return .initChain(self.content, self.chain);
         }
     };
 
     pub const Paragraph = struct {
-        /// Raw text; multi-line paragraphs keep interior newlines.
+        /// Raw text of the block. Inside containers this still carries the
+        /// container prefixes of continuation lines; `lines` and `spans`
+        /// strip them.
         content: []const u8,
+        chain: Chain = .{},
 
         pub fn lines(self: Paragraph) LineIterator {
-            return .{ .remaining = self.content };
+            return .{ .remaining = self.content, .chain = self.chain };
         }
 
         pub fn spans(self: Paragraph) Spans {
-            return .init(self.content);
+            return .initChain(self.content, self.chain);
         }
     };
 
     pub const CodeBlock = struct {
         info: ?[]const u8,
-        /// Verbatim text between the fences.
+        /// Raw text between the fences, including container prefixes; use
+        /// `lines` for the stripped, verbatim lines.
         content: []const u8,
+        chain: Chain = .{},
+
+        pub fn lines(self: CodeBlock) LineIterator {
+            return .{ .remaining = self.content, .chain = self.chain, .first = false };
+        }
     };
 
     pub const ThematicBreak = struct {};
+
+    pub const List = struct {
+        /// True for `1.` / `1)`, false for `-` / `*` / `+`.
+        ordered: bool,
+        /// First number of an ordered list.
+        start: u32,
+        /// No blank lines between or inside items.
+        tight: bool,
+        items: Items,
+
+        pub const Items = struct {
+            text: []const u8,
+            /// Container prefixes preceding every marker line.
+            chain: Chain = .{},
+            /// Absolute start of the next item.
+            cursor: usize,
+            /// Exclusive end of the whole list.
+            end: usize,
+            ordered: bool,
+            bullet: u8 = 0,
+            /// `.` or `)` for ordered lists.
+            delim: u8 = 0,
+            /// Set once a line that cannot continue the list is reached.
+            done: bool = false,
+            loose: bool = false,
+
+            /// Parses the next item's marker and bounds; the item's blocks
+            /// are parsed lazily through `ListItem.blocks`.
+            pub fn next(self: *Items) ?ListItem {
+                if (self.done or self.cursor >= self.end) return null;
+                const text = self.text;
+                const first = chainLine(self.chain, text, self.cursor, self.end, false);
+                const extra = leadingSpaces(first.content);
+                const marker = parseMarkerLine(first.content[extra..]) orelse {
+                    self.done = true;
+                    self.cursor = self.end;
+                    return null;
+                };
+
+                var indent = extra + marker.contentIndent();
+                var content_start = first.start + extra + marker.len + marker.spaces_raw;
+                var task: ?bool = null;
+                var task_glyph: []const u8 = "";
+                if (taskMarker(first.content[extra + marker.len + marker.spaces_raw ..])) |t| {
+                    task = t.done;
+                    task_glyph = first.content[extra + marker.len + marker.spaces_raw ..][0..3];
+                    indent += task_width;
+                    content_start += task_width;
+                }
+                const body = first.content[extra + marker.len + marker.spaces_raw ..];
+                const marker_text = first.content[extra..][0..marker.len];
+                var content_end = first.raw_end;
+                var last_para = paragraphish(body);
+
+                var pending_blank = false;
+                var scan = first.next;
+                while (scan < self.end) {
+                    const line = chainLine(self.chain, text, scan, self.end, false);
+                    if (isBlankLine(line.content)) {
+                        pending_blank = true;
+                        scan = line.next;
+                        continue;
+                    }
+                    const line_extra = leadingSpaces(line.content);
+                    if (line_extra >= indent) {
+                        if (pending_blank) {
+                            self.loose = true;
+                            pending_blank = false;
+                        }
+                        content_end = line.raw_end;
+                        last_para = paragraphish(line.content);
+                        scan = line.next;
+                        continue;
+                    }
+                    if (line_extra <= 3) {
+                        const body_line = line.content[line_extra..];
+                        if (parseMarkerLine(body_line)) |sibling| {
+                            if (sibling.sameKindAs(self)) {
+                                if (pending_blank) {
+                                    self.loose = true;
+                                    pending_blank = false;
+                                }
+                                self.cursor = scan;
+                                return self.item(task, task_glyph, marker_text, indent, content_start, content_end);
+                            }
+                            self.done = true;
+                            self.cursor = scan;
+                            return self.item(task, task_glyph, marker_text, indent, content_start, content_end);
+                        }
+                        if (!pending_blank and last_para and paragraphish(line.content)) {
+                            content_end = line.raw_end;
+                            last_para = true;
+                            scan = line.next;
+                            continue;
+                        }
+                    }
+                    self.done = true;
+                    self.cursor = scan;
+                    return self.item(task, task_glyph, marker_text, indent, content_start, content_end);
+                }
+                self.done = true;
+                self.cursor = self.end;
+                return self.item(task, task_glyph, marker_text, indent, content_start, content_end);
+            }
+
+            fn item(self: *Items, task: ?bool, task_glyph: []const u8, marker: []const u8, indent: usize, start: usize, end: usize) ListItem {
+                const chain = self.chain.push(.{ .spaces = indent });
+                if (chain == null or start >= end) {
+                    return .{ .task = task, .task_glyph = task_glyph, .marker = marker, .indent = indent, .blocks = .{
+                        .text = self.text,
+                        .cursor = end,
+                        .end = end,
+                        .mid_line = true,
+                    } };
+                }
+                return .{
+                    .task = task,
+                    .task_glyph = task_glyph,
+                    .marker = marker,
+                    .indent = indent,
+                    .blocks = .{
+                        .text = self.text,
+                        .cursor = start,
+                        .end = end,
+                        .mid_line = true,
+                        .chain = chain.?,
+                    },
+                };
+            }
+        };
+    };
+
+    pub const BlockQuote = struct {
+        blocks: Blocks,
+    };
 };
 
-/// An inline formatting run. Emphasis is flat: bold/italic content is raw
-/// text that may still contain markers.
+/// Width of the `- [x] ` task marker relative to the list marker.
+const task_width = 4;
+
+pub const ListItem = struct {
+    /// null when not a task list item; otherwise checked state.
+    task: ?bool,
+    /// Raw text of the task checkbox, e.g. `[x]`; only for task items.
+    task_glyph: []const u8 = "",
+    /// Raw text of the list marker, e.g. `-` or `12.`.
+    marker: []const u8,
+    /// Content indent in columns, for renderers.
+    indent: usize,
+    blocks: Blocks,
+};
+
+/// Iterates the block children of a container (list item, block quote) or
+/// of the whole document.
+pub const Blocks = struct {
+    text: []const u8,
+    /// Position of the next unparsed byte; mid-line on the first call when
+    /// the parent already stripped the first line's prefixes.
+    cursor: usize,
+    /// Exclusive end of this container's content.
+    end: usize,
+    mid_line: bool = false,
+    chain: Chain = .{},
+
+    pub fn next(self: *Blocks) ?Element {
+        const text = self.text;
+        var first = self.mid_line;
+        self.mid_line = false;
+
+        while (self.cursor < self.end) {
+            const line = chainLine(self.chain, text, self.cursor, self.end, first);
+            if (!isBlankLine(line.content)) break;
+            self.cursor = line.next;
+            first = false;
+        }
+        if (self.cursor >= self.end) return null;
+
+        const line = chainLine(self.chain, text, self.cursor, self.end, first);
+        const extra = leadingSpaces(line.content);
+        if (extra <= 3) {
+            const body = line.content[extra..];
+            if (parseAtxHeader(body)) |header| {
+                self.cursor = line.next;
+                return .{ .header = .{ .level = header.level, .content = header.content, .chain = self.chain } };
+            }
+            if (parseFence(body)) |fence| return self.parseCodeBlock(fence, line);
+            if (isThematicBreak(body)) {
+                self.cursor = line.next;
+                return .thematic_break;
+            }
+            if (body.len > 0 and body[0] == '>') return self.parseQuote(line);
+            if (parseMarkerLine(body)) |marker| return self.parseList(marker);
+        }
+        return self.parseParagraph(line);
+    }
+
+    fn parseParagraph(self: *Blocks, first: Line) Element {
+        const text = self.text;
+        var content_start = first.start;
+        while (content_start < first.start + first.content.len and
+            (text[content_start] == ' ' or text[content_start] == '\t'))
+        {
+            content_start += 1;
+        }
+        var content_end = first.raw_end;
+        var scan = first.next;
+
+        while (scan < self.end) {
+            const line = chainLine(self.chain, text, scan, self.end, false);
+            if (isBlankLine(line.content)) break;
+            const extra = leadingSpaces(line.content);
+            if (extra <= 3) {
+                const body = line.content[extra..];
+                // A `-` run under a paragraph is a setext h2, not an hr.
+                if (setextLevel(body)) |level| {
+                    self.cursor = line.next;
+                    return .{ .header = .{
+                        .level = level,
+                        .content = trimBlockContent(text[content_start..content_end]),
+                        .chain = self.chain,
+                    } };
+                }
+                if (parseAtxHeader(body) != null) break;
+                if (parseFence(body) != null) break;
+                if (isThematicBreak(body)) break;
+                if (body.len > 0 and body[0] == '>') break;
+                if (parseMarkerLine(body)) |marker| {
+                    if (marker.interruptsParagraph()) break;
+                }
+            }
+            content_end = line.raw_end;
+            scan = line.next;
+        }
+
+        self.cursor = scan;
+        return .{ .paragraph = .{
+            .content = trimBlockContent(text[content_start..content_end]),
+            .chain = self.chain,
+        } };
+    }
+
+    fn parseCodeBlock(self: *Blocks, fence: Fence, first: Line) Element {
+        const text = self.text;
+        self.cursor = first.next;
+        const content_start = self.cursor;
+        var content_end = content_start;
+
+        while (self.cursor < self.end) {
+            const line = chainLine(self.chain, text, self.cursor, self.end, false);
+            const indent = leadingSpaces(line.content);
+            if (indent <= 3) {
+                const body = line.content[indent..];
+                const close_len = runLen(body, 0, fence.ch);
+                if (close_len >= fence.len and isBlankLine(body[close_len..])) {
+                    self.cursor = line.next;
+                    return .{ .code_block = .{
+                        .info = fence.info,
+                        .content = text[content_start..content_end],
+                        .chain = self.chain,
+                    } };
+                }
+            }
+            content_end = line.raw_end;
+            self.cursor = line.next;
+        }
+        return .{ .code_block = .{
+            .info = fence.info,
+            .content = text[content_start..content_end],
+            .chain = self.chain,
+        } };
+    }
+
+    fn parseQuote(self: *Blocks, first: Line) Element {
+        const text = self.text;
+        var content_start = first.start + 1;
+        if (content_start < first.raw_end and (text[content_start] == ' ' or text[content_start] == '\t')) {
+            content_start += 1;
+        }
+        var content_end = first.raw_end;
+        var last_para = paragraphish(text[content_start..content_end]);
+
+        var pending_blank = false;
+        var scan = first.next;
+        while (scan < self.end) {
+            const line = chainLine(self.chain, text, scan, self.end, false);
+            if (isBlankLine(line.content)) {
+                pending_blank = true;
+                scan = line.next;
+                continue;
+            }
+            const extra = leadingSpaces(line.content);
+            if (extra <= 3) {
+                const body = line.content[extra..];
+                if (body.len > 0 and body[0] == '>') {
+                    pending_blank = false;
+                    content_end = line.raw_end;
+                    var inner_start = line.start + extra + 1;
+                    if (inner_start < line.raw_end and (text[inner_start] == ' ' or text[inner_start] == '\t')) {
+                        inner_start += 1;
+                    }
+                    last_para = paragraphish(text[inner_start..content_end]);
+                    scan = line.next;
+                    continue;
+                }
+                if (!pending_blank and last_para and paragraphish(line.content)) {
+                    // Lazy continuation of the quote's last paragraph.
+                    content_end = line.raw_end;
+                    scan = line.next;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        self.cursor = scan;
+        const chain = self.chain.push(.quote) orelse self.chain;
+        const capped = self.chain.len < max_depth;
+        return .{ .block_quote = .{ .blocks = .{
+            .text = text,
+            .cursor = content_start,
+            .end = if (capped) content_end else content_start,
+            .mid_line = true,
+            .chain = chain,
+        } } };
+    }
+
+    fn parseList(self: *Blocks, first_marker: Marker) Element {
+        const start_line = self.cursor;
+        var probe: Element.List.Items = .{
+            .text = self.text,
+            .chain = self.chain,
+            .cursor = start_line,
+            .end = self.end,
+            .ordered = first_marker.ordered,
+            .bullet = first_marker.bullet,
+            .delim = first_marker.delim,
+        };
+        while (probe.next()) |_| {}
+        // The scan stops at the first line that cannot continue the list.
+        const list_end = @min(probe.cursor, self.end);
+
+        self.cursor = list_end;
+        return .{ .list = .{
+            .ordered = first_marker.ordered,
+            .start = first_marker.start,
+            .tight = !probe.loose,
+            .items = .{
+                .text = self.text,
+                .chain = self.chain,
+                .cursor = start_line,
+                .end = list_end,
+                .ordered = first_marker.ordered,
+                .bullet = first_marker.bullet,
+                .delim = first_marker.delim,
+            },
+        } };
+    }
+};
+
+/// Parses a list marker on a container-stripped line. The marker must be
+/// followed by whitespace or end the line.
+const Marker = struct {
+    ordered: bool,
+    start: u32,
+    bullet: u8,
+    /// `.` or `)` for ordered markers.
+    delim: u8,
+    len: usize,
+    spaces_raw: usize,
+    /// Nothing but whitespace after the marker: an empty item.
+    empty: bool,
+
+    /// Content indent: marker plus following spaces, capped so that more
+    /// than four spaces count as one (the extras stay in the content).
+    fn contentIndent(self: Marker) usize {
+        const spaces: usize = if (self.spaces_raw == 0 or self.spaces_raw > 4) 1 else self.spaces_raw;
+        return self.len + spaces;
+    }
+
+    fn sameKindAs(self: Marker, items: *const Element.List.Items) bool {
+        if (self.ordered != items.ordered) return false;
+        if (self.ordered) return self.delim == items.delim;
+        return self.bullet == items.bullet;
+    }
+
+    /// Lists may interrupt a paragraph only when the item is non-empty;
+    /// ordered lists additionally need start number 1.
+    fn interruptsParagraph(self: Marker) bool {
+        if (self.ordered and self.start != 1) return false;
+        return !self.empty;
+    }
+};
+
+fn parseMarkerLine(line: []const u8) ?Marker {
+    if (line.len == 0) return null;
+    var marker: Marker = .{
+        .ordered = false,
+        .start = 0,
+        .bullet = 0,
+        .delim = 0,
+        .len = 0,
+        .spaces_raw = 0,
+        .empty = false,
+    };
+    const c = line[0];
+    if (c == '-' or c == '+' or c == '*') {
+        marker.bullet = c;
+        marker.len = 1;
+    } else if (ascii.isDigit(c)) {
+        var digits: usize = 0;
+        while (digits < 9 and digits < line.len and ascii.isDigit(line[digits])) digits += 1;
+        if (digits >= line.len or (line[digits] != '.' and line[digits] != ')')) return null;
+        marker.start = std.fmt.parseInt(u32, line[0..digits], 10) catch return null;
+        marker.ordered = true;
+        marker.delim = line[digits];
+        marker.len = digits + 1;
+    } else {
+        return null;
+    }
+    if (marker.len < line.len and line[marker.len] != ' ' and line[marker.len] != '\t') return null;
+    var i = marker.len;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) {
+        marker.spaces_raw += 1;
+        i += 1;
+    }
+    marker.empty = isBlankLine(line[i..]);
+    return marker;
+}
+
+/// Recognizes `- [ ] `, `- [x] ` style task markers (GFM).
+fn taskMarker(content: []const u8) ?struct { done: bool } {
+    if (content.len < 3 or content[0] != '[' or content[2] != ']') return null;
+    const done = switch (content[1]) {
+        ' ' => false,
+        'x', 'X' => true,
+        else => return null,
+    };
+    if (content.len > 3 and content[3] != ' ' and content[3] != '\t') return null;
+    return .{ .done = done };
+}
+
+/// An inline formatting event. Emphasis, strikethrough and links are
+/// open/close pairs; consumers track a style stack. Text spans never
+/// contain newlines: line breaks are `soft_break` / `hard_break` events.
 pub const Span = union(enum) {
     text: []const u8,
     code: []const u8,
-    bold: []const u8,
-    italic: []const u8,
-    bold_italic: []const u8,
+    /// Raw entity such as `&amp;`; decode with `decodeEntity`.
+    entity: []const u8,
+    /// Backslash escape resolved to this character.
+    escape: []const u8,
+    hard_break,
+    soft_break,
+    em_open,
+    em_close,
+    strong_open,
+    strong_close,
+    strike_open,
+    strike_close,
+    link: Link,
+    link_close,
+
+    pub const Link = struct {
+        destination: []const u8,
+        title: ?[]const u8,
+    };
 };
 
-/// Inline span iterator. Code spans close at a run of exactly N backticks,
-/// emphasis at a later run of the same marker at least as long; unclosed
-/// markers are literal text. Intraword `_` never emphasizes, `*` does.
+/// Inline span iterator. Resolution follows the CommonMark emphasis
+/// algorithm (delimiter runs with flanking rules and the rule of 3), GFM
+/// strikethrough (one or two tildes, equal counts), and inline links.
+/// Bounded fixed tables; content past the caps degrades to literal text.
 pub const Spans = struct {
+    const max_events = 256;
+    const max_delims = 64;
+
     content: []const u8,
+    chain: Chain = .{},
     pos: usize = 0,
+    events: [max_events]Event = undefined,
+    event_count: usize = 0,
+    degraded: bool = false,
+    event_i: usize = 0,
+    link_count: usize = 0,
+    delims: [max_delims]Delim = undefined,
+    delim_count: usize = 0,
 
     pub fn init(content: []const u8) Spans {
-        return .{ .content = content };
+        return initChain(content, .{});
+    }
+
+    pub fn initChain(content: []const u8, chain: Chain) Spans {
+        var self: Spans = .{ .content = content, .chain = chain };
+        self.resolve();
+        return self;
     }
 
     pub fn next(self: *Spans) ?Span {
-        const c = self.content;
-        if (self.pos >= c.len) return null;
-        const start = self.pos;
-        switch (c[start]) {
-            '`' => {
-                const open_len = runLen(c, start, '`');
-                if (findRunExact(c, start + open_len, '`', open_len)) |close_start| {
-                    var inner = c[start + open_len .. close_start];
-                    if (inner.len >= 2 and inner[0] == ' ' and inner[inner.len - 1] == ' ') {
-                        inner = inner[1 .. inner.len - 1];
-                    }
-                    self.pos = close_start + open_len;
-                    return .{ .code = inner };
-                }
-                return self.textSpan(start, start + open_len);
-            },
-            '*', '_' => {
-                const marker = c[start];
-                const open_len = runLen(c, start, marker);
-                if (canOpenEmphasis(c, start, open_len, marker)) {
-                    var search = start + open_len;
-                    while (findRunAtLeast(c, search, marker, open_len)) |close_start| {
-                        if (canCloseEmphasis(c, close_start, open_len, marker)) {
-                            self.pos = close_start + open_len;
-                            const inner = c[start + open_len .. close_start];
-                            return switch (open_len) {
-                                1 => .{ .italic = inner },
-                                2 => .{ .bold = inner },
-                                else => .{ .bold_italic = inner },
-                            };
-                        }
-                        search = close_start + runLen(c, close_start, marker);
-                    }
-                }
-                return self.textSpan(start, start + open_len);
-            },
-            else => return self.textSpan(start, start),
+        if (self.degraded) {
+            if (self.event_i > 0) return null;
+            self.event_i = 1;
+            self.pos = self.content.len;
+            return .{ .text = self.content };
+        }
+        while (true) {
+            if (self.event_i >= self.event_count) {
+                if (self.pos >= self.content.len) return null;
+                const text = self.content[self.pos..];
+                self.pos = self.content.len;
+                return .{ .text = text };
+            }
+            const event = self.events[self.event_i];
+            if (event.pos > self.pos) {
+                const text = self.content[self.pos..event.pos];
+                self.pos = event.pos;
+                return .{ .text = text };
+            }
+            self.event_i += 1;
+            self.pos = event.pos + event.skip;
+            switch (event.kind) {
+                .code => return .{ .code = event.slice },
+                .entity => return .{ .entity = event.slice },
+                .escape => return .{ .escape = event.slice },
+                .hard_break => return .hard_break,
+                .soft_break => return .soft_break,
+                .em_open => return .em_open,
+                .em_close => return .em_close,
+                .strong_open => return .strong_open,
+                .strong_close => return .strong_close,
+                .strike_open => return .strike_open,
+                .strike_close => return .strike_close,
+                .link_open => return .{ .link = .{ .destination = event.slice, .title = event.extra } },
+                .link_close => return .link_close,
+            }
         }
     }
 
-    /// Extends a literal text run through marker runs that cannot open a
-    /// span, so `a_b_c` does not fragment into tiny spans.
-    fn textSpan(self: *Spans, start: usize, from: usize) Span {
+    const EventKind = enum {
+        code,
+        entity,
+        escape,
+        hard_break,
+        soft_break,
+        em_open,
+        em_close,
+        strong_open,
+        strong_close,
+        strike_open,
+        strike_close,
+        link_open,
+        link_close,
+    };
+
+    const Event = struct {
+        pos: usize,
+        skip: usize,
+        kind: EventKind,
+        slice: []const u8 = "",
+        extra: ?[]const u8 = null,
+    };
+
+    const Delim = struct {
+        pos: usize,
+        run_len: usize,
+        count: usize,
+        ch: u8,
+        can_open: bool,
+        can_close: bool,
+        region: usize,
+        open_use: usize = 0,
+        close_use: usize = 0,
+    };
+
+    fn addEvent(self: *Spans, event: Event) void {
+        if (self.degraded) return;
+        if (self.event_count >= max_events) {
+            self.degraded = true;
+            self.event_count = 0;
+            return;
+        }
+        self.events[self.event_count] = event;
+        self.event_count += 1;
+    }
+
+    fn resolve(self: *Spans) void {
+        self.scan();
+        if (self.degraded) return;
+        self.resolveEmphasis();
+        self.sortEvents();
+    }
+
+    fn scan(self: *Spans) void {
         const c = self.content;
-        var i = from;
+        var i: usize = 0;
+        var region: usize = outside_region;
+        // Currently open link, so that brackets inside link text stay literal.
+        var link_text_end: usize = 0;
+        var link_after: usize = 0;
+
         while (i < c.len) {
+            if (link_after > 0 and i >= link_text_end) {
+                // Leaving the link text: its destination was consumed by the
+                // link_close event's skip.
+                region = outside_region;
+                link_after = 0;
+            }
             switch (c[i]) {
-                '`' => break,
-                '*', '_' => {
-                    const run = runLen(c, i, c[i]);
-                    if (canOpenEmphasis(c, i, run, c[i])) break;
+                '\\' => {
+                    if (i + 1 < c.len and c[i + 1] == '\n') {
+                        const next_start = self.lineBreakSkip(i + 2);
+                        self.addEvent(.{ .pos = i, .skip = next_start - i, .kind = .hard_break });
+                        i = next_start;
+                        continue;
+                    }
+                    if (i + 1 < c.len and isAsciiPunct(c[i + 1])) {
+                        self.addEvent(.{ .pos = i, .skip = 2, .kind = .escape, .slice = c[i + 1 .. i + 2] });
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                },
+                '`' => {
+                    const open_len = runLen(c, i, '`');
+                    if (findRunExact(c, i + open_len, '`', open_len)) |close_start| {
+                        var inner = c[i + open_len .. close_start];
+                        if (inner.len >= 2 and inner[0] == ' ' and inner[inner.len - 1] == ' ') {
+                            inner = inner[1 .. inner.len - 1];
+                        }
+                        self.addEvent(.{
+                            .pos = i,
+                            .skip = close_start + open_len - i,
+                            .kind = .code,
+                            .slice = inner,
+                        });
+                        i = close_start + open_len;
+                        continue;
+                    }
+                    i += open_len;
+                },
+                '&' => {
+                    if (validEntity(c[i..])) |len| {
+                        self.addEvent(.{ .pos = i, .skip = len, .kind = .entity, .slice = c[i .. i + len] });
+                        i += len;
+                        continue;
+                    }
+                    i += 1;
+                },
+                '\n' => {
+                    var back = i;
+                    if (back > 0 and c[back - 1] == '\r') back -= 1;
+                    var spaces: usize = 0;
+                    while (back > 0 and c[back - 1] == ' ') {
+                        spaces += 1;
+                        back -= 1;
+                    }
+                    const next_start = self.lineBreakSkip(i + 1);
+                    if (spaces >= 2) {
+                        self.addEvent(.{ .pos = back, .skip = next_start - back, .kind = .hard_break });
+                    } else {
+                        self.addEvent(.{ .pos = i, .skip = next_start - i, .kind = .soft_break });
+                    }
+                    i = next_start;
+                    continue;
+                },
+                '*', '_', '~' => {
+                    const ch = c[i];
+                    const run = runLen(c, i, ch);
+                    if (ch == '~' and run > 2) {
+                        i += run;
+                        continue;
+                    }
+                    if (self.delim_count < max_delims) {
+                        self.delims[self.delim_count] = .{
+                            .pos = i,
+                            .run_len = run,
+                            .count = run,
+                            .ch = ch,
+                            .can_open = canOpenEmphasis(c, i, run, ch),
+                            .can_close = canCloseEmphasis(c, i, run, ch),
+                            .region = region,
+                        };
+                        self.delim_count += 1;
+                    }
                     i += run;
+                },
+                '[' => {
+                    if (region != outside_region) {
+                        // No nested links.
+                        i += 1;
+                        continue;
+                    }
+                    if (self.parseLink(i)) |parsed| {
+                        self.addEvent(.{ .pos = i, .skip = 1, .kind = .link_open, .slice = parsed.destination, .extra = parsed.title });
+                        self.addEvent(.{
+                            .pos = parsed.text_end,
+                            .skip = parsed.after - parsed.text_end,
+                            .kind = .link_close,
+                        });
+                        region = self.link_count;
+                        self.link_count += 1;
+                        link_text_end = parsed.text_end;
+                        link_after = parsed.after;
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                },
+                ']' => {
+                    if (link_after > 0 and i == link_text_end) {
+                        i = link_after;
+                        continue;
+                    }
+                    i += 1;
+                },
+                '!' => {
+                    // Images are not supported; skip the marker.
+                    i += if (i + 1 < c.len and c[i + 1] == '[') 2 else 1;
                 },
                 else => i += 1,
             }
         }
-        self.pos = i;
-        return .{ .text = c[start..i] };
+    }
+
+    /// Returns the absolute content position where the line after the
+    /// newline at `from - 1` begins, skipping the container prefixes.
+    fn lineBreakSkip(self: *Spans, from: usize) usize {
+        const c = self.content;
+        if (from >= c.len) return c.len;
+        const line_end = mem.indexOfScalarPos(u8, c, from, '\n') orelse c.len;
+        const raw = c[from..line_end];
+        const skip = chainSkip(self.chain, raw) orelse chainSpacesOnly(self.chain, raw);
+        return from + skip;
+    }
+
+    const ParsedLink = struct {
+        destination: []const u8,
+        title: ?[]const u8,
+        text_end: usize,
+        after: usize,
+    };
+
+    /// Parses `[text](dest "title")` starting at the `[`; null when the
+    /// syntax does not form a link.
+    fn parseLink(self: *Spans, open: usize) ?ParsedLink {
+        const c = self.content;
+        var i = open + 1;
+        var depth: usize = 1;
+        while (i < c.len) {
+            switch (c[i]) {
+                '\\' => i += @min(@as(usize, 2), c.len - i),
+                '`' => {
+                    const run = runLen(c, i, '`');
+                    if (findRunExact(c, i + run, '`', run)) |close| {
+                        i = close + run;
+                    } else {
+                        i += run;
+                    }
+                },
+                '[' => {
+                    depth += 1;
+                    i += 1;
+                },
+                ']' => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                    i += 1;
+                },
+                else => i += 1,
+            }
+        }
+        if (i >= c.len or c[i] != ']') return null;
+        const text_end = i;
+        if (i + 1 >= c.len or c[i + 1] != '(') return null;
+
+        var j = i + 2;
+        while (j < c.len and (c[j] == ' ' or c[j] == '\t')) j += 1;
+        var destination: []const u8 = "";
+        if (j < c.len and c[j] == '<') {
+            const start = j + 1;
+            j = start;
+            while (j < c.len and c[j] != '>' and c[j] != '\n') j += 1;
+            if (j >= c.len or c[j] != '>') return null;
+            destination = c[start..j];
+            j += 1;
+        } else {
+            const start = j;
+            var parens: usize = 0;
+            while (j < c.len) {
+                const ch = c[j];
+                if (ch == '\\' and j + 1 < c.len and isAsciiPunct(c[j + 1])) {
+                    j += 2;
+                    continue;
+                }
+                if (ch == '(') {
+                    parens += 1;
+                } else if (ch == ')') {
+                    if (parens == 0) break;
+                    parens -= 1;
+                } else if (ch == ' ' or ch == '\n') {
+                    break;
+                }
+                j += 1;
+            }
+            if (j >= c.len or c[j] == '\n') return null;
+            destination = c[start..j];
+        }
+        while (j < c.len and (c[j] == ' ' or c[j] == '\t')) j += 1;
+
+        var title: ?[]const u8 = null;
+        if (j < c.len and (c[j] == '"' or c[j] == '\'' or c[j] == '(')) {
+            const close: u8 = if (c[j] == '(') ')' else c[j];
+            const start = j + 1;
+            j = start;
+            while (j < c.len and c[j] != close and c[j] != '\n') {
+                if (c[j] == '\\' and j + 1 < c.len) j += 1;
+                j += 1;
+            }
+            if (j >= c.len or c[j] != close) return null;
+            title = c[start..j];
+            j += 1;
+            while (j < c.len and (c[j] == ' ' or c[j] == '\t')) j += 1;
+        }
+        if (j >= c.len or c[j] != ')') return null;
+        return .{
+            .destination = destination,
+            .title = title,
+            .text_end = text_end,
+            .after = j + 1,
+        };
+    }
+
+    fn resolveEmphasis(self: *Spans) void {
+        const delims = self.delims[0..self.delim_count];
+        for (delims, 0..) |*closer, ci| {
+            if (!closer.can_close or closer.count == 0) continue;
+            var oi = ci;
+            while (oi > 0) {
+                oi -= 1;
+                const opener = &delims[oi];
+                if (opener.count == 0 or !opener.can_open) continue;
+                if (opener.ch != closer.ch) continue;
+                if (opener.region != closer.region) continue;
+                if (closer.ch == '~') {
+                    // GFM strikethrough: equal counts, no rule of 3.
+                    if (opener.count != closer.count) continue;
+                } else if ((opener.can_close or closer.can_open) and
+                    (opener.count + closer.count) % 3 == 0 and
+                    !(opener.count % 3 == 0 and closer.count % 3 == 0))
+                {
+                    continue;
+                }
+                const use = if (closer.ch == '~') closer.count else @min(@min(opener.count, closer.count), 2);
+                self.addEvent(.{
+                    .pos = opener.pos + opener.run_len - opener.open_use - use,
+                    .skip = use,
+                    .kind = openKind(closer.ch, use),
+                });
+                opener.open_use += use;
+                opener.count -= use;
+                self.addEvent(.{
+                    .pos = closer.pos + closer.close_use,
+                    .skip = use,
+                    .kind = closeKind(closer.ch, use),
+                });
+                closer.close_use += use;
+                closer.count -= use;
+                if (closer.count == 0) break;
+                // Runs longer than two can pair several times; retry the
+                // same opener for the remaining closer count.
+                if (opener.count > 0) oi += 1;
+            }
+        }
+    }
+
+    /// Events are appended nearly in position order; insertion sort keeps
+    /// them ordered for the emit walk.
+    fn sortEvents(self: *Spans) void {
+        var i: usize = 1;
+        while (i < self.event_count) : (i += 1) {
+            const event = self.events[i];
+            var j = i;
+            while (j > 0 and self.events[j - 1].pos > event.pos) : (j -= 1) {
+                self.events[j] = self.events[j - 1];
+            }
+            self.events[j] = event;
+        }
     }
 };
 
+fn openKind(ch: u8, use: usize) Spans.EventKind {
+    if (ch == '~') return .strike_open;
+    return if (use >= 2) .strong_open else .em_open;
+}
+
+fn closeKind(ch: u8, use: usize) Spans.EventKind {
+    if (ch == '~') return .strike_close;
+    return if (use >= 2) .strong_close else .em_close;
+}
+
 pub const LineIterator = struct {
     remaining: []const u8,
+    chain: Chain = .{},
+    first: bool = true,
 
     pub fn next(self: *LineIterator) ?[]const u8 {
         if (self.remaining.len == 0) return null;
@@ -264,9 +1017,111 @@ pub const LineIterator = struct {
         var line = self.remaining[0..end];
         self.remaining = self.remaining[@min(end + 1, self.remaining.len)..];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        return line;
+        if (self.first) {
+            self.first = false;
+            return line;
+        }
+        if (self.chain.len == 0) return line;
+        const skip = chainSkip(self.chain, line) orelse chainSpacesOnly(self.chain, line);
+        return line[skip..];
     }
 };
+
+const max_depth = 8;
+
+pub const Step = union(enum) {
+    /// Skip this many leading spaces (list item content indent).
+    spaces: usize,
+    /// Skip up to three spaces, a `>` marker and one optional space.
+    quote,
+};
+
+/// Ordered container prefixes stripped from every line: quote markers and
+/// item indents, outermost first. Lists, items and block quotes carry their
+/// chain so their content can be re-parsed lazily.
+pub const Chain = struct {
+    steps: [max_depth]Step = undefined,
+    len: usize = 0,
+
+    fn push(self: Chain, step: Step) ?Chain {
+        if (self.len >= max_depth) return null;
+        var out = self;
+        out.steps[self.len] = step;
+        out.len += 1;
+        return out;
+    }
+};
+
+const outside_region = std.math.maxInt(usize);
+
+/// Bytes of `line` consumed by the container prefixes; null when a quote
+/// marker is missing (lazy continuation).
+fn chainSkip(chain: Chain, line: []const u8) ?usize {
+    var i: usize = 0;
+    for (chain.steps[0..chain.len]) |step| {
+        switch (step) {
+            .spaces => |n| {
+                var k: usize = 0;
+                while (k < n and i < line.len and line[i] == ' ') k += 1;
+                i += k;
+            },
+            .quote => {
+                var k: usize = 0;
+                while (k < 3 and i < line.len and line[i] == ' ') k += 1;
+                if (i + k >= line.len or line[i + k] != '>') return null;
+                i += k + 1;
+                if (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+            },
+        }
+    }
+    return i;
+}
+
+/// Prefix fallback for lazy continuation lines: strip only space steps.
+fn chainSpacesOnly(chain: Chain, line: []const u8) usize {
+    var i: usize = 0;
+    for (chain.steps[0..chain.len]) |step| {
+        switch (step) {
+            .spaces => |n| {
+                var k: usize = 0;
+                while (k < n and i < line.len and line[i] == ' ') k += 1;
+                i += k;
+            },
+            .quote => {},
+        }
+    }
+    return i;
+}
+
+const Line = struct {
+    /// Absolute position of the content start (prefixes stripped).
+    start: usize,
+    /// Content bytes with container prefixes removed and CR trimmed.
+    content: []const u8,
+    /// Absolute end of the raw line, before the newline.
+    raw_end: usize,
+    /// Absolute position after the newline.
+    next: usize,
+};
+
+fn chainLine(chain: Chain, text: []const u8, pos: usize, end: usize, mid_line: bool) Line {
+    var line_end = mem.indexOfScalarPos(u8, text, pos, '\n') orelse text.len;
+    if (line_end > end) line_end = end;
+    var raw_end = line_end;
+    if (raw_end > pos and text[raw_end - 1] == '\r') raw_end -= 1;
+    const next_pos = if (line_end < end and line_end < text.len and text[line_end] == '\n') line_end + 1 else line_end;
+    var skip: usize = 0;
+    if (!mid_line) {
+        const raw = text[pos..raw_end];
+        skip = chainSkip(chain, raw) orelse chainSpacesOnly(chain, raw);
+    }
+    return .{
+        .start = pos + skip,
+        .content = text[pos + skip .. raw_end],
+        .raw_end = raw_end,
+        .next = next_pos,
+    };
+}
 
 const Fence = struct {
     ch: u8,
@@ -332,8 +1187,8 @@ fn setextLevel(body: []const u8) ?u8 {
 }
 
 /// Simplified CommonMark flank rules; content start/end count as whitespace.
-/// `*` opens when left-flanking and closes when right-flanking; `_`
-/// additionally refuses intraword positions.
+/// `*` (and GFM `~`) open when left-flanking and close when right-flanking;
+/// `_` additionally refuses intraword positions.
 fn canOpenEmphasis(c: []const u8, marker_pos: usize, run: usize, marker: u8) bool {
     const after = marker_pos + run;
     if (after >= c.len) return false;
@@ -345,7 +1200,7 @@ fn canOpenEmphasis(c: []const u8, marker_pos: usize, run: usize, marker: u8) boo
         if (!isInlineWhitespace(p) and !isInlinePunct(p)) return false;
     }
     switch (marker) {
-        '*' => return true,
+        '*', '~' => return true,
         '_' => {
             const p = prev orelse return true;
             return !ascii.isAlphanumeric(p);
@@ -365,7 +1220,7 @@ fn canCloseEmphasis(c: []const u8, close_pos: usize, run: usize, marker: u8) boo
         if (!isInlineWhitespace(n) and !isInlinePunct(n)) return false;
     }
     switch (marker) {
-        '*' => return true,
+        '*', '~' => return true,
         '_' => {
             const n = next_char orelse return true;
             return !ascii.isAlphanumeric(n);
@@ -380,6 +1235,22 @@ fn isInlineWhitespace(c: u8) bool {
 
 fn isInlinePunct(c: u8) bool {
     return !ascii.isAlphanumeric(c) and !isInlineWhitespace(c);
+}
+
+/// Whether the line could continue a paragraph: no block start on it.
+fn paragraphish(line: []const u8) bool {
+    if (isBlankLine(line)) return false;
+    const extra = leadingSpaces(line);
+    if (extra > 3) return true;
+    const body = line[extra..];
+    if (body.len == 0) return false;
+    if (parseAtxHeader(body) != null) return false;
+    if (parseFence(body) != null) return false;
+    if (isThematicBreak(body)) return false;
+    if (body[0] == '>') return false;
+    if (parseMarkerLine(body) != null) return false;
+    if (setextLevel(body) != null) return false;
+    return true;
 }
 
 fn runLen(s: []const u8, start: usize, ch: u8) usize {
@@ -402,37 +1273,13 @@ fn findRunExact(s: []const u8, from: usize, ch: u8, n: usize) ?usize {
     return null;
 }
 
-fn findRunAtLeast(s: []const u8, from: usize, ch: u8, n: usize) ?usize {
-    var i = from;
-    while (i < s.len) {
-        if (s[i] == ch) {
-            if (runLen(s, i, ch) >= n) return i;
-            i += runLen(s, i, ch);
-        } else {
-            i += 1;
-        }
-    }
-    return null;
-}
-
-fn lineEndTrimCr(text: []const u8, start: usize) usize {
-    var end = mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
-    if (end > start and text[end - 1] == '\r') end -= 1;
-    return end;
-}
-
-fn lineSlice(text: []const u8, start: usize) []const u8 {
-    return text[start..lineEndTrimCr(text, start)];
-}
-
-fn nextLineStart(text: []const u8, start: usize) usize {
-    const end = mem.indexOfScalarPos(u8, text, start, '\n') orelse return text.len;
-    return end + 1;
-}
-
 fn isBlankLine(line: []const u8) bool {
     for (line) |c| if (c != ' ' and c != '\t') return false;
     return true;
+}
+
+fn trimBlockContent(content: []const u8) []const u8 {
+    return mem.trimEnd(u8, content, " \t\r");
 }
 
 fn leadingSpaces(line: []const u8) usize {
@@ -441,8 +1288,125 @@ fn leadingSpaces(line: []const u8) usize {
     return i;
 }
 
-fn trimBlockContent(content: []const u8) []const u8 {
-    return mem.trimEnd(u8, content, " \t\r");
+fn isAsciiPunct(c: u8) bool {
+    return switch (c) {
+        '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~' => true,
+        else => false,
+    };
+}
+
+const Entity = struct { name: []const u8, cp: u21 };
+
+const named_entities = [_]Entity{
+    .{ .name = "amp", .cp = 0x26 },
+    .{ .name = "lt", .cp = 0x3C },
+    .{ .name = "gt", .cp = 0x3E },
+    .{ .name = "quot", .cp = 0x22 },
+    .{ .name = "apos", .cp = 0x27 },
+    .{ .name = "nbsp", .cp = 0xA0 },
+    .{ .name = "copy", .cp = 0xA9 },
+    .{ .name = "reg", .cp = 0xAE },
+    .{ .name = "deg", .cp = 0xB0 },
+    .{ .name = "plusmn", .cp = 0xB1 },
+    .{ .name = "para", .cp = 0xB6 },
+    .{ .name = "middot", .cp = 0xB7 },
+    .{ .name = "laquo", .cp = 0xAB },
+    .{ .name = "raquo", .cp = 0xBB },
+    .{ .name = "times", .cp = 0xD7 },
+    .{ .name = "divide", .cp = 0xF7 },
+    .{ .name = "euro", .cp = 0x20AC },
+    .{ .name = "pound", .cp = 0xA3 },
+    .{ .name = "yen", .cp = 0xA5 },
+    .{ .name = "cent", .cp = 0xA2 },
+    .{ .name = "ndash", .cp = 0x2013 },
+    .{ .name = "mdash", .cp = 0x2014 },
+    .{ .name = "lsquo", .cp = 0x2018 },
+    .{ .name = "rsquo", .cp = 0x2019 },
+    .{ .name = "ldquo", .cp = 0x201C },
+    .{ .name = "rdquo", .cp = 0x201D },
+    .{ .name = "hellip", .cp = 0x2026 },
+    .{ .name = "bull", .cp = 0x2022 },
+    .{ .name = "dagger", .cp = 0x2020 },
+    .{ .name = "trade", .cp = 0x2122 },
+    .{ .name = "check", .cp = 0x2713 },
+};
+
+/// Validates an entity at the start of `raw` (beginning with `&`) and
+/// returns its length. Named entities must be known; numeric ones must be
+/// valid unicode scalars.
+fn validEntity(raw: []const u8) ?usize {
+    if (raw.len < 3 or raw[0] != '&') return null;
+    if (raw[1] == '#') {
+        var i: usize = 2;
+        var value: u32 = 0;
+        if (i < raw.len and (raw[i] == 'x' or raw[i] == 'X')) {
+            i += 1;
+            const digits_start = i;
+            while (i < raw.len and i - digits_start < 6 and ascii.isHex(raw[i])) {
+                value = value * 16 + hexValue(raw[i]);
+                i += 1;
+            }
+            if (i == digits_start) return null;
+        } else {
+            const digits_start = i;
+            while (i < raw.len and i - digits_start < 7 and ascii.isDigit(raw[i])) {
+                value = value * 10 + (raw[i] - '0');
+                i += 1;
+            }
+            if (i == digits_start) return null;
+        }
+        if (i >= raw.len or raw[i] != ';') return null;
+        if (value == 0 or value > 0x10FFFF or (value >= 0xD800 and value <= 0xDFFF)) return null;
+        return i + 1;
+    }
+    if (!ascii.isAlphabetic(raw[1])) return null;
+    var i: usize = 1;
+    while (i < raw.len and i <= 32 and ascii.isAlphanumeric(raw[i])) i += 1;
+    if (i >= raw.len or raw[i] != ';') return null;
+    const name = raw[1..i];
+    for (named_entities) |entity| {
+        if (mem.eql(u8, entity.name, name)) return i + 1;
+    }
+    return null;
+}
+
+fn hexValue(c: u8) u32 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => 0,
+    };
+}
+
+/// Decodes an entity produced by the parser into `buf` (4 bytes for a
+/// unicode scalar); null for unknown entities.
+pub fn decodeEntity(raw: []const u8, buf: *[4]u8) ?[]const u8 {
+    if (raw.len < 3 or raw[0] != '&') return null;
+    var cp: u21 = 0;
+    if (raw[1] == '#') {
+        var value: u32 = 0;
+        if (raw[2] == 'x' or raw[2] == 'X') {
+            for (raw[3 .. raw.len - 1]) |c| value = value * 16 + hexValue(c);
+        } else {
+            for (raw[2 .. raw.len - 1]) |c| value = value * 10 + (c - '0');
+        }
+        if (value == 0 or value > 0x10FFFF or (value >= 0xD800 and value <= 0xDFFF)) return null;
+        cp = @intCast(value);
+    } else {
+        const name = raw[1 .. raw.len - 1];
+        var found = false;
+        for (named_entities) |entity| {
+            if (mem.eql(u8, entity.name, name)) {
+                cp = entity.cp;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return null;
+    }
+    const len = std.unicode.utf8Encode(cp, buf) catch return null;
+    return buf[0..len];
 }
 
 const std = @import("std");
@@ -650,18 +1614,254 @@ test "code fence edge cases" {
     try testing.expect(doc3.next().?.paragraph.content.len > 0);
 }
 
+test "bullet lists" {
+    var doc = Document.init("- one\n- two\n\nafter\n");
+    const list = doc.next().?.list;
+    try testing.expect(!list.ordered);
+    try testing.expect(list.tight);
+
+    var items = list.items;
+    const first = items.next().?;
+    try testing.expect(first.task == null);
+    var first_blocks = first.blocks;
+    try testing.expectEqualStrings("one", first_blocks.next().?.paragraph.content);
+    try testing.expect(first_blocks.next() == null);
+    const second = items.next().?;
+    var second_blocks = second.blocks;
+    try testing.expectEqualStrings("two", second_blocks.next().?.paragraph.content);
+    try testing.expect(items.next() == null);
+
+    try testing.expectEqualStrings("after", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+}
+
+test "bullet char changes start a new list" {
+    var doc = Document.init("- a\n* b\n");
+    const first = doc.next().?.list;
+    var items = first.items;
+    _ = items.next().?;
+    try testing.expect(items.next() == null);
+
+    const second = doc.next().?.list;
+    try testing.expect(!second.ordered);
+    var second_items = second.items;
+    const b_item = second_items.next().?;
+    var b_blocks = b_item.blocks;
+    try testing.expectEqualStrings("b", b_blocks.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+}
+
+test "ordered lists keep their start number" {
+    var doc = Document.init("3. three\n4. four\n\n5) five\n");
+    const list = doc.next().?.list;
+    try testing.expect(list.ordered);
+    try testing.expectEqual(@as(u32, 3), list.start);
+    var items = list.items;
+    _ = items.next().?;
+    _ = items.next().?;
+    try testing.expect(items.next() == null);
+
+    const paren_list = doc.next().?.list;
+    try testing.expect(paren_list.ordered);
+    try testing.expectEqual(@as(u32, 5), paren_list.start);
+    try testing.expect(doc.next() == null);
+}
+
+test "task list items" {
+    var doc = Document.init("- [ ] todo\n- [x] done\n- [X] also done\n- plain\n");
+    const list = doc.next().?.list;
+    var items = list.items;
+
+    const todo = items.next().?;
+    try testing.expectEqual(false, todo.task.?);
+    var todo_blocks = todo.blocks;
+    try testing.expectEqualStrings("todo", todo_blocks.next().?.paragraph.content);
+
+    const done = items.next().?;
+    try testing.expectEqual(true, done.task.?);
+    var done_blocks = done.blocks;
+    try testing.expectEqualStrings("done", done_blocks.next().?.paragraph.content);
+
+    const also_done = items.next().?;
+    try testing.expectEqual(true, also_done.task.?);
+
+    const plain = items.next().?;
+    try testing.expect(plain.task == null);
+    var plain_blocks = plain.blocks;
+    try testing.expectEqualStrings("plain", plain_blocks.next().?.paragraph.content);
+    try testing.expect(items.next() == null);
+}
+
+test "loose lists" {
+    var doc = Document.init("- one\n\n- two\n");
+    const list = doc.next().?.list;
+    try testing.expect(!list.tight);
+
+    var tight_doc = Document.init("- one\n- two\n");
+    try testing.expect(tight_doc.next().?.list.tight);
+}
+
+test "nested lists" {
+    var doc = Document.init("- a\n  - b\n    - c\n");
+    const outer = doc.next().?.list;
+    var outer_items = outer.items;
+    const a = outer_items.next().?;
+    var a_blocks = a.blocks;
+    try testing.expectEqualStrings("a", a_blocks.next().?.paragraph.content);
+    const middle = a_blocks.next().?.list;
+    try testing.expect(!middle.ordered);
+
+    var middle_items = middle.items;
+    const b = middle_items.next().?;
+    var b_blocks = b.blocks;
+    try testing.expectEqualStrings("b", b_blocks.next().?.paragraph.content);
+    const inner = b_blocks.next().?.list;
+    var inner_items = inner.items;
+    const c_item = inner_items.next().?;
+    var c_blocks = c_item.blocks;
+    try testing.expectEqualStrings("c", c_blocks.next().?.paragraph.content);
+
+    try testing.expect(middle_items.next() == null);
+    try testing.expect(outer_items.next() == null);
+    try testing.expect(doc.next() == null);
+}
+
+test "list items hold multiple blocks" {
+    var doc = Document.init("- para\n  # head\n  more\n");
+    const list_elem = doc.next().?.list;
+    var list_items = list_elem.items;
+    const item = list_items.next().?;
+    var item_blocks = item.blocks;
+    try testing.expectEqualStrings("para", item_blocks.next().?.paragraph.content);
+    const h = item_blocks.next().?.header;
+    try testing.expectEqual(@as(u8, 1), h.level);
+    try testing.expectEqualStrings("head", h.content);
+    try testing.expectEqualStrings("more", item_blocks.next().?.paragraph.content);
+    try testing.expect(item_blocks.next() == null);
+}
+
+test "empty list items" {
+    var doc = Document.init("-\n- x\n");
+    const list = doc.next().?.list;
+    var items = list.items;
+    const empty = items.next().?;
+    var empty_blocks = empty.blocks;
+    try testing.expect(empty_blocks.next() == null);
+    const full = items.next().?;
+    var full_blocks = full.blocks;
+    try testing.expectEqualStrings("x", full_blocks.next().?.paragraph.content);
+    try testing.expect(items.next() == null);
+}
+
+test "lists interrupt paragraphs" {
+    var doc = Document.init("text\n- item\n");
+    try testing.expectEqualStrings("text", doc.next().?.paragraph.content);
+    _ = doc.next().?.list;
+
+    var doc2 = Document.init("text\n1. item\n");
+    try testing.expectEqualStrings("text", doc2.next().?.paragraph.content);
+    _ = doc2.next().?.list;
+
+    // Empty items and start numbers other than 1 do not interrupt. A lone
+    // `-` is a setext underline, so use a `*` bullet for the empty item.
+    var doc3 = Document.init("text\n* \nmore\n");
+    try testing.expectEqualStrings("text\n* \nmore", doc3.next().?.paragraph.content);
+
+    var doc4 = Document.init("text\n2. item\n");
+    try testing.expectEqualStrings("text\n2. item", doc4.next().?.paragraph.content);
+}
+
+test "thematic break wins over list marker" {
+    var doc = Document.init("- - -\n- item\n");
+    try testing.expect(meta.activeTag(doc.next().?) == .thematic_break);
+    _ = doc.next().?.list;
+    try testing.expect(doc.next() == null);
+}
+
+test "block quotes" {
+    var doc = Document.init("> # Title\n> para\n>\n> more\n\nafter\n");
+    const quote = doc.next().?.block_quote;
+    var blocks = quote.blocks;
+
+    const h = blocks.next().?.header;
+    try testing.expectEqual(@as(u8, 1), h.level);
+    try testing.expectEqualStrings("Title", h.content);
+    try testing.expectEqualStrings("para", blocks.next().?.paragraph.content);
+    try testing.expectEqualStrings("more", blocks.next().?.paragraph.content);
+    try testing.expect(blocks.next() == null);
+
+    try testing.expectEqualStrings("after", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+}
+
+test "lazy quote continuation" {
+    var doc = Document.init("> para one\ncontinues here\n\nnext\n");
+    var blocks = doc.next().?.block_quote.blocks;
+    const p = blocks.next().?.paragraph;
+    var lines = p.lines();
+    try testing.expectEqualStrings("para one", lines.next().?);
+    try testing.expectEqualStrings("continues here", lines.next().?);
+    try testing.expect(lines.next() == null);
+    try testing.expect(blocks.next() == null);
+    try testing.expectEqualStrings("next", doc.next().?.paragraph.content);
+}
+
+test "nested block quotes" {
+    var doc = Document.init("> level 1\n> > level 2\n");
+    const outer = doc.next().?.block_quote;
+    var outer_blocks = outer.blocks;
+    const p1 = outer_blocks.next().?.paragraph;
+    var p1_lines = p1.lines();
+    try testing.expectEqualStrings("level 1", p1_lines.next().?);
+    try testing.expect(p1_lines.next() == null);
+
+    var inner = outer_blocks.next().?.block_quote;
+    const p2 = inner.blocks.next().?.paragraph;
+    var p2_lines = p2.lines();
+    try testing.expectEqualStrings("level 2", p2_lines.next().?);
+    try testing.expect(inner.blocks.next() == null);
+    try testing.expect(outer_blocks.next() == null);
+    try testing.expect(doc.next() == null);
+}
+
+test "lists inside block quotes" {
+    var doc = Document.init("> - a\n> - b\n");
+    var blocks = doc.next().?.block_quote.blocks;
+    const list = blocks.next().?.list;
+    var items = list.items;
+    const a_item = items.next().?;
+    var a_blocks = a_item.blocks;
+    try testing.expectEqualStrings("a", a_blocks.next().?.paragraph.content);
+    const b_item = items.next().?;
+    var b_blocks = b_item.blocks;
+    try testing.expectEqualStrings("b", b_blocks.next().?.paragraph.content);
+    try testing.expect(items.next() == null);
+    try testing.expect(blocks.next() == null);
+    try testing.expect(doc.next() == null);
+}
+
+test "code blocks inside containers" {
+    var doc = Document.init("> ```zig\n> let x = 1;\n> ```\n");
+    var blocks = doc.next().?.block_quote.blocks;
+    const cb = blocks.next().?.code_block;
+    try testing.expectEqualStrings("zig", cb.info.?);
+    var lines = cb.lines();
+    try testing.expectEqualStrings("let x = 1;", lines.next().?);
+    try testing.expect(lines.next() == null);
+}
+
 test "inline span edge cases" {
     const cases = [_]struct { input: []const u8, expected: []const Span }{
         .{ .input = "plain text", .expected = &.{.{ .text = "plain text" }} },
-        // Unclosed markers are literal text, merged with surrounding text.
+        // Unclosed markers are literal text.
         .{ .input = "a ** b", .expected = &.{.{ .text = "a ** b" }} },
         .{ .input = "**a", .expected = &.{.{ .text = "**a" }} },
         // Intraword `_` is not recognized.
         .{ .input = "a_b_c", .expected = &.{.{ .text = "a_b_c" }} },
         .{ .input = "foo_bar", .expected = &.{.{ .text = "foo_bar" }} },
         // Intraword `*` does emphasize, matching CommonMark.
-        .{ .input = "2*3*4", .expected = &.{ .{ .text = "2" }, .{ .italic = "3" }, .{ .text = "4" } } },
-        .{ .input = "*a*b", .expected = &.{ .{ .italic = "a" }, .{ .text = "b" } } },
+        .{ .input = "2*3*4", .expected = &.{ .{ .text = "2" }, .em_open, .{ .text = "3" }, .em_close, .{ .text = "4" } } },
+        .{ .input = "*a*b", .expected = &.{ .em_open, .{ .text = "a" }, .em_close, .{ .text = "b" } } },
         // Multi-backtick code spans.
         .{ .input = "``a`b``", .expected = &.{.{ .code = "a`b" }} },
         .{ .input = "`a``b`", .expected = &.{.{ .code = "a``b" }} },
@@ -669,14 +1869,42 @@ test "inline span edge cases" {
         .{ .input = "` x `", .expected = &.{.{ .code = "x" }} },
         .{ .input = "`  x `", .expected = &.{.{ .code = " x" }} },
         // Longer closing runs leave the extra markers as text.
-        .{ .input = "**a***", .expected = &.{ .{ .bold = "a" }, .{ .text = "*" } } },
-        // A `*` run may close inside a longer run: `*a**b*` is two emphases.
-        .{ .input = "*a**b*", .expected = &.{ .{ .italic = "a" }, .{ .italic = "b" } } },
+        .{ .input = "**a***", .expected = &.{ .strong_open, .{ .text = "a" }, .strong_close, .{ .text = "*" } } },
+        // The rule of 3 keeps `*a**b*` from matching the inner run.
+        .{ .input = "*a**b*", .expected = &.{ .em_open, .{ .text = "a**b" }, .em_close } },
         // Emphasis across a soft line break.
-        .{ .input = "*two\nlines*", .expected = &.{.{ .italic = "two\nlines" }} },
-        // Unclosed code span merges into text.
-        .{ .input = "x `` y", .expected = &.{ .{ .text = "x " }, .{ .text = "`` y" } } },
+        .{ .input = "*two\nlines*", .expected = &.{ .em_open, .{ .text = "two" }, .soft_break, .{ .text = "lines" }, .em_close } },
+        // Unclosed code spans merge into text.
+        .{ .input = "x `` y", .expected = &.{.{ .text = "x `` y" }} },
         .{ .input = "``", .expected = &.{.{ .text = "``" }} },
+        // Nested emphasis: `***` resolves to strong inside emphasis.
+        .{ .input = "***a***", .expected = &.{ .em_open, .strong_open, .{ .text = "a" }, .strong_close, .em_close } },
+        .{ .input = "*a *b* c*", .expected = &.{ .em_open, .{ .text = "a " }, .em_open, .{ .text = "b" }, .em_close, .{ .text = " c" }, .em_close } },
+        .{ .input = "**a *b* c**", .expected = &.{ .strong_open, .{ .text = "a " }, .em_open, .{ .text = "b" }, .em_close, .{ .text = " c" }, .strong_close } },
+        // Strikethrough: one or two tildes, counts must match.
+        .{ .input = "~~strike~~", .expected = &.{ .strike_open, .{ .text = "strike" }, .strike_close } },
+        .{ .input = "~one~", .expected = &.{ .strike_open, .{ .text = "one" }, .strike_close } },
+        .{ .input = "~a~~", .expected = &.{.{ .text = "~a~~" }} },
+        .{ .input = "~~~x~~~", .expected = &.{.{ .text = "~~~x~~~" }} },
+        // Links: destination and title, with emphasis in the text.
+        .{ .input = "[link](/url)", .expected = &.{ .{ .link = .{ .destination = "/url", .title = null } }, .{ .text = "link" }, .link_close } },
+        .{ .input = "[t](/u \"ti\")", .expected = &.{ .{ .link = .{ .destination = "/u", .title = "ti" } }, .{ .text = "t" }, .link_close } },
+        .{ .input = "[a](b(c))", .expected = &.{ .{ .link = .{ .destination = "b(c)", .title = null } }, .{ .text = "a" }, .link_close } },
+        .{ .input = "[in *em*](u)", .expected = &.{ .{ .link = .{ .destination = "u", .title = null } }, .{ .text = "in " }, .em_open, .{ .text = "em" }, .em_close, .link_close } },
+        .{ .input = "[bad](unclosed", .expected = &.{.{ .text = "[bad](unclosed" }} },
+        // Entities: named (known only) and numeric.
+        .{ .input = "&amp;", .expected = &.{.{ .entity = "&amp;" }} },
+        .{ .input = "&#65;", .expected = &.{.{ .entity = "&#65;" }} },
+        .{ .input = "&#x42;", .expected = &.{.{ .entity = "&#x42;" }} },
+        .{ .input = "&nope;", .expected = &.{.{ .text = "&nope;" }} },
+        .{ .input = "&copy", .expected = &.{.{ .text = "&copy" }} },
+        // Escapes.
+        .{ .input = "a\\*b", .expected = &.{ .{ .text = "a" }, .{ .escape = "*" }, .{ .text = "b" } } },
+        .{ .input = "\\\\", .expected = &.{.{ .escape = "\\" }} },
+        // Hard breaks: two trailing spaces or a backslash at the line end.
+        .{ .input = "end  \nnext", .expected = &.{ .{ .text = "end" }, .hard_break, .{ .text = "next" } } },
+        .{ .input = "back\\\nslash", .expected = &.{ .{ .text = "back" }, .hard_break, .{ .text = "slash" } } },
+        .{ .input = "soft\nbreak", .expected = &.{ .{ .text = "soft" }, .soft_break, .{ .text = "break" } } },
     };
 
     for (cases) |case| {
@@ -686,12 +1914,10 @@ test "inline span edge cases" {
                 debug.print("missing span in \"{s}\"\n", .{case.input});
                 return error.TestUnexpectedResult;
             };
-            try testing.expectEqual(meta.activeTag(expected), meta.activeTag(actual));
-            switch (expected) {
-                inline else => |exp, tag| {
-                    try testing.expectEqualStrings(exp, @field(actual, @tagName(tag)));
-                },
-            }
+            expectSpanEqual(expected, actual) catch |err| {
+                debug.print("in \"{s}\"\n", .{case.input});
+                return err;
+            };
         }
         if (it.next()) |extra| {
             debug.print("unexpected extra span in \"{s}\": {any}\n", .{ case.input, extra });
@@ -700,8 +1926,32 @@ test "inline span edge cases" {
     }
 }
 
+fn expectSpanEqual(expected: Span, actual: Span) !void {
+    try testing.expectEqual(meta.activeTag(expected), meta.activeTag(actual));
+    switch (expected) {
+        .text => |s| try testing.expectEqualStrings(s, actual.text),
+        .code => |s| try testing.expectEqualStrings(s, actual.code),
+        .entity => |s| try testing.expectEqualStrings(s, actual.entity),
+        .escape => |s| try testing.expectEqualStrings(s, actual.escape),
+        .link => |l| {
+            try testing.expectEqualStrings(l.destination, actual.link.destination);
+            if (l.title) |t| try testing.expectEqualStrings(t, actual.link.title.?);
+        },
+        .hard_break, .soft_break, .em_open, .em_close, .strong_open, .strong_close, .strike_open, .strike_close, .link_close => {},
+    }
+}
+
+test "decode entities" {
+    var buf: [4]u8 = undefined;
+    try testing.expectEqualStrings("&", Document.decodeEntity("&amp;", &buf).?);
+    try testing.expectEqualStrings("A", Document.decodeEntity("&#65;", &buf).?);
+    try testing.expectEqualStrings("\"", Document.decodeEntity("&#x22;", &buf).?);
+    try testing.expect(Document.decodeEntity("&nope;", &buf) == null);
+    try testing.expect(Document.decodeEntity("&#x110000;", &buf) == null);
+}
+
 test "zero-copy slices point into text" {
-    const text = "# Title\n\npara **bold**\n";
+    const text = "# Title\n\npara `code`\n";
     var doc = Document.init(text);
     const h = doc.next().?.header;
     try testing.expect(h.content.ptr == text.ptr + 2);
@@ -709,8 +1959,8 @@ test "zero-copy slices point into text" {
     try testing.expect(p.content.ptr == text.ptr + 9);
     var it = p.spans();
     _ = it.next().?.text;
-    const bold = it.next().?.bold;
-    try testing.expect(bold.ptr == text.ptr + 16);
+    const code = it.next().?.code;
+    try testing.expect(code.ptr == text.ptr + 15);
 }
 
 test "parse from a chunked reader matches borrowed parsing" {
@@ -722,7 +1972,9 @@ test "parse from a chunked reader matches borrowed parsing" {
         "\n" ++
         "```zig\nfn main() {}\n```\n" ++
         "---\n" ++
-        "Setext\n------\n";
+        "Setext\n------\n" ++
+        "- a\n- b\n" ++
+        "> quoted\n";
 
     var borrowed = Document.init(input);
 
@@ -742,20 +1994,7 @@ test "parse from a chunked reader matches borrowed parsing" {
 
     while (borrowed.next()) |elem_a| {
         const elem_b = streamed.next() orelse return error.TestUnexpectedResult;
-        try testing.expectEqual(meta.activeTag(elem_a), meta.activeTag(elem_b));
-        switch (elem_a) {
-            .header => |h| {
-                try testing.expectEqual(h.level, elem_b.header.level);
-                try testing.expectEqualStrings(h.content, elem_b.header.content);
-            },
-            .paragraph => |p| try testing.expectEqualStrings(p.content, elem_b.paragraph.content),
-            .code_block => |cb| {
-                try testing.expectEqual(cb.info != null, elem_b.code_block.info != null);
-                if (cb.info) |info| try testing.expectEqualStrings(info, elem_b.code_block.info.?);
-                try testing.expectEqualStrings(cb.content, elem_b.code_block.content);
-            },
-            .thematic_break => {},
-        }
+        try expectEqualElements(elem_a, elem_b, 0);
     }
     try testing.expect(streamed.next() == null);
 }
@@ -770,7 +2009,7 @@ test "parse of empty stream" {
 
 // Corpus entries also run as plain tests in every `zig build test`.
 test "fuzz parser safety" {
-    try testing.fuzz({}, fuzzOne, .{ .corpus = &corpus });
+    try testing.fuzz({}, fuzzOne, .{ .corpus = &fuzz_corpus });
 }
 
 // Deterministic randomized runs in every `zig build test`: random byte
@@ -802,16 +2041,91 @@ fn expectValidSpans(content: []const u8) !void {
     var it = Spans.init(content);
     var prev_pos: usize = 0;
     var count: usize = 0;
+    var open = [3]isize{ 0, 0, 0 };
+    var in_link = false;
     while (it.next()) |span| {
         count += 1;
         try testing.expect(it.pos > prev_pos);
         try testing.expect(it.pos <= content.len);
         prev_pos = it.pos;
         switch (span) {
-            inline else => |s| try expectWithin(s, content),
+            .text, .code, .entity => |s| try expectWithin(s, content),
+            .escape => |s| try testing.expectEqual(@as(usize, 1), s.len),
+            .hard_break, .soft_break => {},
+            .em_open => open[0] += 1,
+            .em_close => open[0] -= 1,
+            .strong_open => open[1] += 1,
+            .strong_close => open[1] -= 1,
+            .strike_open => open[2] += 1,
+            .strike_close => open[2] -= 1,
+            .link => |l| {
+                try testing.expect(!in_link);
+                in_link = true;
+                try expectWithin(l.destination, content);
+                if (l.title) |t| try expectWithin(t, content);
+            },
+            .link_close => in_link = false,
         }
+        try testing.expect(open[0] >= 0 and open[1] >= 0 and open[2] >= 0);
+        try testing.expect(count <= 2 * content.len + 1);
     }
-    try testing.expect(count <= content.len);
+    try testing.expectEqual(@as(isize, 0), open[0]);
+    try testing.expectEqual(@as(isize, 0), open[1]);
+    try testing.expectEqual(@as(isize, 0), open[2]);
+    try testing.expect(!in_link);
+}
+
+fn expectValidElement(elem: Element, text: []const u8, depth: usize) anyerror!void {
+    switch (elem) {
+        .header => |h| {
+            try testing.expect(h.level >= 1 and h.level <= 6);
+            try expectWithin(h.content, text);
+            try expectValidSpans(h.content);
+        },
+        .paragraph => |p| {
+            try expectWithin(p.content, text);
+            try expectValidSpans(p.content);
+            var lines = p.lines();
+            var line_count: usize = 0;
+            while (lines.next()) |l| {
+                line_count += 1;
+                try expectWithin(l, text);
+            }
+            try testing.expect(line_count <= p.content.len);
+        },
+        .code_block => |cb| {
+            if (cb.info) |info| try expectWithin(info, text);
+            try expectWithin(cb.content, text);
+            var lines = cb.lines();
+            while (lines.next()) |l| try expectWithin(l, text);
+        },
+        .thematic_break => {},
+        .list => |l| {
+            var items = l.items;
+            var item_count: usize = 0;
+            while (items.next()) |item| {
+                item_count += 1;
+                try testing.expect(item.indent >= 1);
+                try testing.expect(item.blocks.end <= text.len);
+                try testing.expect(item.blocks.cursor <= item.blocks.end);
+                try expectValidBlocks(item.blocks, text, depth + 1);
+            }
+            try testing.expect(item_count <= text.len);
+        },
+        .block_quote => |q| try expectValidBlocks(q.blocks, text, depth + 1),
+    }
+}
+
+fn expectValidBlocks(blocks: Blocks, text: []const u8, depth: usize) anyerror!void {
+    if (depth > 16) return;
+    var it = blocks;
+    var count: usize = 0;
+    while (it.next()) |elem| {
+        count += 1;
+        try testing.expect(it.cursor <= text.len);
+        try expectValidElement(elem, text, depth);
+        try testing.expect(count <= text.len);
+    }
 }
 
 fn expectValidDocument(doc: *Document) !void {
@@ -823,34 +2137,54 @@ fn expectValidDocument(doc: *Document) !void {
         try testing.expect(doc.cursor > prev_cursor);
         try testing.expect(doc.cursor <= text.len);
         prev_cursor = doc.cursor;
-        switch (elem) {
-            .header => |h| {
-                try testing.expect(h.level >= 1 and h.level <= 6);
-                try expectWithin(h.content, text);
-                try expectValidSpans(h.content);
-            },
-            .paragraph => |p| {
-                try expectWithin(p.content, text);
-                try expectValidSpans(p.content);
-                var lines = p.lines();
-                var line_count: usize = 0;
-                while (lines.next()) |l| {
-                    line_count += 1;
-                    try expectWithin(l, text);
-                }
-                try testing.expect(line_count <= p.content.len);
-            },
-            .code_block => |cb| {
-                if (cb.info) |info| try expectWithin(info, text);
-                try expectWithin(cb.content, text);
-            },
-            .thematic_break => {},
-        }
+        try expectValidElement(elem, text, 0);
         try testing.expect(count <= text.len);
     }
 }
 
-const corpus = [_][]const u8{
+fn expectEqualElements(a: Element, b: Element, depth: usize) anyerror!void {
+    try testing.expectEqual(meta.activeTag(a), meta.activeTag(b));
+    if (depth > 16) return;
+    switch (a) {
+        .header => |h| {
+            try testing.expectEqual(h.level, b.header.level);
+            try testing.expectEqualStrings(h.content, b.header.content);
+        },
+        .paragraph => |p| try testing.expectEqualStrings(p.content, b.paragraph.content),
+        .code_block => |cb| {
+            try testing.expectEqual(cb.info != null, b.code_block.info != null);
+            if (cb.info) |info| try testing.expectEqualStrings(info, b.code_block.info.?);
+            try testing.expectEqualStrings(cb.content, b.code_block.content);
+        },
+        .thematic_break => {},
+        .list => |l| {
+            try testing.expectEqual(l.ordered, b.list.ordered);
+            try testing.expectEqual(l.start, b.list.start);
+            try testing.expectEqual(l.tight, b.list.tight);
+            var ia = l.items;
+            var ib = b.list.items;
+            while (ia.next()) |item_a| {
+                const item_b = ib.next() orelse return error.TestUnexpectedResult;
+                try testing.expectEqual(item_a.task, item_b.task);
+                try expectEqualBlocks(item_a.blocks, item_b.blocks, depth + 1);
+            }
+            try testing.expect(ib.next() == null);
+        },
+        .block_quote => |q| try expectEqualBlocks(q.blocks, b.block_quote.blocks, depth + 1),
+    }
+}
+
+fn expectEqualBlocks(a: Blocks, b: Blocks, depth: usize) anyerror!void {
+    var ia = a;
+    var ib = b;
+    while (ia.next()) |elem_a| {
+        const elem_b = ib.next() orelse return error.TestUnexpectedResult;
+        try expectEqualElements(elem_a, elem_b, depth);
+    }
+    try testing.expect(ib.next() == null);
+}
+
+pub const fuzz_corpus = [_][]const u8{
     "",
     "\n\n\n",
     "# Hello\n\nWorld **bold** and `code`.\n",
@@ -867,18 +2201,36 @@ const corpus = [_][]const u8{
     "**** ** * *-- --- _ _ _ ``` ` ` `````\n",
     "> quote\n- list\n1. ordered\n| table |\n",
     "#\n##\n### ####\n-\n--\n=\n",
+    "- one\n- two\n\n1. a\n2) b\n\n* c\n",
+    "- a\n  - b\n    - c\n- back\n",
+    "- [ ] todo\n- [x] done\n- [X] also\n- [y] no\n",
+    "> quote\n> more\n> > nested\n\n> lazy\ncontinues\n",
+    "[link](/url \"title\") [bad](nope [also](x(y)\n",
+    "&amp; &#65; &#x42; &nope; &copy &\n",
+    "~~strike~~ ~one~ ~~a\nb~~ *em ~~both~~*\n",
+    "hard  \nbreak\\\ntext\n",
+    "10. ten\n- mix\n+ more\n",
+    "- a\n\n- b\n\n\n- c\n",
+    "> \n> \n",
+    "- \n-\n",
+    "***a*** **b *c* d** __e__ _f_\n",
+    "\\*not em\\* a\\\\b \\<tag\\>\n",
 };
 
-const fuzz_tokens = [_][]const u8{
-    "# ",         "## ",         "###### ",   "#######",  "#nospace",    "#",
-    "\n",         "\n\n",        "\r\n",      "\r\n\r\n", " ",           "  ",
-    "    ",       "\t",          "```",       "```zig\n", "````\n",      "~~~",
-    "~~~css\n",   "  ```",       "``` x`y\n", "text ",    "hello world", "*em*",
-    "**bold**",   "***both***",  "_under_",   "`code`",   "``a`b``",     "``",
-    "` unclosed", "** unclosed", "* ",        "_ ",       "---",         "***",
-    "___",        "- - -",       "--",        "=",        "=====",       "-----",
-    "-a-",        "a_b",         "2*3",       "**a*",     "*a**b*",      "` x `",
-    "> ",         "- item",      "1. item",
+pub const fuzz_tokens = [_][]const u8{
+    "# ",         "## ",         "###### ",     "#######",      "#nospace",    "#",
+    "\n",         "\n\n",        "\r\n",        "\r\n\r\n",     " ",           "  ",
+    "    ",       "\t",          "```",         "```zig\n",     "````\n",      "~~~",
+    "~~~css\n",   "  ```",       "``` x`y\n",   "text ",        "hello world", "*em*",
+    "**bold**",   "***both***",  "_under_",     "`code`",       "``a`b``",     "``",
+    "` unclosed", "** unclosed", "* ",          "_ ",           "---",         "***",
+    "___",        "- - -",       "--",          "=",            "=====",       "-----",
+    "-a-",        "a_b",         "2*3",         "**a*",         "*a**b*",      "` x `",
+    "> ",         "> > ",        "- item",      "1. item",      "1) item",     "10. item",
+    "- ",         "1. ",         "[a](b)",      "[a](b \"c\")", "[",           "](",
+    "(",          ")",           "&amp;",       "&#65;",        "&",           ";",
+    "~~",         "~",           "~~x~~",       "\\",           "\\*",         "- [ ] ",
+    "- [x] ",     "***a***",     "*a **b** c*", "![img](x)",    "   ",         "\t- ",
 };
 
 fn fuzzOne(_: void, smith: *testing.Smith) !void {
@@ -936,20 +2288,7 @@ fn fuzzOne(_: void, smith: *testing.Smith) !void {
 
         while (borrowed.next()) |elem_a| {
             const elem_b = streamed.next() orelse return error.TestUnexpectedResult;
-            try testing.expectEqual(meta.activeTag(elem_a), meta.activeTag(elem_b));
-            switch (elem_a) {
-                .header => |h| {
-                    try testing.expectEqual(h.level, elem_b.header.level);
-                    try testing.expectEqualStrings(h.content, elem_b.header.content);
-                },
-                .paragraph => |p| try testing.expectEqualStrings(p.content, elem_b.paragraph.content),
-                .code_block => |cb| {
-                    try testing.expectEqual(cb.info != null, elem_b.code_block.info != null);
-                    if (cb.info) |info| try testing.expectEqualStrings(info, elem_b.code_block.info.?);
-                    try testing.expectEqualStrings(cb.content, elem_b.code_block.content);
-                },
-                .thematic_break => {},
-            }
+            try expectEqualElements(elem_a, elem_b, 0);
         }
         try testing.expect(streamed.next() == null);
     }
