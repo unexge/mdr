@@ -12,7 +12,7 @@
 //! in the library; `init` borrows text already in memory. Markdown has no
 //! syntax errors, so parsing cannot fail.
 //!
-//! Not supported yet: indented code blocks, tables, HTML, images,
+//! Not supported yet: indented code blocks, HTML, images,
 //! autolinks and reference links. Container nesting deeper than 8 levels
 //! degrades to plain text.
 
@@ -65,6 +65,7 @@ pub const Element = union(enum) {
     thematic_break: ThematicBreak,
     list: List,
     block_quote: BlockQuote,
+    table: Table,
 
     pub const Header = struct {
         /// 1 to 6.
@@ -242,10 +243,23 @@ pub const Element = union(enum) {
     pub const BlockQuote = struct {
         blocks: Blocks,
     };
+
+    pub const Table = struct {
+        ncols: usize,
+        aligns: [max_table_cols]Alignment,
+        header: []const u8,
+        body: []const u8,
+        chain: Chain = .{},
+    };
 };
 
 /// Width of the `- [x] ` task marker relative to the list marker.
 const task_width = 4;
+
+/// Maximum table columns; wider tables degrade to paragraphs.
+pub const max_table_cols = 32;
+
+pub const Alignment = enum { left, center, right };
 
 pub const ListItem = struct {
     /// null when not a task list item; otherwise checked state.
@@ -299,6 +313,7 @@ pub const Blocks = struct {
             }
             if (body.len > 0 and body[0] == '>') return self.parseQuote(line);
             if (parseMarkerLine(body)) |marker| return self.parseList(marker);
+            if (self.parseTable(line)) |table| return table;
         }
         return self.parseParagraph(line);
     }
@@ -464,6 +479,54 @@ pub const Blocks = struct {
             },
         } };
     }
+
+    fn parseTable(self: *Blocks, first: Line) ?Element {
+        const text = self.text;
+        const extra = leadingSpaces(first.content);
+        if (extra > 3) return null;
+        const header = mem.trim(u8, first.content[extra..], " \t");
+        if (header.len == 0) return null;
+        if (first.next >= self.end) return null;
+        const second = chainLine(self.chain, text, first.next, self.end, false);
+        if (isBlankLine(second.content)) return null;
+        const extra2 = leadingSpaces(second.content);
+        if (extra2 > 3) return null;
+        const delimiter = mem.trim(u8, second.content[extra2..], " \t");
+        if (delimiter.len == 0) return null;
+        var aligns: [max_table_cols]Alignment = undefined;
+        const ncols = parseDelimiterRow(delimiter, &aligns) orelse return null;
+        var hbuf: [max_table_cols][]const u8 = undefined;
+        if (splitCells(header, &hbuf) != ncols) return null;
+        if (!containsTablePipe(header) and !containsTablePipe(delimiter)) return null;
+
+        const body_start = second.next;
+        var body_end = body_start;
+        var scan = body_start;
+        while (scan < self.end) {
+            const line = chainLine(self.chain, text, scan, self.end, false);
+            if (isBlankLine(line.content)) break;
+            const e = leadingSpaces(line.content);
+            if (e <= 3) {
+                const b = line.content[e..];
+                if (parseAtxHeader(b) != null) break;
+                if (parseFence(b) != null) break;
+                if (isThematicBreak(b)) break;
+                if (b.len > 0 and b[0] == '>') break;
+                if (parseMarkerLine(b) != null) break;
+            }
+            body_end = line.raw_end;
+            scan = line.next;
+        }
+
+        self.cursor = scan;
+        return .{ .table = .{
+            .ncols = ncols,
+            .aligns = aligns,
+            .header = header,
+            .body = text[body_start..body_end],
+            .chain = self.chain,
+        } };
+    }
 };
 
 /// Parses a list marker on a container-stripped line. The marker must be
@@ -546,6 +609,97 @@ fn taskMarker(content: []const u8) ?struct { done: bool } {
     };
     if (content.len > 3 and content[3] != ' ' and content[3] != '\t') return null;
     return .{ .done = done };
+}
+
+/// Splits a table row into cells on unescaped pipes outside code spans.
+/// Strips one optional leading and trailing boundary pipe, trims each cell.
+/// Returns the total count even when it exceeds `out.len`.
+pub fn splitCells(line: []const u8, out: [][]const u8) usize {
+    var s = mem.trim(u8, line, " \t");
+    if (s.len > 0 and s[0] == '|') s = s[1..];
+    if (s.len > 0 and s[s.len - 1] == '|' and !isEscapedPipe(s, s.len - 1)) s = s[0 .. s.len - 1];
+    if (s.len == 0) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\\' and i + 1 < s.len and isAsciiPunct(s[i + 1])) {
+            i += 2;
+            continue;
+        }
+        if (s[i] == '`') {
+            const run = runLen(s, i, '`');
+            if (findRunExact(s, i + run, '`', run)) |close| {
+                i = close + run;
+                continue;
+            }
+            i += run;
+            continue;
+        }
+        if (s[i] == '|') {
+            if (count < out.len) out[count] = mem.trim(u8, s[start..i], " \t");
+            count += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (count < out.len) out[count] = mem.trim(u8, s[start..], " \t");
+    return count + 1;
+}
+
+fn isEscapedPipe(s: []const u8, at: usize) bool {
+    var backslashes: usize = 0;
+    var i = at;
+    while (i > 0 and s[i - 1] == '\\') {
+        backslashes += 1;
+        i -= 1;
+    }
+    return backslashes % 2 == 1;
+}
+
+fn parseDelimiterRow(line: []const u8, aligns: *[max_table_cols]Alignment) ?usize {
+    var cells: [max_table_cols][]const u8 = undefined;
+    const n = splitCells(line, &cells);
+    if (n == 0 or n > max_table_cols) return null;
+    for (cells[0..n], 0..) |cell, i| {
+        var inner = cell;
+        var left = false;
+        var right = false;
+        if (inner.len > 0 and inner[0] == ':') {
+            left = true;
+            inner = inner[1..];
+        }
+        if (inner.len > 0 and inner[inner.len - 1] == ':') {
+            right = true;
+            inner = inner[0 .. inner.len - 1];
+        }
+        if (inner.len == 0) return null;
+        for (inner) |c| if (c != '-') return null;
+        aligns[i] = if (left and right) .center else if (right) .right else .left;
+    }
+    return n;
+}
+
+fn containsTablePipe(line: []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == '\\' and i + 1 < line.len and isAsciiPunct(line[i + 1])) {
+            i += 2;
+            continue;
+        }
+        if (line[i] == '`') {
+            const run = runLen(line, i, '`');
+            if (findRunExact(line, i + run, '`', run)) |close| {
+                i = close + run;
+                continue;
+            }
+            i += run;
+            continue;
+        }
+        if (line[i] == '|') return true;
+        i += 1;
+    }
+    return false;
 }
 
 /// An inline formatting event. Emphasis, strikethrough and links are
@@ -1778,6 +1932,52 @@ test "thematic break wins over list marker" {
     try testing.expect(doc.next() == null);
 }
 
+test "tables" {
+    var doc = Document.init("| a | b |\n|---|---|\n| c | d |\n\nafter\n");
+    const table = doc.next().?.table;
+    try testing.expectEqual(@as(usize, 2), table.ncols);
+    try testing.expectEqualStrings("| a | b |", table.header);
+
+    var hbuf: [max_table_cols][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), splitCells(table.header, &hbuf));
+    try testing.expectEqualStrings("a", hbuf[0]);
+    try testing.expectEqualStrings("b", hbuf[1]);
+
+    var lines = LineIterator{ .remaining = table.body, .chain = table.chain, .first = false };
+    var row: [max_table_cols][]const u8 = undefined;
+    try testing.expectEqualStrings("| c | d |", lines.next().?);
+    try testing.expect(lines.next() == null);
+    try testing.expectEqual(@as(usize, 2), splitCells("| c | d |", &row));
+    try testing.expectEqualStrings("c", row[0]);
+
+    try testing.expectEqualStrings("after", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+}
+
+test "table alignments and cell edge cases" {
+    var doc = Document.init("| l | r | c | d |\n| :--- | ---: | :---: | --- |\n");
+    const table = doc.next().?.table;
+    try testing.expectEqual(@as(usize, 4), table.ncols);
+    try testing.expectEqual(Alignment.left, table.aligns[0]);
+    try testing.expectEqual(Alignment.right, table.aligns[1]);
+    try testing.expectEqual(Alignment.center, table.aligns[2]);
+    try testing.expectEqual(Alignment.left, table.aligns[3]);
+    try testing.expectEqualStrings("", table.body);
+
+    var buf: [max_table_cols][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), splitCells("| a \\| b | `c|d` |", &buf));
+    try testing.expectEqualStrings("a \\| b", buf[0]);
+    try testing.expectEqualStrings("`c|d`", buf[1]);
+}
+
+test "table delimiter mismatch stays a paragraph" {
+    var doc = Document.init("| a | b |\n|---|\n");
+    try testing.expectEqualStrings("| a | b |\n|---|", doc.next().?.paragraph.content);
+
+    var setext = Document.init("plain\n---\n");
+    try testing.expectEqual(@as(u8, 2), setext.next().?.header.level);
+}
+
 test "block quotes" {
     var doc = Document.init("> # Title\n> para\n>\n> more\n\nafter\n");
     const quote = doc.next().?.block_quote;
@@ -2100,6 +2300,22 @@ fn expectValidElement(elem: Element, text: []const u8, depth: usize) anyerror!vo
             while (lines.next()) |l| try expectWithin(l, text);
         },
         .thematic_break => {},
+        .table => |t| {
+            try testing.expect(t.ncols >= 1 and t.ncols <= max_table_cols);
+            try expectWithin(t.header, text);
+            try expectWithin(t.body, text);
+            var hbuf: [max_table_cols][]const u8 = undefined;
+            try testing.expectEqual(t.ncols, splitCells(t.header, &hbuf));
+            for (hbuf[0..t.ncols]) |cell| try expectValidSpans(cell);
+            var lines = LineIterator{ .remaining = t.body, .chain = t.chain, .first = false };
+            var buf: [max_table_cols][]const u8 = undefined;
+            while (lines.next()) |line| {
+                try expectWithin(line, text);
+                const n = splitCells(line, &buf);
+                try testing.expect(n <= max_table_cols);
+                for (buf[0..@min(n, t.ncols)]) |cell| try expectValidSpans(cell);
+            }
+        },
         .list => |l| {
             var items = l.items;
             var item_count: usize = 0;
@@ -2157,6 +2373,12 @@ fn expectEqualElements(a: Element, b: Element, depth: usize) anyerror!void {
             try testing.expectEqualStrings(cb.content, b.code_block.content);
         },
         .thematic_break => {},
+        .table => |t| {
+            try testing.expectEqual(t.ncols, b.table.ncols);
+            for (t.aligns[0..t.ncols], b.table.aligns[0..t.ncols]) |x, y| try testing.expectEqual(x, y);
+            try testing.expectEqualStrings(t.header, b.table.header);
+            try testing.expectEqualStrings(t.body, b.table.body);
+        },
         .list => |l| {
             try testing.expectEqual(l.ordered, b.list.ordered);
             try testing.expectEqual(l.start, b.list.start);
@@ -2215,6 +2437,12 @@ pub const fuzz_corpus = [_][]const u8{
     "- \n-\n",
     "***a*** **b *c* d** __e__ _f_\n",
     "\\*not em\\* a\\\\b \\<tag\\>\n",
+    "| a | b |\n|---|---|\n| c | d |\n",
+    "| left | right | center |\n| :--- | ---: | :---: |\n",
+    "a | b\n--- | ---\nfoo\n",
+    "| escaped \\| pipe | `code|span` |\n|---|---|\n",
+    "| only header |\n|---|\n",
+    "not a table\n---\n",
 };
 
 pub const fuzz_tokens = [_][]const u8{
@@ -2231,6 +2459,8 @@ pub const fuzz_tokens = [_][]const u8{
     "(",          ")",           "&amp;",       "&#65;",        "&",           ";",
     "~~",         "~",           "~~x~~",       "\\",           "\\*",         "- [ ] ",
     "- [x] ",     "***a***",     "*a **b** c*", "![img](x)",    "   ",         "\t- ",
+    "| ",         "|",           "|---|",       "---|",         ":---",        "---:",
+    ":---:",      "\\|",         "`a|b`",
 };
 
 fn fuzzOne(_: void, smith: *testing.Smith) !void {

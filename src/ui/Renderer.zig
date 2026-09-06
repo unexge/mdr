@@ -73,6 +73,7 @@ fn layoutDepth(win: ?vaxis.Window, elem: Document.Element, row: usize, skip: usi
         .thematic_break => thematic_break.layout(win, row, skip, width),
         .list => |l| list.layout(win, l, row, skip, depth, width),
         .block_quote => |q| block_quote.layout(win, q.blocks, row, skip, depth, width),
+        .table => |t| table.layout(win, t, row, skip, width),
     };
 }
 
@@ -89,6 +90,7 @@ const code_block = @import("renderer/code_block.zig");
 const thematic_break = @import("renderer/thematic_break.zig");
 const list = @import("renderer/list.zig");
 const block_quote = @import("renderer/block_quote.zig");
+const table = @import("renderer/table.zig");
 
 test "block footprints include the trailing gap" {
     try testing.expectEqual(@as(usize, 2), measure(.{ .thematic_break = .{} }, 10));
