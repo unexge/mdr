@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     var doc = try mdr.Document.parse(&file_reader.interface, arena);
     defer doc.deinit();
 
-    var app = mdr.ui.init(init.gpa, &doc);
+    var app = mdr.ui.initFile(init.gpa, &doc, args[1]);
     defer app.deinit();
 
     try app.run(io, init.environ_map);

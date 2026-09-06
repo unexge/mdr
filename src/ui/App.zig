@@ -10,13 +10,38 @@ const App = @This();
 /// One lazily parsed element and its height at the current width.
 const Entry = struct {
     elem: Element,
+    media: Media.State = .idle,
+    virtual_rows: u16 = 0,
+    virtual_cols: u16 = 0,
     /// Footprint rows (content plus trailing gap); zero while unmeasured,
     /// e.g. right after parsing or a width change.
     height: usize = 0,
 };
 
+const MediaRequest = struct {
+    entry_index: usize,
+    path: []u8,
+    max_width: u16,
+    max_height: u16,
+    result: union(enum) {
+        pending,
+        ready: Media.Artifact,
+        failed,
+    } = .pending,
+
+    fn deinit(self: *MediaRequest, gpa: mem.Allocator) void {
+        gpa.free(self.path);
+        switch (self.result) {
+            .ready => |*artifact| artifact.deinit(gpa),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
 gpa: mem.Allocator,
 doc: *Document,
+base_dir: []const u8 = ".",
 
 /// Elements parsed so far; their slices point into `doc.text`. Heights live
 /// beside their element so the pair can never fall out of sync.
@@ -31,10 +56,26 @@ fully_parsed: bool = false,
 scroll: usize = 0,
 viewport: usize = 0,
 width: usize = 0,
+cell_width: usize = 0,
+cell_height: usize = 0,
+pending_media: ?*MediaRequest = null,
+placement_mode: Kitty.PlacementMode = .stable,
+graphics_supported: bool = false,
+virtual_placements: [max_images]Kitty.VirtualPlacement = undefined,
+virtual_placement_count: usize = 0,
+stable_placements: [max_images]Kitty.Placement = undefined,
+stable_placement_count: usize = 0,
+next_stable_placements: [max_images]Kitty.Placement = undefined,
+next_stable_placement_count: usize = 0,
+next_image_id: u32 = 1,
 quit: bool = false,
 
 pub fn init(gpa: mem.Allocator, doc: *Document) App {
     return .{ .gpa = gpa, .doc = doc };
+}
+
+pub fn initFile(gpa: mem.Allocator, doc: *Document, file_path: []const u8) App {
+    return .{ .gpa = gpa, .doc = doc, .base_dir = path.dirname(file_path) orelse "." };
 }
 
 pub fn deinit(self: *App) void {
@@ -43,6 +84,11 @@ pub fn deinit(self: *App) void {
 }
 
 pub fn run(self: *App, io: Io, environ: *std.process.Environ.Map) !void {
+    self.placement_mode = Kitty.placementMode(
+        environ.get("TERM") orelse "",
+        environ.get("TERM_PROGRAM") orelse "",
+        environ.get("KITTY_WINDOW_ID") orelse "",
+    );
     var tty_buffer: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buffer);
     defer tty.deinit();
@@ -58,18 +104,27 @@ pub fn run(self: *App, io: Io, environ: *std.process.Environ.Map) !void {
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
 
+    var media_tasks: Io.Group = .init;
+    defer {
+        media_tasks.cancel(io);
+        self.cancelPendingMedia();
+        self.freeImages(tty.writer());
+    }
+
     while (!self.quit) {
         switch (try loop.nextEvent()) {
             .key_press => |key| try self.handleKey(&vx, key),
             .winsize => |ws| try vx.resize(self.gpa, tty.writer(), ws),
+            .media_loaded => try self.finishMedia(tty.writer()),
         }
-        if (!self.quit) try self.draw(&vx, tty.writer());
+        if (!self.quit) try self.draw(io, &vx, tty.writer(), &loop, &media_tasks);
     }
 }
 
 const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
+    media_loaded,
 };
 
 fn handleKey(self: *App, vx: *vaxis.Vaxis, key: vaxis.Key) !void {
@@ -97,19 +152,42 @@ fn pageRows(viewport: usize) usize {
     return if (viewport > 1) viewport - 1 else 1;
 }
 
-fn draw(self: *App, vx: *vaxis.Vaxis, tty: *Io.Writer) !void {
+fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop(Event), media_tasks: *Io.Group) !void {
+    if (vx.caps.kitty_graphics) {
+        self.graphics_supported = true;
+        if (self.placement_mode == .stable) vx.caps.kitty_graphics = false;
+    }
     const win = vx.window();
     const content = win.child(.{
         .x_off = 0,
         .width = @intCast(contentWidth(win.width)),
     });
+    self.syncCellSize(content);
     self.syncWidth(content.width);
     try self.prepareFrame(content.height);
+    try self.startVisibleMedia(io, loop, media_tasks);
 
     Renderer.beginFrame();
     win.clear();
-    self.renderViewport(content);
+    self.virtual_placement_count = 0;
+    self.next_stable_placement_count = 0;
+    try self.renderViewport(content);
+    if (self.placement_mode == .unicode and self.virtual_placement_count > 0) {
+        try Kitty.defineVirtualPlacements(tty, self.virtual_placements[0..self.virtual_placement_count]);
+    }
     try vx.render(tty);
+    if (self.placement_mode == .stable) {
+        try Kitty.syncPlacements(
+            tty,
+            self.stable_placements[0..self.stable_placement_count],
+            self.next_stable_placements[0..self.next_stable_placement_count],
+        );
+        @memcpy(
+            self.stable_placements[0..self.next_stable_placement_count],
+            self.next_stable_placements[0..self.next_stable_placement_count],
+        );
+        self.stable_placement_count = self.next_stable_placement_count;
+    }
 }
 
 /// Content fills four fifths of the window; narrower windows than this
@@ -123,19 +201,59 @@ fn contentWidth(full: usize) usize {
 
 /// Draws the visible rows, skipping everything above `scroll` and stopping
 /// at the window bottom.
-fn renderViewport(self: *App, win: vaxis.Window) void {
+fn renderViewport(self: *App, win: vaxis.Window) !void {
     var row: usize = 0;
     var skip = self.scroll;
-    for (self.entries.items) |entry| {
+    for (self.entries.items) |*entry| {
         if (row >= win.height) break;
         // Cached heights are footprints: content rows plus the gap after.
         if (skip >= entry.height) {
             skip -= entry.height;
             continue;
         }
-        row = Renderer.render(win, entry.elem, row, skip);
+        row = try self.renderEntry(win, entry, row, skip);
         skip = 0;
         row = @min(win.height, row + 1);
+    }
+}
+
+fn renderEntry(self: *App, win: vaxis.Window, entry: *Entry, row: usize, skip: usize) !usize {
+    switch (entry.media) {
+        .ready => |image| {
+            const rows = Media.rowsForSize(image.width, image.height, self.width, self.cell_width, self.cell_height);
+            if (skip >= rows) return row;
+            const visible_rows = rows - skip;
+            const draw_rows = @min(visible_rows, win.height -| row);
+            const cols = @max(1, @min(self.width, math.divCeil(usize, image.width, self.cell_width) catch self.width));
+            if (self.placement_mode == .unicode) {
+                if ((entry.virtual_rows != rows or entry.virtual_cols != cols) and
+                    self.virtual_placement_count < self.virtual_placements.len)
+                {
+                    entry.virtual_rows = @intCast(rows);
+                    entry.virtual_cols = @intCast(cols);
+                    self.virtual_placements[self.virtual_placement_count] = .{
+                        .image_id = image.id,
+                        .rows = entry.virtual_rows,
+                        .cols = @intCast(cols),
+                    };
+                    self.virtual_placement_count += 1;
+                }
+                Kitty.drawPlaceholder(win, image.id, row, skip, draw_rows, cols);
+            } else if (self.next_stable_placement_count < self.next_stable_placements.len) {
+                const source_y: u16 = @intCast(@as(usize, image.height) * skip / rows);
+                self.next_stable_placements[self.next_stable_placement_count] = .{
+                    .image_id = image.id,
+                    .row = row,
+                    .rows = @intCast(draw_rows),
+                    .cols = @intCast(cols),
+                    .source_y = if (skip == 0) null else source_y,
+                    .source_height = if (skip == 0) null else image.height - source_y,
+                };
+                self.next_stable_placement_count += 1;
+            }
+            return row + draw_rows;
+        },
+        else => return Renderer.render(win, entry.elem, row, skip),
     }
 }
 
@@ -155,7 +273,7 @@ fn ensureVisible(self: *App, bottom: usize) !void {
     while (self.total_height < bottom) {
         if (self.measured < self.entries.items.len) {
             const entry = &self.entries.items[self.measured];
-            entry.height = Renderer.measure(entry.elem, self.width);
+            entry.height = self.measureEntry(entry.*);
             self.total_height += entry.height;
             self.measured += 1;
             continue;
@@ -165,8 +283,36 @@ fn ensureVisible(self: *App, bottom: usize) !void {
             self.fully_parsed = true;
             return;
         };
-        try self.entries.append(self.gpa, .{ .elem = elem });
+        try self.entries.append(self.gpa, .{
+            .elem = elem,
+            .media = switch (elem) {
+                .image => |image| Media.State.init(image.source),
+                else => .idle,
+            },
+        });
     }
+}
+
+fn measureEntry(self: *const App, entry: Entry) usize {
+    return switch (entry.media) {
+        .ready => |image| Media.rowsForSize(image.width, image.height, self.width, self.cell_width, self.cell_height) + 1,
+        else => Renderer.measure(entry.elem, self.width),
+    };
+}
+
+fn syncCellSize(self: *App, win: vaxis.Window) void {
+    const cell_width = if (win.screen.width > 0 and win.screen.width_pix > 0)
+        math.divCeil(usize, win.screen.width_pix, win.screen.width) catch 8
+    else
+        8;
+    const cell_height = if (win.screen.height > 0 and win.screen.height_pix > 0)
+        math.divCeil(usize, win.screen.height_pix, win.screen.height) catch 16
+    else
+        16;
+    if (self.cell_width == cell_width and self.cell_height == cell_height) return;
+    self.cell_width = cell_width;
+    self.cell_height = cell_height;
+    self.invalidateMeasurementsFrom(0);
 }
 
 /// Heights are width-dependent; a width change invalidates them and they
@@ -174,9 +320,130 @@ fn ensureVisible(self: *App, bottom: usize) !void {
 fn syncWidth(self: *App, width: usize) void {
     if (self.width == width) return;
     self.width = width;
-    for (self.entries.items) |*entry| entry.height = 0;
-    self.measured = 0;
+    self.invalidateMeasurementsFrom(0);
+}
+
+fn invalidateMeasurementsFrom(self: *App, index: usize) void {
+    const start = @min(index, self.measured);
+    for (self.entries.items[start..]) |*entry| entry.height = 0;
+    self.measured = start;
     self.total_height = 0;
+    for (self.entries.items[0..start]) |entry| self.total_height += entry.height;
+}
+
+fn startVisibleMedia(self: *App, io: Io, loop: *vaxis.Loop(Event), media_tasks: *Io.Group) !void {
+    if (!self.graphics_supported or self.pending_media != null) return;
+    var top: usize = 0;
+    for (self.entries.items, 0..) |*entry, index| {
+        if (entry.height == 0) break;
+        const bottom = top + entry.height;
+        const visible = bottom > self.scroll and top < self.scroll + self.viewport;
+        top = bottom;
+        if (!visible or entry.media != .idle or entry.elem != .image) continue;
+
+        const resolved = try Media.resolveLocal(self.gpa, self.base_dir, entry.elem.image.source);
+        errdefer self.gpa.free(resolved);
+        const request = try self.gpa.create(MediaRequest);
+        errdefer self.gpa.destroy(request);
+        request.* = .{
+            .entry_index = index,
+            .path = resolved,
+            .max_width = @intCast(@min(
+                math.mul(usize, self.width, self.cell_width) catch math.maxInt(u16),
+                math.maxInt(u16),
+            )),
+            .max_height = @intCast(@min(
+                math.mul(usize, 16, self.cell_height) catch math.maxInt(u16),
+                math.maxInt(u16),
+            )),
+        };
+        self.pending_media = request;
+        entry.media = .loading;
+        media_tasks.concurrent(io, loadMedia, .{ io, self.gpa, request, loop }) catch {
+            self.pending_media = null;
+            entry.media = .failed;
+            request.deinit(self.gpa);
+            self.gpa.destroy(request);
+        };
+        return;
+    }
+}
+
+fn loadMedia(io: Io, gpa: mem.Allocator, request: *MediaRequest, loop: *vaxis.Loop(Event)) Io.Cancelable!void {
+    const artifact = Media.loadLocal(io, gpa, request.path, request.max_width, request.max_height) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+        request.result = .failed;
+        try loop.postEvent(.media_loaded);
+        return;
+    };
+    request.result = .{ .ready = artifact };
+    try loop.postEvent(.media_loaded);
+}
+
+fn finishMedia(self: *App, tty: *Io.Writer) !void {
+    const request = self.pending_media orelse return;
+    self.pending_media = null;
+    defer {
+        request.deinit(self.gpa);
+        self.gpa.destroy(request);
+    }
+    if (request.entry_index >= self.entries.items.len) return;
+    const entry = &self.entries.items[request.entry_index];
+    switch (request.result) {
+        .ready => |artifact| {
+            self.evictImage(tty, request.entry_index);
+            entry.media = .{ .ready = Kitty.transmit(
+                tty,
+                self.next_image_id,
+                artifact.payload,
+                artifact.width,
+                artifact.height,
+            ) catch {
+                entry.media = .failed;
+                return;
+            } };
+            self.next_image_id +%= 1;
+            if (self.next_image_id == 0) self.next_image_id = 1;
+        },
+        .pending, .failed => entry.media = .failed,
+    }
+    self.invalidateMeasurementsFrom(request.entry_index);
+}
+
+fn evictImage(self: *App, tty: *Io.Writer, incoming: usize) void {
+    var count: usize = 0;
+    var victim: ?usize = null;
+    var victim_distance: usize = 0;
+    for (self.entries.items, 0..) |entry, index| {
+        if (entry.media != .ready) continue;
+        count += 1;
+        const distance = @max(index, incoming) - @min(index, incoming);
+        if (victim == null or distance > victim_distance) {
+            victim = index;
+            victim_distance = distance;
+        }
+    }
+    if (count < max_images) return;
+    const index = victim orelse return;
+    Kitty.free(tty, self.entries.items[index].media.ready.id);
+    self.entries.items[index].media = .idle;
+    self.entries.items[index].virtual_rows = 0;
+    self.entries.items[index].virtual_cols = 0;
+    self.invalidateMeasurementsFrom(index);
+}
+
+fn cancelPendingMedia(self: *App) void {
+    const request = self.pending_media orelse return;
+    request.deinit(self.gpa);
+    self.gpa.destroy(request);
+    self.pending_media = null;
+}
+
+fn freeImages(self: *App, tty: *Io.Writer) void {
+    for (self.entries.items) |*entry| {
+        if (entry.media == .ready) Kitty.free(tty, entry.media.ready.id);
+        entry.media = .idle;
+    }
 }
 
 fn clampScroll(self: *App) void {
@@ -192,11 +459,15 @@ const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
 const math = std.math;
+const path = std.fs.path;
 const vaxis = @import("vaxis");
 const Document = @import("../Document.zig");
 const Renderer = @import("Renderer.zig");
+const Media = @import("Media.zig");
+const Kitty = @import("Kitty.zig");
 const Element = Document.Element;
 const ArrayList = std.ArrayList;
+const max_images = 8;
 
 test "parses only what the viewport needs" {
     var doc = Document.init(lazy_text);
@@ -270,6 +541,79 @@ test "resize measures on demand after the document is fully parsed" {
     try testing.expectEqual(app.total_height, sum);
 }
 
+test "ready image entry measures from its raster dimensions" {
+    var doc = Document.init("");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 40;
+    app.cell_width = 10;
+    app.cell_height = 20;
+    app.placement_mode = .unicode;
+
+    var entry: Entry = .{
+        .elem = .{ .image = .{ .alt = "diagram", .source = "diagram.png", .title = null } },
+        .media = .{ .ready = vaxis.Image.init(1, 800, 400) },
+    };
+    try testing.expectEqual(@as(usize, 11), app.measureEntry(entry));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 12, .cols = 40, .x_pixel = 400, .y_pixel = 240 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 12,
+        .screen = &screen,
+    };
+    try testing.expectEqual(@as(usize, 10), app.renderEntry(win, &entry, 0, 0));
+    try testing.expectEqual(@as(usize, 1), app.virtual_placement_count);
+    try testing.expectEqual(@as(u32, 1), app.virtual_placements[0].image_id);
+    try testing.expectEqualStrings("\u{10eeee}\u{0305}", win.readCell(0, 0).?.char.grapheme);
+
+    app.virtual_placement_count = 0;
+    try testing.expectEqual(@as(usize, 6), app.renderEntry(win, &entry, 0, 4));
+    try testing.expectEqual(@as(usize, 0), app.virtual_placement_count);
+    try testing.expectEqualStrings("\u{10eeee}\u{0312}", win.readCell(0, 0).?.char.grapheme);
+
+    win.clear();
+    app.placement_mode = .stable;
+    _ = try app.renderEntry(win, &entry, 0, 0);
+    try testing.expectEqual(@as(usize, 1), app.next_stable_placement_count);
+    try testing.expectEqual(@as(u32, 1), app.next_stable_placements[0].image_id);
+    try testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
+}
+
+test "unavailable image states render a placeholder" {
+    var doc = Document.init("");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 40;
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 1,
+        .screen = &screen,
+    };
+    const states = [_]Media.State{ .loading, .unsupported, .failed };
+    for (states) |state| {
+        var entry: Entry = .{
+            .elem = .{ .image = .{ .alt = "diagram", .source = "diagram.png", .title = null } },
+            .media = state,
+        };
+        _ = try app.renderEntry(win, &entry, 0, 0);
+        try testing.expectEqualStrings("[", win.readCell(0, 0).?.char.grapheme);
+        win.clear();
+    }
+}
+
 test "scrolling shifts content up" {
     var doc = Document.init("first\n\nsecond\n\nthird");
     var app = App.init(testing.allocator, &doc);
@@ -290,19 +634,19 @@ test "scrolling shifts content up" {
         .screen = &screen,
     };
 
-    app.renderViewport(win);
+    try app.renderViewport(win);
     try expectCell(win, 0, 0, 'f');
     try expectCell(win, 0, 2, 's');
 
     win.clear();
     app.scroll = 1;
-    app.renderViewport(win);
+    try app.renderViewport(win);
     try expectCell(win, 0, 0, ' ');
     try expectCell(win, 0, 1, 's');
 
     win.clear();
     app.scroll = 2;
-    app.renderViewport(win);
+    try app.renderViewport(win);
     try expectCell(win, 0, 0, 's');
     try expectCell(win, 0, 2, 't');
 }
@@ -339,7 +683,7 @@ test "scrolling reaches the last line of a long document" {
     };
 
     app.scroll = app.maxScroll();
-    app.renderViewport(win);
+    try app.renderViewport(win);
     try expectCell(win, 0, 1, 'd');
 }
 
@@ -363,7 +707,7 @@ test "code blocks render the info line above the content" {
         .screen = &screen,
     };
 
-    app.renderViewport(win);
+    try app.renderViewport(win);
     try expectCell(win, 0, 0, 'z');
     try expectCell(win, 2, 0, 'g');
     try expectCell(win, 0, 1, 'h');
@@ -391,7 +735,7 @@ test "lists render markers and item content" {
         .screen = &screen,
     };
 
-    app.renderViewport(win);
+    try app.renderViewport(win);
     try expectCell(win, 0, 0, '-');
     try expectCell(win, 2, 0, 'o');
     try expectCell(win, 0, 1, '-');
@@ -419,7 +763,7 @@ test "ordered and task markers" {
         .screen = &screen,
     };
 
-    app.renderViewport(win);
+    try app.renderViewport(win);
     try expectCell(win, 0, 0, '3');
     try expectCell(win, 1, 0, '.');
     try expectCell(win, 3, 0, 'x');
@@ -448,7 +792,7 @@ test "block quotes render the bar and inset content" {
         .screen = &screen,
     };
 
-    app.renderViewport(win);
+    try app.renderViewport(win);
     const bar = win.readCell(0, 0) orelse return error.TestUnexpectedCell;
     try testing.expectEqualStrings("\u{2502}", bar.char.grapheme);
     try expectCell(win, 2, 0, 'h');
@@ -476,7 +820,7 @@ test "tables render inside block quotes" {
         .screen = &screen,
     };
 
-    app.renderViewport(win);
+    try app.renderViewport(win);
     const bar = win.readCell(0, 0) orelse return error.TestUnexpectedCell;
     try testing.expectEqualStrings("\u{2502}", bar.char.grapheme);
     try expectCell(win, 2, 0, '|');
@@ -506,7 +850,7 @@ test "reference links resolve and definitions are stripped" {
         .screen = &screen,
     };
 
-    app.renderViewport(win);
+    try app.renderViewport(win);
     const link = win.readCell(0, 0) orelse return error.TestUnexpectedCell;
     try testing.expectEqualStrings("c", link.char.grapheme);
     try testing.expect(link.style.ul_style == .single);
@@ -607,7 +951,7 @@ fn fuzzRender(_: void, smith: *testing.Smith) !void {
             .height = @intCast(viewport),
             .screen = &screen,
         };
-        app.renderViewport(win);
+        try app.renderViewport(win);
 
         width = smith.valueRangeAtMost(u16, 8, 100);
     }

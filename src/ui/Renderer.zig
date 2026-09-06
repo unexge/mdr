@@ -69,6 +69,7 @@ fn layoutDepth(win: ?vaxis.Window, elem: Document.Element, row: usize, skip: usi
     return switch (elem) {
         .header => |h| header.layout(win, h, row, skip, width),
         .paragraph => |p| text.layout(win, p.content, .{}, row, skip, width, p.chain, .left, p.refs),
+        .image => |img| image.layout(win, img, row, skip, width),
         .code_block => |cb| code_block.layout(win, cb, row, skip, width),
         .thematic_break => thematic_break.layout(win, row, skip, width),
         .list => |l| list.layout(win, l, row, skip, depth, width),
@@ -87,6 +88,7 @@ const list = @import("renderer/list.zig");
 const block_quote = @import("renderer/block_quote.zig");
 const header = @import("renderer/header.zig");
 const table = @import("renderer/table.zig");
+const image = @import("renderer/image.zig");
 
 test "block footprints include the trailing gap" {
     try testing.expectEqual(@as(usize, 2), measure(.{ .thematic_break = .{} }, 10));
@@ -128,6 +130,31 @@ test "renders link destinations on visible label cells" {
         try testing.expectEqualStrings("https://example.com", win.readCell(@intCast(col), 0).?.link.uri);
     }
     try testing.expectEqualStrings("", win.readCell(8, 0).?.link.uri);
+}
+
+test "renders a placeholder for a remote image" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 1,
+        .screen = &screen,
+    };
+
+    _ = render(win, .{ .image = .{
+        .alt = "architecture",
+        .source = "https://example.com/architecture.png",
+        .title = null,
+    } }, 0, 0);
+
+    const expected = "[remote image: architecture]";
+    for (expected, 0..) |char, col| {
+        try testing.expectEqualStrings(&.{char}, win.readCell(@intCast(col), 0).?.char.grapheme);
+    }
 }
 
 const testing = std.testing;

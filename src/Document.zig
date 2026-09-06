@@ -12,8 +12,9 @@
 //! in the library; `init` borrows text already in memory. Markdown has no
 //! syntax errors, so parsing cannot fail.
 //!
-//! Not supported yet: indented code blocks, HTML and images. Container nesting deeper than 8 levels
-//! degrades to plain text.
+//! Not supported yet: indented code blocks, HTML and inline or reference
+//! images. Standalone direct images are block elements. Container nesting
+//! deeper than 8 levels degrades to plain text.
 
 const Document = @This();
 
@@ -64,6 +65,7 @@ pub fn next(self: *Document) ?Element {
 pub const Element = union(enum) {
     header: Header,
     paragraph: Paragraph,
+    image: Image,
     code_block: CodeBlock,
     thematic_break: ThematicBreak,
     list: List,
@@ -100,6 +102,12 @@ pub const Element = union(enum) {
         pub fn spans(self: Paragraph) Spans {
             return .initChain(self.content, self.chain);
         }
+    };
+
+    pub const Image = struct {
+        alt: []const u8,
+        source: []const u8,
+        title: ?[]const u8,
     };
 
     pub const CodeBlock = struct {
@@ -332,6 +340,10 @@ pub const Blocks = struct {
                 if (body.len > 0 and body[0] == '>') return self.parseQuote(line);
                 if (parseMarkerLine(body)) |marker| return self.parseList(marker);
                 if (self.parseTable(line)) |table| return table;
+                if (self.parseStandaloneImage(body)) |image| {
+                    self.cursor = line.next;
+                    return .{ .image = image };
+                }
             }
             if (self.parseParagraph(line)) |elem| return elem;
         }
@@ -369,6 +381,7 @@ pub const Blocks = struct {
                     scan = line.next;
                     continue;
                 }
+                if (self.parseStandaloneImage(body) != null) break;
                 // A `-` run under a paragraph is a setext h2, not an hr.
                 if (content_start != null) {
                     if (setextLevel(body)) |level| {
@@ -407,11 +420,25 @@ pub const Blocks = struct {
             return null;
         };
         self.cursor = scan;
+        const content = trimBlockContent(text[cs..content_end]);
+        if (self.parseStandaloneImage(content)) |image| return .{ .image = image };
         return .{ .paragraph = .{
-            .content = trimBlockContent(text[cs..content_end]),
+            .content = content,
             .chain = self.chain,
             .refs = self.refs,
         } };
+    }
+
+    fn parseStandaloneImage(self: *Blocks, content: []const u8) ?Element.Image {
+        if (content.len < 5 or content[0] != '!' or content[1] != '[') return null;
+        var spans: Spans = .{ .content = content, .chain = self.chain, .refs = self.refs };
+        const parsed = spans.parseLink(1) orelse return null;
+        if (parsed.after != content.len) return null;
+        return .{
+            .alt = content[2..parsed.text_end],
+            .source = parsed.destination,
+            .title = parsed.title,
+        };
     }
 
     fn parseCodeBlock(self: *Blocks, fence: Fence, first: Line) Element {
@@ -1233,7 +1260,7 @@ pub const Spans = struct {
                     i += 1;
                 },
                 '!' => {
-                    // Images are not supported; skip the marker.
+                    // Inline images stay literal; standalone images are blocks.
                     i += if (i + 1 < c.len and c[i + 1] == '[') 2 else 1;
                 },
                 else => i += 1,
@@ -1291,8 +1318,8 @@ pub const Spans = struct {
     }
 
     /// True when the `[` at `open` continues an image alt group
-    /// (`![alt][...]`), whose labels stay literal because images are not
-    /// supported. Inline links after an image still resolve separately.
+    /// (`![alt][...]`), whose labels stay literal because reference images
+    /// are not supported. Inline links after an image still resolve separately.
     fn followsImageAlt(c: []const u8, open: usize) bool {
         if (open < 2 or c[open - 1] != ']') return false;
         var depth: usize = 1;
@@ -1324,7 +1351,7 @@ pub const Spans = struct {
     fn parseRefLink(self: *Spans, open: usize) ?ParsedLink {
         const refs = self.refs orelse return null;
         const c = self.content;
-        // Image markers stay fully literal; images are not supported.
+        // Reference and inline image markers stay fully literal.
         if (open > 0 and c[open - 1] == '!' and !isEscapedPipe(c, open - 1)) return null;
         if (followsImageAlt(c, open)) return null;
         const text_end = findLinkTextEnd(c, open) orelse return null;
@@ -2404,6 +2431,31 @@ test "undefined references stay literal" {
     try testing.expect(it.next() == null);
 }
 
+test "standalone image paragraph becomes an image element" {
+    var doc = Document.init("![architecture](images/architecture.png \"System overview\")");
+    const image = doc.next().?.image;
+
+    try testing.expectEqualStrings("architecture", image.alt);
+    try testing.expectEqualStrings("images/architecture.png", image.source);
+    try testing.expectEqualStrings("System overview", image.title.?);
+    try testing.expect(doc.next() == null);
+}
+
+test "image-only lines interrupt surrounding paragraph text" {
+    var doc = Document.init(
+        \\before
+        \\![one](one.png)
+        \\![two](two.png)
+        \\after
+    );
+
+    try testing.expectEqualStrings("before", doc.next().?.paragraph.content);
+    try testing.expectEqualStrings("one.png", doc.next().?.image.source);
+    try testing.expectEqualStrings("two.png", doc.next().?.image.source);
+    try testing.expectEqualStrings("after", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+}
+
 test "image markers stay literal with references defined" {
     var doc = Document.init("![alt][img]\n\n[img]: /u\n");
     const p = doc.next().?.paragraph;
@@ -2795,6 +2847,11 @@ fn expectValidElement(elem: Element, text: []const u8, depth: usize) anyerror!vo
             }
             try testing.expect(line_count <= p.content.len);
         },
+        .image => |image| {
+            try expectWithin(image.alt, text);
+            try expectWithin(image.source, text);
+            if (image.title) |title| try expectWithin(title, text);
+        },
         .code_block => |cb| {
             if (cb.info) |info| try expectWithin(info, text);
             try expectWithin(cb.content, text);
@@ -2869,6 +2926,12 @@ fn expectEqualElements(a: Element, b: Element, depth: usize) anyerror!void {
             try testing.expectEqualStrings(h.content, b.header.content);
         },
         .paragraph => |p| try testing.expectEqualStrings(p.content, b.paragraph.content),
+        .image => |image| {
+            try testing.expectEqualStrings(image.alt, b.image.alt);
+            try testing.expectEqualStrings(image.source, b.image.source);
+            try testing.expectEqual(image.title != null, b.image.title != null);
+            if (image.title) |title| try testing.expectEqualStrings(title, b.image.title.?);
+        },
         .code_block => |cb| {
             try testing.expectEqual(cb.info != null, b.code_block.info != null);
             if (cb.info) |info| try testing.expectEqualStrings(info, b.code_block.info.?);
