@@ -112,10 +112,14 @@ pub fn run(self: *App, io: Io, environ: *std.process.Environ.Map) !void {
     }
 
     while (!self.quit) {
-        switch (try loop.nextEvent()) {
-            .key_press => |key| try self.handleKey(&vx, key),
-            .winsize => |ws| try vx.resize(self.gpa, tty.writer(), ws),
-            .media_loaded => try self.finishMedia(tty.writer()),
+        try loop.pollEvent();
+        while (try loop.tryEvent()) |event| {
+            switch (event) {
+                .key_press => |key| try self.handleKey(&vx, key),
+                .winsize => |ws| try vx.resize(self.gpa, tty.writer(), ws),
+                .media_loaded => try self.finishMedia(tty.writer()),
+            }
+            if (self.quit) break;
         }
         if (!self.quit) try self.draw(io, &vx, tty.writer(), &loop, &media_tasks);
     }
