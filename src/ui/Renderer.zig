@@ -94,6 +94,7 @@ test "block footprints include the trailing gap" {
     try testing.expectEqual(@as(usize, 2), measure(.{ .thematic_break = .{} }, 10));
     try testing.expectEqual(@as(usize, 2), measure(.{ .paragraph = .{ .content = "hi" } }, 10));
     try testing.expectEqual(@as(usize, 2), measure(.{ .header = .{ .level = 3, .content = "a\nb" } }, 10));
+    try testing.expectEqual(@as(usize, 3), measure(.{ .header = .{ .level = 1, .content = "title" } }, 10));
 }
 
 test "list and quote footprints" {
