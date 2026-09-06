@@ -29,8 +29,8 @@ fn frameCopy(bytes: []const u8) ?[]const u8 {
     return out;
 }
 
-pub fn measure(content: []const u8, width: usize, chain: Document.Chain) usize {
-    return layout(null, content, .{}, 0, 0, width, chain, .left, null);
+pub fn measure(content: []const u8, width: usize, chain: Document.Chain, refs: ?*Document.RefTable) usize {
+    return layout(null, content, .{}, 0, 0, width, chain, .left, refs);
 }
 
 pub fn render(win: vaxis.Window, content: []const u8, base: vaxis.Style, start_row: usize, skip: usize, chain: Document.Chain) usize {
@@ -346,24 +346,24 @@ const Document = @import("../../Document.zig");
 const vaxis = @import("vaxis");
 
 test "wraps words at the width" {
-    try testing.expectEqual(@as(usize, 2), measure("hello world", 5, .{}));
-    try testing.expectEqual(@as(usize, 1), measure("aa bb cc dd", 11, .{}));
-    try testing.expectEqual(@as(usize, 0), measure("", 10, .{}));
+    try testing.expectEqual(@as(usize, 2), measure("hello world", 5, .{}, null));
+    try testing.expectEqual(@as(usize, 1), measure("aa bb cc dd", 11, .{}, null));
+    try testing.expectEqual(@as(usize, 0), measure("", 10, .{}, null));
 }
 
 test "hard wraps words longer than the width" {
-    try testing.expectEqual(@as(usize, 3), measure("abcdefghij", 4, .{}));
+    try testing.expectEqual(@as(usize, 3), measure("abcdefghij", 4, .{}, null));
 }
 
 test "soft breaks reflow, hard breaks keep lines" {
-    try testing.expectEqual(@as(usize, 1), measure("a\nb", 10, .{}));
-    try testing.expectEqual(@as(usize, 1), measure("aa bb\ncc dd", 11, .{}));
-    try testing.expectEqual(@as(usize, 2), measure("a  \nb", 10, .{}));
+    try testing.expectEqual(@as(usize, 1), measure("a\nb", 10, .{}, null));
+    try testing.expectEqual(@as(usize, 1), measure("aa bb\ncc dd", 11, .{}, null));
+    try testing.expectEqual(@as(usize, 2), measure("a  \nb", 10, .{}, null));
 }
 
 test "spans measure like their text" {
-    try testing.expectEqual(@as(usize, 1), measure("**bold** text", 10, .{}));
-    try testing.expectEqual(@as(usize, 2), measure("a *b c* d", 4, .{}));
+    try testing.expectEqual(@as(usize, 1), measure("**bold** text", 10, .{}, null));
+    try testing.expectEqual(@as(usize, 2), measure("a *b c* d", 4, .{}, null));
 }
 
 test "spaces survive span boundaries" {
@@ -388,8 +388,16 @@ test "spaces survive span boundaries" {
 }
 
 test "line breaks and entities occupy rows" {
-    try testing.expectEqual(@as(usize, 2), measure("end  \nnext", 40, .{}));
-    try testing.expectEqual(@as(usize, 1), measure("&amp;", 40, .{}));
+    try testing.expectEqual(@as(usize, 2), measure("end  \nnext", 40, .{}, null));
+    try testing.expectEqual(@as(usize, 1), measure("&amp;", 40, .{}, null));
+}
+
+test "measures with reference links resolved" {
+    var doc = Document.init("[click][here] and more text here\n\n[here]: /url\n");
+    const p = doc.next().?.paragraph;
+    try testing.expectEqual(layout(null, p.content, .{}, 0, 0, 20, p.chain, .left, p.refs), measure(p.content, 20, p.chain, p.refs));
+    try testing.expectEqual(@as(usize, 1), measure("[click][here]", 6, .{}, p.refs));
+    try testing.expectEqual(@as(usize, 3), measure("[click][here]", 6, .{}, null));
 }
 
 test "renders center and right alignment" {

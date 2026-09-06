@@ -23,13 +23,13 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
 
     if (win == null) {
         var row = start_row;
-        row += rowHeight(header_cells[0..@min(header_count, ncols)], ncols, widths[0..ncols]);
+        row += rowHeight(header_cells[0..@min(header_count, ncols)], ncols, widths[0..ncols], table.refs);
         row += 1;
         var lines = Document.LineIterator{ .remaining = table.body, .chain = table.chain, .first = false };
         var buf: [Document.max_table_cols][]const u8 = undefined;
         while (lines.next()) |line| {
             const n = Document.splitCells(line, &buf);
-            row += rowHeight(buf[0..@min(n, ncols)], ncols, widths[0..ncols]);
+            row += rowHeight(buf[0..@min(n, ncols)], ncols, widths[0..ncols], table.refs);
         }
         return row;
     }
@@ -58,7 +58,7 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
 fn renderRow(w: vaxis.Window, cells: [][]const u8, table: Document.Element.Table, widths: []usize, cells_x: []usize, borders: []usize, row: usize, skip_rows: *usize) usize {
     const ncols = table.ncols;
     const aligns = table.aligns[0..ncols];
-    const height = rowHeight(cells, ncols, widths);
+    const height = rowHeight(cells, ncols, widths, table.refs);
     if (skip_rows.* >= height) {
         skip_rows.* -= height;
         return row;
@@ -103,12 +103,12 @@ fn drawSeparator(w: vaxis.Window, row: usize, ncols: usize, borders: []usize) vo
     }
 }
 
-fn rowHeight(cells: [][]const u8, ncols: usize, widths: []usize) usize {
+fn rowHeight(cells: [][]const u8, ncols: usize, widths: []usize, refs: ?*Document.RefTable) usize {
     var height: usize = 1;
     for (0..ncols) |i| {
         const cell: []const u8 = if (i < cells.len) cells[i] else "";
         if (cell.len == 0) continue;
-        height = @max(height, text.measure(cell, widths[i], .{}));
+        height = @max(height, text.measure(cell, widths[i], .{}, refs));
     }
     return height;
 }
