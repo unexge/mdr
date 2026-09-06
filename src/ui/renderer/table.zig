@@ -37,7 +37,7 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
     const w = win.?;
     var row = start_row;
     var skip_rows = skip;
-    row = renderRow(w, header_cells[0..@min(header_count, ncols)], ncols, widths[0..ncols], table.aligns[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
+    row = renderRow(w, header_cells[0..@min(header_count, ncols)], table, widths[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
     if (row >= w.height) return row;
     if (skip_rows > 0) {
         skip_rows -= 1;
@@ -50,12 +50,14 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
     while (lines.next()) |line| {
         if (row >= w.height) break;
         const n = Document.splitCells(line, &buf);
-        row = renderRow(w, buf[0..@min(n, ncols)], ncols, widths[0..ncols], table.aligns[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
+        row = renderRow(w, buf[0..@min(n, ncols)], table, widths[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
     }
     return row;
 }
 
-fn renderRow(w: vaxis.Window, cells: [][]const u8, ncols: usize, widths: []usize, aligns: []const Document.Alignment, cells_x: []usize, borders: []usize, row: usize, skip_rows: *usize) usize {
+fn renderRow(w: vaxis.Window, cells: [][]const u8, table: Document.Element.Table, widths: []usize, cells_x: []usize, borders: []usize, row: usize, skip_rows: *usize) usize {
+    const ncols = table.ncols;
+    const aligns = table.aligns[0..ncols];
     const height = rowHeight(cells, ncols, widths);
     if (skip_rows.* >= height) {
         skip_rows.* -= height;
@@ -82,7 +84,7 @@ fn renderRow(w: vaxis.Window, cells: [][]const u8, ncols: usize, widths: []usize
             .width = @intCast(widths[i]),
             .height = w.height -| @as(u16, @intCast(row)),
         });
-        _ = text.layout(inner, cell, .{}, 0, cell_skip, widths[i], .{}, aligns[i]);
+        _ = text.layout(inner, cell, .{}, 0, cell_skip, widths[i], .{}, aligns[i], table.refs);
     }
     return row + visible;
 }

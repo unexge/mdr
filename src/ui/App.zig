@@ -463,6 +463,35 @@ test "tables render inside block quotes" {
     try expectCell(win, 0, 3, ' ');
 }
 
+test "reference links resolve and definitions are stripped" {
+    var doc = Document.init("[click][here]\n\n[here]: /url\n");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 3,
+        .screen = &screen,
+    };
+
+    app.renderViewport(win);
+    const link = win.readCell(0, 0) orelse return error.TestUnexpectedCell;
+    try testing.expectEqualStrings("c", link.char.grapheme);
+    try testing.expect(link.style.ul_style == .single);
+    try expectCell(win, 4, 0, 'k');
+    try expectCell(win, 0, 1, ' ');
+    try expectCell(win, 0, 2, ' ');
+}
+
 // Rendering fuzz: arbitrary inputs are parsed, scrolled incrementally with
 // random resizes, and rendered. Asserts three properties that broke before:
 // no panics, measure/render agreement, and that incremental scrolling

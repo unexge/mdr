@@ -30,14 +30,14 @@ fn frameCopy(bytes: []const u8) ?[]const u8 {
 }
 
 pub fn measure(content: []const u8, width: usize, chain: Document.Chain) usize {
-    return layout(null, content, .{}, 0, 0, width, chain, .left);
+    return layout(null, content, .{}, 0, 0, width, chain, .left, null);
 }
 
 pub fn render(win: vaxis.Window, content: []const u8, base: vaxis.Style, start_row: usize, skip: usize, chain: Document.Chain) usize {
-    return layout(win, content, base, start_row, skip, win.width, chain, .left);
+    return layout(win, content, base, start_row, skip, win.width, chain, .left, null);
 }
 
-pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_row: usize, skip: usize, width: usize, chain: Document.Chain, alignment: Document.Alignment) usize {
+pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_row: usize, skip: usize, width: usize, chain: Document.Chain, alignment: Document.Alignment, refs: ?*Document.RefTable) usize {
     var lay: Lay = .{
         .win = win,
         .width = @max(width, 1),
@@ -48,7 +48,11 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
     lay.styles[0] = base;
     lay.depth = 1;
 
-    var spans = Document.Spans.initChain(content, chain);
+    // Definitions are scanned once, and only when brackets may need them.
+    var spans = if (refs != null and mem.indexOfScalar(u8, content, '[') != null)
+        Document.Spans.initChainRefs(content, chain, refs)
+    else
+        Document.Spans.initChain(content, chain);
     while (spans.next()) |span| {
         if (lay.clipped()) break;
         switch (span) {
@@ -331,6 +335,7 @@ const Lay = struct {
 };
 
 const std = @import("std");
+const mem = std.mem;
 const Document = @import("../../Document.zig");
 const vaxis = @import("vaxis");
 
@@ -392,11 +397,11 @@ test "renders center and right alignment" {
         .screen = &screen,
     };
 
-    _ = layout(win, "ab", .{}, 0, 0, 10, .{}, .center);
+    _ = layout(win, "ab", .{}, 0, 0, 10, .{}, .center, null);
     try testing.expectEqualStrings("a", win.readCell(4, 0).?.char.grapheme);
-    _ = layout(win, "ab", .{}, 1, 0, 10, .{}, .right);
+    _ = layout(win, "ab", .{}, 1, 0, 10, .{}, .right, null);
     try testing.expectEqualStrings("a", win.readCell(8, 1).?.char.grapheme);
-    _ = layout(win, "aa bb cc", .{}, 2, 0, 5, .{}, .center);
+    _ = layout(win, "aa bb cc", .{}, 2, 0, 5, .{}, .center, null);
     try testing.expectEqualStrings("c", win.readCell(1, 3).?.char.grapheme);
 }
 

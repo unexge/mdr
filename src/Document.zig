@@ -1,5 +1,5 @@
 //! Zero-copy, lazily parsed Markdown (CommonMark flavored, plus GFM
-//! strikethrough and task lists).
+//! strikethrough, task lists and reference links).
 //!
 //! `Document` returns one block-level `Element` per `next` call; every slice
 //! it hands out points into the input text. Containers carry iterators:
@@ -12,8 +12,7 @@
 //! in the library; `init` borrows text already in memory. Markdown has no
 //! syntax errors, so parsing cannot fail.
 //!
-//! Not supported yet: indented code blocks, HTML, images,
-//! autolinks and reference links. Container nesting deeper than 8 levels
+//! Not supported yet: indented code blocks, HTML and images. Container nesting deeper than 8 levels
 //! degrades to plain text.
 
 const Document = @This();
@@ -24,19 +23,21 @@ cursor: usize = 0,
 /// Set by `parse`, freed by `deinit`.
 owned: ?[]u8 = null,
 gpa: ?mem.Allocator = null,
+/// Reference definitions, scanned once on first use.
+refs: RefTable = .{},
 
 /// Reads the entire stream into one buffer; the reader is not retained.
 /// Wrap the reader in `limited()` first to bound memory for untrusted input.
 pub fn parse(reader: *Io.Reader, gpa: mem.Allocator) ParseError!Document {
     const owned = try reader.allocRemaining(gpa, .unlimited);
-    return .{ .text = owned, .owned = owned, .gpa = gpa };
+    return .{ .text = owned, .owned = owned, .gpa = gpa, .refs = .{ .text = owned } };
 }
 
 pub const ParseError = Io.Reader.LimitedAllocError;
 
 /// Borrows `text`; it must stay valid and unmodified while iterating.
 pub fn init(text: []const u8) Document {
-    return .{ .text = text };
+    return .{ .text = text, .refs = .{ .text = text } };
 }
 
 /// Frees the `parse` buffer; a no-op for `init` documents.
@@ -47,10 +48,12 @@ pub fn deinit(self: *Document) void {
 
 /// Returns the next block-level element, or null at the end.
 pub fn next(self: *Document) ?Element {
+    self.refs.text = self.text;
     var blocks: Blocks = .{
         .text = self.text,
         .cursor = self.cursor,
         .end = self.text.len,
+        .refs = &self.refs,
     };
     const elem = blocks.next() orelse return null;
     self.cursor = blocks.cursor;
@@ -73,6 +76,8 @@ pub const Element = union(enum) {
         content: []const u8,
         /// Container prefixes to strip per line (setext headers only).
         chain: Chain = .{},
+        /// Reference definitions for `[text][label]` links.
+        refs: ?*RefTable = null,
 
         pub fn spans(self: Header) Spans {
             return .initChain(self.content, self.chain);
@@ -85,6 +90,8 @@ pub const Element = union(enum) {
         /// strip them.
         content: []const u8,
         chain: Chain = .{},
+        /// Reference definitions for `[text][label]` links.
+        refs: ?*RefTable = null,
 
         pub fn lines(self: Paragraph) LineIterator {
             return .{ .remaining = self.content, .chain = self.chain };
@@ -133,6 +140,8 @@ pub const Element = union(enum) {
             /// Set once a line that cannot continue the list is reached.
             done: bool = false,
             loose: bool = false,
+            /// Reference table threaded into item blocks.
+            refs: ?*RefTable = null,
 
             /// Parses the next item's marker and bounds; the item's blocks
             /// are parsed lazily through `ListItem.blocks`.
@@ -221,6 +230,7 @@ pub const Element = union(enum) {
                         .cursor = end,
                         .end = end,
                         .mid_line = true,
+                        .refs = self.refs,
                     } };
                 }
                 return .{
@@ -234,6 +244,7 @@ pub const Element = union(enum) {
                         .end = end,
                         .mid_line = true,
                         .chain = chain.?,
+                        .refs = self.refs,
                     },
                 };
             }
@@ -250,6 +261,7 @@ pub const Element = union(enum) {
         header: []const u8,
         body: []const u8,
         chain: Chain = .{},
+        refs: ?*RefTable = null,
     };
 };
 
@@ -284,49 +296,66 @@ pub const Blocks = struct {
     end: usize,
     mid_line: bool = false,
     chain: Chain = .{},
+    /// Reference table threaded into elements; null in tests.
+    refs: ?*RefTable = null,
+    /// Only the definition probe records; normal iteration just strips.
+    record: bool = false,
 
     pub fn next(self: *Blocks) ?Element {
         const text = self.text;
         var first = self.mid_line;
         self.mid_line = false;
 
-        while (self.cursor < self.end) {
-            const line = chainLine(self.chain, text, self.cursor, self.end, first);
-            if (!isBlankLine(line.content)) break;
-            self.cursor = line.next;
-            first = false;
-        }
-        if (self.cursor >= self.end) return null;
+        while (true) {
+            while (self.cursor < self.end) {
+                const blank = chainLine(self.chain, text, self.cursor, self.end, first);
+                if (!isBlankLine(blank.content)) break;
+                self.cursor = blank.next;
+                first = false;
+            }
+            if (self.cursor >= self.end) return null;
 
-        const line = chainLine(self.chain, text, self.cursor, self.end, first);
-        const extra = leadingSpaces(line.content);
-        if (extra <= 3) {
-            const body = line.content[extra..];
-            if (parseAtxHeader(body)) |header| {
-                self.cursor = line.next;
-                return .{ .header = .{ .level = header.level, .content = header.content, .chain = self.chain } };
+            const line = chainLine(self.chain, text, self.cursor, self.end, first);
+            first = false;
+            const extra = leadingSpaces(line.content);
+            if (extra <= 3) {
+                const body = line.content[extra..];
+                if (parseAtxHeader(body)) |header| {
+                    self.cursor = line.next;
+                    return .{ .header = .{ .level = header.level, .content = header.content, .chain = self.chain, .refs = self.refs } };
+                }
+                if (parseFence(body)) |fence| return self.parseCodeBlock(fence, line);
+                if (isThematicBreak(body)) {
+                    self.cursor = line.next;
+                    return .thematic_break;
+                }
+                if (body.len > 0 and body[0] == '>') return self.parseQuote(line);
+                if (parseMarkerLine(body)) |marker| return self.parseList(marker);
+                if (self.parseTable(line)) |table| return table;
             }
-            if (parseFence(body)) |fence| return self.parseCodeBlock(fence, line);
-            if (isThematicBreak(body)) {
-                self.cursor = line.next;
-                return .thematic_break;
-            }
-            if (body.len > 0 and body[0] == '>') return self.parseQuote(line);
-            if (parseMarkerLine(body)) |marker| return self.parseList(marker);
-            if (self.parseTable(line)) |table| return table;
+            if (self.parseParagraph(line)) |elem| return elem;
         }
-        return self.parseParagraph(line);
     }
 
-    fn parseParagraph(self: *Blocks, first: Line) Element {
+    fn parseParagraph(self: *Blocks, first: Line) ?Element {
         const text = self.text;
-        var content_start = first.start;
-        while (content_start < first.start + first.content.len and
-            (text[content_start] == ' ' or text[content_start] == '\t'))
-        {
-            content_start += 1;
+        var content_start: ?usize = null;
+        var content_end: usize = 0;
+
+        const first_extra = leadingSpaces(first.content);
+        const first_def = if (first_extra <= 3) parseRefDef(first.content[first_extra..]) else null;
+        if (first_def) |def| {
+            if (self.record) self.refs.?.record(def.label, def.destination, def.title);
+        } else {
+            var cs = first.start;
+            while (cs < first.start + first.content.len and
+                (text[cs] == ' ' or text[cs] == '\t'))
+            {
+                cs += 1;
+            }
+            content_start = cs;
+            content_end = first.raw_end;
         }
-        var content_end = first.raw_end;
         var scan = first.next;
 
         while (scan < self.end) {
@@ -335,14 +364,22 @@ pub const Blocks = struct {
             const extra = leadingSpaces(line.content);
             if (extra <= 3) {
                 const body = line.content[extra..];
+                if (parseRefDef(body)) |def| {
+                    if (self.record) self.refs.?.record(def.label, def.destination, def.title);
+                    scan = line.next;
+                    continue;
+                }
                 // A `-` run under a paragraph is a setext h2, not an hr.
-                if (setextLevel(body)) |level| {
-                    self.cursor = line.next;
-                    return .{ .header = .{
-                        .level = level,
-                        .content = trimBlockContent(text[content_start..content_end]),
-                        .chain = self.chain,
-                    } };
+                if (content_start != null) {
+                    if (setextLevel(body)) |level| {
+                        self.cursor = line.next;
+                        return .{ .header = .{
+                            .level = level,
+                            .content = trimBlockContent(text[content_start.?..content_end]),
+                            .chain = self.chain,
+                            .refs = self.refs,
+                        } };
+                    }
                 }
                 if (parseAtxHeader(body) != null) break;
                 if (parseFence(body) != null) break;
@@ -352,14 +389,28 @@ pub const Blocks = struct {
                     if (marker.interruptsParagraph()) break;
                 }
             }
+            if (content_start == null) {
+                var cs = line.start;
+                while (cs < line.start + line.content.len and
+                    (text[cs] == ' ' or text[cs] == '\t'))
+                {
+                    cs += 1;
+                }
+                content_start = cs;
+            }
             content_end = line.raw_end;
             scan = line.next;
         }
 
+        const cs = content_start orelse {
+            self.cursor = scan;
+            return null;
+        };
         self.cursor = scan;
         return .{ .paragraph = .{
-            .content = trimBlockContent(text[content_start..content_end]),
+            .content = trimBlockContent(text[cs..content_end]),
             .chain = self.chain,
+            .refs = self.refs,
         } };
     }
 
@@ -445,6 +496,7 @@ pub const Blocks = struct {
             .end = if (capped) content_end else content_start,
             .mid_line = true,
             .chain = chain,
+            .refs = self.refs,
         } } };
     }
 
@@ -458,6 +510,7 @@ pub const Blocks = struct {
             .ordered = first_marker.ordered,
             .bullet = first_marker.bullet,
             .delim = first_marker.delim,
+            .refs = self.refs,
         };
         while (probe.next()) |_| {}
         // The scan stops at the first line that cannot continue the list.
@@ -476,6 +529,7 @@ pub const Blocks = struct {
                 .ordered = first_marker.ordered,
                 .bullet = first_marker.bullet,
                 .delim = first_marker.delim,
+                .refs = self.refs,
             },
         } };
     }
@@ -525,6 +579,7 @@ pub const Blocks = struct {
             .header = header,
             .body = text[body_start..body_end],
             .chain = self.chain,
+            .refs = self.refs,
         } };
     }
 };
@@ -702,6 +757,179 @@ fn containsTablePipe(line: []const u8) bool {
     return false;
 }
 
+/// Maximum reference definitions kept; further ones stay literal text.
+pub const max_refs = 64;
+
+/// Link reference definitions (`[label]: destination "title"`), collected
+/// by one probe parse over the document and consulted for `[text][label]`,
+/// `[text][]` and `[text]` links. All slices point into `Document.text`.
+pub const RefTable = struct {
+    pub const Def = struct {
+        label: []const u8,
+        destination: []const u8,
+        title: ?[]const u8,
+    };
+
+    defs: [max_refs]Def = undefined,
+    count: usize = 0,
+    scanned: bool = false,
+    text: []const u8 = "",
+
+    pub fn lookup(self: *const RefTable, label: []const u8) ?Def {
+        for (self.defs[0..self.count]) |def| {
+            if (labelsEqual(def.label, label)) return def;
+        }
+        return null;
+    }
+
+    /// First definition wins; blank or overlong labels never record.
+    pub fn record(self: *RefTable, label: []const u8, destination: []const u8, title: ?[]const u8) void {
+        if (label.len == 0 or label.len > 999 or isBlankLabel(label)) return;
+        for (self.defs[0..self.count]) |def| {
+            if (labelsEqual(def.label, label)) return;
+        }
+        if (self.count >= max_refs) return;
+        self.defs[self.count] = .{ .label = label, .destination = destination, .title = title };
+        self.count += 1;
+    }
+
+    pub fn ensureScanned(self: *RefTable) void {
+        if (self.scanned) return;
+        self.scanned = true;
+        var probe: Blocks = .{ .text = self.text, .cursor = 0, .end = self.text.len, .refs = self, .record = true };
+        while (probe.next()) |_| {}
+    }
+};
+
+fn isBlankLabel(label: []const u8) bool {
+    for (label) |c| if (!isRefSpace(c)) return false;
+    return true;
+}
+
+fn isRefSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+fn skipRefSpace(s: []const u8, i: usize) usize {
+    var j = i;
+    while (j < s.len and isRefSpace(s[j])) j += 1;
+    return j;
+}
+
+/// Labels match case-insensitively with internal whitespace collapsed.
+fn labelsEqual(a: []const u8, b: []const u8) bool {
+    var i = skipRefSpace(a, 0);
+    var j = skipRefSpace(b, 0);
+    while (i < a.len and j < b.len) {
+        if (isRefSpace(a[i]) or isRefSpace(b[j])) {
+            if (!isRefSpace(a[i]) or !isRefSpace(b[j])) return false;
+            i = skipRefSpace(a, i);
+            j = skipRefSpace(b, j);
+            if (i >= a.len or j >= b.len) return i >= a.len and j >= b.len;
+        } else {
+            if (asciiToLower(a[i]) != asciiToLower(b[j])) return false;
+            i += 1;
+            j += 1;
+        }
+    }
+    i = skipRefSpace(a, i);
+    j = skipRefSpace(b, j);
+    return i >= a.len and j >= b.len;
+}
+
+fn asciiToLower(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+const ParsedRefDef = struct {
+    label: []const u8,
+    destination: []const u8,
+    title: ?[]const u8,
+};
+
+/// Parses a single-line `[label]: destination "title"` definition without
+/// leading indent; null when the line is not one. Titles must close on the
+/// same line.
+fn parseRefDef(line: []const u8) ?ParsedRefDef {
+    if (line.len == 0 or line[0] != '[') return null;
+    var i: usize = 1;
+    var depth: usize = 1;
+    while (i < line.len) {
+        if (line[i] == '\\' and i + 1 < line.len) {
+            i += 2;
+            continue;
+        }
+        if (line[i] == '[') depth += 1 else if (line[i] == ']') {
+            depth -= 1;
+            if (depth == 0) break;
+        }
+        i += 1;
+    }
+    if (i >= line.len or line[i] != ']') return null;
+    const label = line[1..i];
+    if (isBlankLabel(label)) return null;
+    i += 1;
+    if (i >= line.len or line[i] != ':') return null;
+    i += 1;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    var destination: []const u8 = "";
+    if (i < line.len and line[i] == '<') {
+        const start = i + 1;
+        i = start;
+        while (i < line.len and line[i] != '>') {
+            if (line[i] == ' ' or line[i] == '\t') return null;
+            i += 1;
+        }
+        if (i >= line.len) return null;
+        destination = line[start..i];
+        if (destination.len == 0) return null;
+        i += 1;
+    } else {
+        const start = i;
+        var parens: usize = 0;
+        while (i < line.len) {
+            const ch = line[i];
+            if (ch == '\\' and i + 1 < line.len and isAsciiPunct(line[i + 1])) {
+                i += 2;
+                continue;
+            }
+            if (ch == '(') {
+                parens += 1;
+            } else if (ch == ')') {
+                if (parens == 0) break;
+                parens -= 1;
+            } else if (ch == ' ' or ch == '\t') {
+                break;
+            }
+            i += 1;
+        }
+        destination = line[start..i];
+        if (destination.len == 0) return null;
+    }
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    var title: ?[]const u8 = null;
+    if (i < line.len) {
+        const q = line[i];
+        if (q != '"' and q != '\'' and q != '(') return null;
+        const close: u8 = if (q == '(') ')' else q;
+        i += 1;
+        const start = i;
+        while (i < line.len and line[i] != close) {
+            if (line[i] == '\\' and i + 1 < line.len) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        if (i >= line.len) return null;
+        title = line[start..i];
+        i += 1;
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+        if (i < line.len) return null;
+    }
+    return .{ .label = label, .destination = destination, .title = title };
+}
+
 /// An inline formatting event. Emphasis, strikethrough and links are
 /// open/close pairs; consumers track a style stack. Text spans never
 /// contain newlines: line breaks are `soft_break` / `hard_break` events.
@@ -739,6 +967,7 @@ pub const Spans = struct {
 
     content: []const u8,
     chain: Chain = .{},
+    refs: ?*RefTable = null,
     pos: usize = 0,
     events: [max_events]Event = undefined,
     event_count: usize = 0,
@@ -753,7 +982,12 @@ pub const Spans = struct {
     }
 
     pub fn initChain(content: []const u8, chain: Chain) Spans {
-        var self: Spans = .{ .content = content, .chain = chain };
+        return initChainRefs(content, chain, null);
+    }
+
+    pub fn initChainRefs(content: []const u8, chain: Chain, refs: ?*RefTable) Spans {
+        if (refs) |t| t.ensureScanned();
+        var self: Spans = .{ .content = content, .chain = chain, .refs = refs };
         self.resolve();
         return self;
     }
@@ -861,7 +1095,7 @@ pub const Spans = struct {
         var link_after: usize = 0;
 
         while (i < c.len) {
-            if (link_after > 0 and i >= link_text_end) {
+            if (link_after > 0 and i > link_text_end) {
                 // Leaving the link text: its destination was consumed by the
                 // link_close event's skip.
                 region = outside_region;
@@ -952,7 +1186,7 @@ pub const Spans = struct {
                         i += 1;
                         continue;
                     }
-                    if (self.parseLink(i)) |parsed| {
+                    if (self.parseLink(i) orelse self.parseRefLink(i)) |parsed| {
                         self.addEvent(.{ .pos = i, .skip = 1, .kind = .link_open, .slice = parsed.destination, .extra = parsed.title });
                         self.addEvent(.{
                             .pos = parsed.text_end,
@@ -971,6 +1205,29 @@ pub const Spans = struct {
                 ']' => {
                     if (link_after > 0 and i == link_text_end) {
                         i = link_after;
+                        continue;
+                    }
+                    i += 1;
+                },
+                '<' => {
+                    if (region != outside_region) {
+                        // No nested links.
+                        i += 1;
+                        continue;
+                    }
+                    if (self.parseAutolink(i)) |parsed| {
+                        self.addEvent(.{ .pos = i, .skip = 1, .kind = .link_open, .slice = parsed.destination, .extra = parsed.title });
+                        self.addEvent(.{
+                            .pos = parsed.text_end,
+                            .skip = parsed.after - parsed.text_end,
+                            .kind = .link_close,
+                        });
+                        region = self.link_count;
+                        self.link_count += 1;
+                        link_text_end = parsed.text_end;
+                        link_after = parsed.after;
+                        // The interior stays literal: no inline parsing inside.
+                        i = parsed.after;
                         continue;
                     }
                     i += 1;
@@ -1002,10 +1259,9 @@ pub const Spans = struct {
         after: usize,
     };
 
-    /// Parses `[text](dest "title")` starting at the `[`; null when the
-    /// syntax does not form a link.
-    fn parseLink(self: *Spans, open: usize) ?ParsedLink {
-        const c = self.content;
+    /// Index of the `]` closing the link text at `open`, honoring escapes,
+    /// code spans and nested brackets; null when unclosed.
+    fn findLinkTextEnd(c: []const u8, open: usize) ?usize {
         var i = open + 1;
         var depth: usize = 1;
         while (i < c.len) {
@@ -1025,14 +1281,146 @@ pub const Spans = struct {
                 },
                 ']' => {
                     depth -= 1;
-                    if (depth == 0) break;
+                    if (depth == 0) return i;
                     i += 1;
                 },
                 else => i += 1,
             }
         }
-        if (i >= c.len or c[i] != ']') return null;
-        const text_end = i;
+        return null;
+    }
+
+    /// True when the `[` at `open` continues an image alt group
+    /// (`![alt][...]`), whose labels stay literal because images are not
+    /// supported. Inline links after an image still resolve separately.
+    fn followsImageAlt(c: []const u8, open: usize) bool {
+        if (open < 2 or c[open - 1] != ']') return false;
+        var depth: usize = 1;
+        var i = open - 1;
+        var backslashes: usize = 0;
+        while (i > 0) {
+            i -= 1;
+            const ch = c[i];
+            if (ch == '\\') {
+                backslashes += 1;
+                continue;
+            }
+            const escaped = backslashes % 2 == 1;
+            backslashes = 0;
+            if (!escaped and ch == ']') {
+                depth += 1;
+            } else if (!escaped and ch == '[') {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+        if (depth != 0 or i == 0) return false;
+        return c[i - 1] == '!' and !isEscapedPipe(c, i - 1);
+    }
+
+    /// Parses `[text][label]`, `[text][]` and `[text]` starting at the `[`;
+    /// an empty `[]` label means the text itself. Falls back to the shortcut
+    /// form when a full label is undefined. Null without definitions.
+    fn parseRefLink(self: *Spans, open: usize) ?ParsedLink {
+        const refs = self.refs orelse return null;
+        const c = self.content;
+        // Image markers stay fully literal; images are not supported.
+        if (open > 0 and c[open - 1] == '!' and !isEscapedPipe(c, open - 1)) return null;
+        if (followsImageAlt(c, open)) return null;
+        const text_end = findLinkTextEnd(c, open) orelse return null;
+        if (text_end + 1 < c.len and c[text_end + 1] == '[') {
+            if (findLinkTextEnd(c, text_end + 1)) |label_end| {
+                const raw = c[text_end + 2 .. label_end];
+                const effective = if (raw.len == 0) c[open + 1 .. text_end] else raw;
+                if (refs.lookup(effective)) |def| {
+                    return .{ .destination = def.destination, .title = def.title, .text_end = text_end, .after = label_end + 1 };
+                }
+            }
+        }
+        return self.shortcutRef(open, text_end);
+    }
+
+    fn shortcutRef(self: *Spans, open: usize, text_end: usize) ?ParsedLink {
+        const refs = self.refs orelse return null;
+        if (text_end == open + 1) return null;
+        if (refs.lookup(self.content[open + 1 .. text_end])) |def| {
+            return .{ .destination = def.destination, .title = def.title, .text_end = text_end, .after = text_end + 1 };
+        }
+        return null;
+    }
+
+    /// Parses `<scheme:...>` and `<email>` starting at the `<`; the link
+    /// text is the raw interior. Email destinations stay raw (`mailto:` is
+    /// a render concern). Null for anything else, including HTML.
+    fn parseAutolink(self: *Spans, open: usize) ?ParsedLink {
+        const c = self.content;
+        var i = open + 1;
+        while (i < c.len and c[i] != '>') {
+            if (c[i] == ' ' or c[i] == '\t' or c[i] == '\n' or c[i] == '\r' or c[i] == '<' or c[i] < 0x20) return null;
+            i += 1;
+        }
+        if (i >= c.len) return null;
+        const inner = c[open + 1 .. i];
+        if (!isUriAutolink(inner) and !isEmailAutolink(inner)) return null;
+        return .{ .destination = inner, .title = null, .text_end = i, .after = i + 1 };
+    }
+
+    /// A 2-32 character scheme, then a colon; the rest was validated above.
+    fn isUriAutolink(inner: []const u8) bool {
+        if (inner.len == 0 or !ascii.isAlphabetic(inner[0])) return false;
+        var i: usize = 1;
+        while (i < inner.len and i < 32 and
+            (ascii.isAlphanumeric(inner[i]) or inner[i] == '+' or inner[i] == '-' or inner[i] == '.'))
+        {
+            i += 1;
+        }
+        if (i < 2 or i > 32) return false;
+        return i < inner.len and inner[i] == ':';
+    }
+
+    fn isEmailAutolink(inner: []const u8) bool {
+        var i: usize = 0;
+        const local_start = i;
+        while (i < inner.len and isEmailLocal(inner[i])) i += 1;
+        if (i == local_start or i >= inner.len or inner[i] != '@') return false;
+        i += 1;
+        if (!parseEmailLabel(inner, &i)) return false;
+        while (i < inner.len and inner[i] == '.') {
+            i += 1;
+            if (!parseEmailLabel(inner, &i)) return false;
+        }
+        return i >= inner.len;
+    }
+
+    /// One dot-separated domain label: alphanumerics and hyphens, starting
+    /// and ending alphanumeric, at most 63 characters.
+    fn parseEmailLabel(inner: []const u8, i: *usize) bool {
+        if (i.* >= inner.len or !ascii.isAlphanumeric(inner[i.*])) return false;
+        const start = i.*;
+        i.* += 1;
+        while (i.* < inner.len and i.* - start < 63 and
+            (ascii.isAlphanumeric(inner[i.*]) or inner[i.*] == '-'))
+        {
+            i.* += 1;
+        }
+        if (i.* < inner.len and (ascii.isAlphanumeric(inner[i.*]) or inner[i.*] == '-')) return false;
+        return inner[i.* - 1] != '-';
+    }
+
+    fn isEmailLocal(c: u8) bool {
+        if (ascii.isAlphanumeric(c)) return true;
+        return switch (c) {
+            '.', '!', '#', '$', '%', '&', '\'', '*', '+', '/', '=', '?', '^', '_', '`', '{', '|', '}', '~', '-' => true,
+            else => false,
+        };
+    }
+
+    /// Parses `[text](dest "title")` starting at the `[`; null when the
+    /// syntax does not form a link.
+    fn parseLink(self: *Spans, open: usize) ?ParsedLink {
+        const c = self.content;
+        const text_end = findLinkTextEnd(c, open) orelse return null;
+        const i = text_end;
         if (i + 1 >= c.len or c[i + 1] != '(') return null;
 
         var j = i + 2;
@@ -1978,6 +2366,82 @@ test "table delimiter mismatch stays a paragraph" {
     try testing.expectEqual(@as(u8, 2), setext.next().?.header.level);
 }
 
+test "reference links" {
+    var doc = Document.init("[full][label] and [collapsed][] and [shortcut]\n\n[label]: /a\n[collapsed]: /b \"t\"\n[shortcut]: /c\n");
+    const p = doc.next().?.paragraph;
+    try testing.expectEqualStrings("[full][label] and [collapsed][] and [shortcut]", p.content);
+
+    var it = Spans.initChainRefs(p.content, p.chain, p.refs);
+    try expectSpanEqual(.{ .link = .{ .destination = "/a", .title = null } }, it.next().?);
+    try testing.expectEqualStrings("full", it.next().?.text);
+    _ = it.next();
+    try testing.expectEqualStrings(" and ", it.next().?.text);
+    try expectSpanEqual(.{ .link = .{ .destination = "/b", .title = "t" } }, it.next().?);
+    try testing.expectEqualStrings("collapsed", it.next().?.text);
+    _ = it.next();
+    try testing.expectEqualStrings(" and ", it.next().?.text);
+    try expectSpanEqual(.{ .link = .{ .destination = "/c", .title = null } }, it.next().?);
+    try testing.expectEqualStrings("shortcut", it.next().?.text);
+    _ = it.next();
+    try testing.expect(it.next() == null);
+    try testing.expect(doc.next() == null);
+}
+
+test "reference definitions are stripped" {
+    var doc = Document.init("Foo\n[bar]: /baz\n");
+    try testing.expectEqualStrings("Foo", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+
+    var only = Document.init("[a]: /x\n");
+    try testing.expect(only.next() == null);
+}
+
+test "undefined references stay literal" {
+    var doc = Document.init("[foo][bar] and [baz]\n");
+    const p = doc.next().?.paragraph;
+    var it = Spans.initChainRefs(p.content, p.chain, p.refs);
+    try testing.expectEqualStrings("[foo][bar] and [baz]", it.next().?.text);
+    try testing.expect(it.next() == null);
+}
+
+test "image markers stay literal with references defined" {
+    var doc = Document.init("![alt][img]\n\n[img]: /u\n");
+    const p = doc.next().?.paragraph;
+    var it = Spans.initChainRefs(p.content, p.chain, p.refs);
+    try testing.expectEqualStrings("![alt][img]", it.next().?.text);
+    try testing.expect(it.next() == null);
+}
+
+test "reference labels match loosely, first wins" {
+    var doc = Document.init("[A  B][lAb El]\n\n[lab  el]: /one\n[LAB EL]: /two\n");
+    doc.refs.ensureScanned();
+    const def = doc.refs.lookup("lab el").?;
+    try testing.expectEqualStrings("/one", def.destination);
+
+    const p = doc.next().?.paragraph;
+    var it = Spans.initChainRefs(p.content, p.chain, p.refs);
+    try expectSpanEqual(.{ .link = .{ .destination = "/one", .title = null } }, it.next().?);
+}
+
+test "autolink interiors stay literal" {
+    var it = Spans.init("<http://a*b[c]>");
+    try expectSpanEqual(.{ .link = .{ .destination = "http://a*b[c]", .title = null } }, it.next().?);
+    try testing.expectEqualStrings("http://a*b[c]", it.next().?.text);
+    _ = it.next();
+    try testing.expect(it.next() == null);
+}
+
+test "full reference falls back to shortcut" {
+    var doc = Document.init("[foo][bar]\n\n[foo]: /x\n");
+    const p = doc.next().?.paragraph;
+    var it = Spans.initChainRefs(p.content, p.chain, p.refs);
+    try expectSpanEqual(.{ .link = .{ .destination = "/x", .title = null } }, it.next().?);
+    try testing.expectEqualStrings("foo", it.next().?.text);
+    _ = it.next();
+    try testing.expectEqualStrings("[bar]", it.next().?.text);
+    try testing.expect(it.next() == null);
+}
+
 test "tables inside block quotes" {
     var doc = Document.init("> | a | b |\n> |---|---|\n> | c | d |\n");
     var blocks = doc.next().?.block_quote.blocks;
@@ -2133,6 +2597,13 @@ test "inline span edge cases" {
         .{ .input = "end  \nnext", .expected = &.{ .{ .text = "end" }, .hard_break, .{ .text = "next" } } },
         .{ .input = "back\\\nslash", .expected = &.{ .{ .text = "back" }, .hard_break, .{ .text = "slash" } } },
         .{ .input = "soft\nbreak", .expected = &.{ .{ .text = "soft" }, .soft_break, .{ .text = "break" } } },
+        // Autolinks: URI schemes and emails; anything else stays literal.
+        .{ .input = "<https://x.y/z?a=1&b=2>", .expected = &.{ .{ .link = .{ .destination = "https://x.y/z?a=1&b=2", .title = null } }, .{ .text = "https://x.y/z?a=1&b=2" }, .link_close } },
+        .{ .input = "<foo@bar.com>", .expected = &.{ .{ .link = .{ .destination = "foo@bar.com", .title = null } }, .{ .text = "foo@bar.com" }, .link_close } },
+        .{ .input = "<div>", .expected = &.{.{ .text = "<div>" }} },
+        .{ .input = "<a b>", .expected = &.{.{ .text = "<a b>" }} },
+        .{ .input = "<a:>", .expected = &.{.{ .text = "<a:>" }} },
+        .{ .input = "<foo@>", .expected = &.{.{ .text = "<foo@>" }} },
     };
 
     for (cases) |case| {
@@ -2202,7 +2673,8 @@ test "parse from a chunked reader matches borrowed parsing" {
         "---\n" ++
         "Setext\n------\n" ++
         "- a\n- b\n" ++
-        "> quoted\n";
+        "> quoted\n" ++
+        "[r][i]\n\n[i]: /u\n";
 
     var borrowed = Document.init(input);
 
@@ -2318,6 +2790,8 @@ fn expectValidElement(elem: Element, text: []const u8, depth: usize) anyerror!vo
             while (lines.next()) |l| {
                 line_count += 1;
                 try expectWithin(l, text);
+                const extra = leadingSpaces(l);
+                if (extra <= 3) try testing.expect(parseRefDef(l[extra..]) == null);
             }
             try testing.expect(line_count <= p.content.len);
         },
@@ -2471,6 +2945,17 @@ pub const fuzz_corpus = [_][]const u8{
     "| escaped \\| pipe | `code|span` |\n|---|---|\n",
     "| only header |\n|---|\n",
     "not a table\n---\n",
+    "[link][ref]\n\n[ref]: /url \"title\"\n",
+    "[collapsed][]\n\n[collapsed]: /u\n",
+    "[shortcut]\n\n[shortcut]: /u\n",
+    "[dup][a]\n\n[a]: /one\n[a]: /two\n",
+    "[Case][Lab]\n\n[lab]: /x\n",
+    "Foo\n[bar]: /baz\n",
+    "[a]: /only-def\n",
+    "[undef][missing] and [lit]\n",
+    "<https://example.com/?a=1&b=2>\n",
+    "<user@example.com>\n",
+    "<div>not autolink</div>\n",
 };
 
 pub const fuzz_tokens = [_][]const u8{
@@ -2488,7 +2973,9 @@ pub const fuzz_tokens = [_][]const u8{
     "~~",         "~",           "~~x~~",       "\\",           "\\*",         "- [ ] ",
     "- [x] ",     "***a***",     "*a **b** c*", "![img](x)",    "   ",         "\t- ",
     "| ",         "|",           "|---|",       "---|",         ":---",        "---:",
-    ":---:",      "\\|",         "`a|b`",
+    ":---:",      "\\|",         "`a|b`",       "[a][b]",       "[a][]",       "[a]",
+    "[a]: ",      "[A][b]",      "/url",        "\"t\"",        "<https://",   "@x.com>",
+    "<div>",
 };
 
 fn fuzzOne(_: void, smith: *testing.Smith) !void {
