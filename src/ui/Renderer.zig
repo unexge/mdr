@@ -67,7 +67,7 @@ pub fn layoutBlocks(win: ?vaxis.Window, blocks: Document.Blocks, start_row: usiz
 
 fn layoutDepth(win: ?vaxis.Window, elem: Document.Element, row: usize, skip: usize, depth: usize, width: usize) usize {
     return switch (elem) {
-        .header => |h| text.layout(win, h.content, headerStyle(h.level), row, skip, width, h.chain, .left, h.refs),
+        .header => |h| header.layout(win, h, row, skip, width),
         .paragraph => |p| text.layout(win, p.content, .{}, row, skip, width, p.chain, .left, p.refs),
         .code_block => |cb| code_block.layout(win, cb, row, skip, width),
         .thematic_break => thematic_break.layout(win, row, skip, width),
@@ -75,11 +75,6 @@ fn layoutDepth(win: ?vaxis.Window, elem: Document.Element, row: usize, skip: usi
         .block_quote => |q| block_quote.layout(win, q.blocks, row, skip, depth, width),
         .table => |t| table.layout(win, t, row, skip, width),
     };
-}
-
-fn headerStyle(level: u8) vaxis.Style {
-    if (level == 1) return .{ .bold = true, .ul_style = .single };
-    return .{ .bold = level <= 2 };
 }
 
 const std = @import("std");
@@ -90,6 +85,7 @@ const code_block = @import("renderer/code_block.zig");
 const thematic_break = @import("renderer/thematic_break.zig");
 const list = @import("renderer/list.zig");
 const block_quote = @import("renderer/block_quote.zig");
+const header = @import("renderer/header.zig");
 const table = @import("renderer/table.zig");
 
 test "block footprints include the trailing gap" {
