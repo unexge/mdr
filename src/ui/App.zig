@@ -23,6 +23,7 @@ const MediaRequest = struct {
     path: []u8,
     max_width: u16,
     max_height: u16,
+    sizing: Media.Sizing,
     result: union(enum) {
         pending,
         ready: Media.Artifact,
@@ -56,6 +57,7 @@ fully_parsed: bool = false,
 scroll: usize = 0,
 viewport: usize = 0,
 width: usize = 0,
+image_width: usize = 0,
 cell_width: usize = 0,
 cell_height: usize = 0,
 pending_media: ?*MediaRequest = null,
@@ -88,6 +90,7 @@ pub fn run(self: *App, io: Io, environ: *std.process.Environ.Map) !void {
         environ.get("TERM") orelse "",
         environ.get("TERM_PROGRAM") orelse "",
         environ.get("KITTY_WINDOW_ID") orelse "",
+        environ.get("ZELLIJ") orelse "",
     );
     var tty_buffer: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buffer);
@@ -159,15 +162,19 @@ fn pageRows(viewport: usize) usize {
 fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop(Event), media_tasks: *Io.Group) !void {
     if (vx.caps.kitty_graphics) {
         self.graphics_supported = true;
-        if (self.placement_mode == .stable) vx.caps.kitty_graphics = false;
+        if (self.placement_mode != .unicode) vx.caps.kitty_graphics = false;
     }
     const win = vx.window();
     const content = win.child(.{
         .x_off = 0,
         .width = @intCast(contentWidth(win.width)),
     });
-    self.syncCellSize(content);
+    const cell_size_changed = self.syncCellSize(content);
     self.syncWidth(content.width);
+    const image_width_changed = self.syncImageWidth(win.width);
+    if (self.placement_mode == .remainder and (cell_size_changed or image_width_changed)) {
+        self.resetReadyImages(tty);
+    }
     try self.prepareFrame(content.height);
     try self.startVisibleMedia(io, loop, media_tasks);
 
@@ -180,7 +187,7 @@ fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop
         try Kitty.defineVirtualPlacements(tty, self.virtual_placements[0..self.virtual_placement_count]);
     }
     try vx.render(tty);
-    if (self.placement_mode == .stable) {
+    if (self.placement_mode != .unicode) {
         try Kitty.syncPlacements(
             tty,
             self.stable_placements[0..self.stable_placement_count],
@@ -224,11 +231,11 @@ fn renderViewport(self: *App, win: vaxis.Window) !void {
 fn renderEntry(self: *App, win: vaxis.Window, entry: *Entry, row: usize, skip: usize) !usize {
     switch (entry.media) {
         .ready => |image| {
-            const rows = Media.rowsForSize(image.width, image.height, self.width, self.cell_width, self.cell_height);
+            const cols = self.imageCols(image);
+            const rows = self.imageRows(image, cols);
             if (skip >= rows) return row;
             const visible_rows = rows - skip;
             const draw_rows = @min(visible_rows, win.height -| row);
-            const cols = @max(1, @min(self.width, math.divCeil(usize, image.width, self.cell_width) catch self.width));
             if (self.placement_mode == .unicode) {
                 if ((entry.virtual_rows != rows or entry.virtual_cols != cols) and
                     self.virtual_placement_count < self.virtual_placements.len)
@@ -244,14 +251,30 @@ fn renderEntry(self: *App, win: vaxis.Window, entry: *Entry, row: usize, skip: u
                 }
                 Kitty.drawPlaceholder(win, image.id, row, skip, draw_rows, cols);
             } else if (self.next_stable_placement_count < self.next_stable_placements.len) {
-                const source_y: u16 = @intCast(@as(usize, image.height) * skip / rows);
+                const source_y: u16 = if (self.placement_mode == .remainder)
+                    sourcePixelRow(image.height, skip, self.cell_height)
+                else
+                    @intCast(@as(usize, image.height) * skip / rows);
+                const source_bottom: u16 = if (self.placement_mode == .remainder)
+                    image.height
+                else
+                    @intCast(math.divCeil(
+                        usize,
+                        @as(usize, image.height) * (skip + draw_rows),
+                        rows,
+                    ) catch image.height);
+                const clipped = skip > 0 or
+                    (self.placement_mode != .remainder and draw_rows < visible_rows);
                 self.next_stable_placements[self.next_stable_placement_count] = .{
                     .image_id = image.id,
                     .row = row,
-                    .rows = @intCast(draw_rows),
+                    .rows = @intCast(if (self.placement_mode == .remainder) visible_rows else draw_rows),
                     .cols = @intCast(cols),
-                    .source_y = if (skip == 0) null else source_y,
-                    .source_height = if (skip == 0) null else image.height - source_y,
+                    .source = if (clipped) .{
+                        .y = source_y,
+                        .width = image.width,
+                        .height = @max(1, source_bottom - source_y),
+                    } else null,
                 };
                 self.next_stable_placement_count += 1;
             }
@@ -299,12 +322,27 @@ fn ensureVisible(self: *App, bottom: usize) !void {
 
 fn measureEntry(self: *const App, entry: Entry) usize {
     return switch (entry.media) {
-        .ready => |image| Media.rowsForSize(image.width, image.height, self.width, self.cell_width, self.cell_height) + 1,
+        .ready => |image| self.imageRows(image, self.imageCols(image)) + 1,
         else => Renderer.measure(entry.elem, self.width),
     };
 }
 
-fn syncCellSize(self: *App, win: vaxis.Window) void {
+fn imageCols(self: *const App, image: vaxis.Image) usize {
+    if (self.placement_mode == .remainder) {
+        return @max(1, @min(self.width, math.divCeil(usize, image.width, self.cell_width) catch 1));
+    }
+    return @max(1, @min(self.image_width, self.width));
+}
+
+fn imageRows(self: *const App, image: vaxis.Image, cols: usize) usize {
+    if (self.placement_mode == .remainder) {
+        return @max(1, math.divCeil(usize, image.height, self.cell_height) catch 1);
+    }
+    const rows = Media.rowsForSize(image.width, image.height, cols, self.cell_width, self.cell_height);
+    return if (self.placement_mode == .unicode) @min(rows, Kitty.max_placeholder_rows) else rows;
+}
+
+fn syncCellSize(self: *App, win: vaxis.Window) bool {
     const cell_width = if (win.screen.width > 0 and win.screen.width_pix > 0)
         math.divCeil(usize, win.screen.width_pix, win.screen.width) catch 8
     else
@@ -313,10 +351,11 @@ fn syncCellSize(self: *App, win: vaxis.Window) void {
         math.divCeil(usize, win.screen.height_pix, win.screen.height) catch 16
     else
         16;
-    if (self.cell_width == cell_width and self.cell_height == cell_height) return;
+    if (self.cell_width == cell_width and self.cell_height == cell_height) return false;
     self.cell_width = cell_width;
     self.cell_height = cell_height;
     self.invalidateMeasurementsFrom(0);
+    return true;
 }
 
 /// Heights are width-dependent; a width change invalidates them and they
@@ -325,6 +364,18 @@ fn syncWidth(self: *App, width: usize) void {
     if (self.width == width) return;
     self.width = width;
     self.invalidateMeasurementsFrom(0);
+}
+
+fn syncImageWidth(self: *App, screen_width: usize) bool {
+    const image_width = imageWidthForScreen(screen_width, self.width);
+    if (self.image_width == image_width) return false;
+    self.image_width = image_width;
+    self.invalidateMeasurementsFrom(0);
+    return true;
+}
+
+fn imageWidthForScreen(screen_width: usize, content_width: usize) usize {
+    return @max(1, @min(content_width, screen_width * 4 / 5));
 }
 
 fn invalidateMeasurementsFrom(self: *App, index: usize) void {
@@ -352,14 +403,9 @@ fn startVisibleMedia(self: *App, io: Io, loop: *vaxis.Loop(Event), media_tasks: 
         request.* = .{
             .entry_index = index,
             .path = resolved,
-            .max_width = @intCast(@min(
-                math.mul(usize, self.width, self.cell_width) catch math.maxInt(u16),
-                math.maxInt(u16),
-            )),
-            .max_height = @intCast(@min(
-                math.mul(usize, 16, self.cell_height) catch math.maxInt(u16),
-                math.maxInt(u16),
-            )),
+            .max_width = self.imagePixelWidth(),
+            .max_height = math.maxInt(u16),
+            .sizing = if (self.placement_mode == .remainder) .width else .fit,
         };
         self.pending_media = request;
         entry.media = .loading;
@@ -374,7 +420,7 @@ fn startVisibleMedia(self: *App, io: Io, loop: *vaxis.Loop(Event), media_tasks: 
 }
 
 fn loadMedia(io: Io, gpa: mem.Allocator, request: *MediaRequest, loop: *vaxis.Loop(Event)) Io.Cancelable!void {
-    const artifact = Media.loadLocal(io, gpa, request.path, request.max_width, request.max_height) catch |err| {
+    const artifact = Media.loadLocal(io, gpa, request.path, request.max_width, request.max_height, request.sizing) catch |err| {
         if (err == error.Canceled) return error.Canceled;
         request.result = .failed;
         try loop.postEvent(.media_loaded);
@@ -393,6 +439,11 @@ fn finishMedia(self: *App, tty: *Io.Writer) !void {
     }
     if (request.entry_index >= self.entries.items.len) return;
     const entry = &self.entries.items[request.entry_index];
+    if (self.placement_mode == .remainder and request.max_width != self.imagePixelWidth()) {
+        entry.media = .idle;
+        self.invalidateMeasurementsFrom(request.entry_index);
+        return;
+    }
     switch (request.result) {
         .ready => |artifact| {
             self.evictImage(tty, request.entry_index);
@@ -412,6 +463,33 @@ fn finishMedia(self: *App, tty: *Io.Writer) !void {
         .pending, .failed => entry.media = .failed,
     }
     self.invalidateMeasurementsFrom(request.entry_index);
+}
+
+fn imagePixelWidth(self: *const App) u16 {
+    return @intCast(@min(
+        math.mul(usize, self.image_width, self.cell_width) catch math.maxInt(u16),
+        math.maxInt(u16),
+    ));
+}
+
+fn sourcePixelRow(image_height: u16, row: usize, cell_height: usize) u16 {
+    return @intCast(@min(
+        image_height,
+        math.mul(usize, row, cell_height) catch math.maxInt(usize),
+    ));
+}
+
+fn resetReadyImages(self: *App, tty: *Io.Writer) void {
+    var first = self.entries.items.len;
+    for (self.entries.items, 0..) |*entry, index| {
+        if (entry.media != .ready) continue;
+        Kitty.free(tty, entry.media.ready.id);
+        entry.media = .idle;
+        entry.virtual_rows = 0;
+        entry.virtual_cols = 0;
+        first = @min(first, index);
+    }
+    if (first < self.entries.items.len) self.invalidateMeasurementsFrom(first);
 }
 
 fn evictImage(self: *App, tty: *Io.Writer, incoming: usize) void {
@@ -550,6 +628,7 @@ test "ready image entry measures from its raster dimensions" {
     var app = App.init(testing.allocator, &doc);
     defer app.deinit();
     app.width = 40;
+    app.image_width = 24;
     app.cell_width = 10;
     app.cell_height = 20;
     app.placement_mode = .unicode;
@@ -558,7 +637,7 @@ test "ready image entry measures from its raster dimensions" {
         .elem = .{ .image = .{ .alt = "diagram", .source = "diagram.png", .title = null } },
         .media = .{ .ready = vaxis.Image.init(1, 800, 400) },
     };
-    try testing.expectEqual(@as(usize, 11), app.measureEntry(entry));
+    try testing.expectEqual(@as(usize, 7), app.measureEntry(entry));
 
     var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 12, .cols = 40, .x_pixel = 400, .y_pixel = 240 });
     defer screen.deinit(testing.allocator);
@@ -571,13 +650,14 @@ test "ready image entry measures from its raster dimensions" {
         .height = 12,
         .screen = &screen,
     };
-    try testing.expectEqual(@as(usize, 10), app.renderEntry(win, &entry, 0, 0));
+    try testing.expectEqual(@as(usize, 6), app.renderEntry(win, &entry, 0, 0));
     try testing.expectEqual(@as(usize, 1), app.virtual_placement_count);
     try testing.expectEqual(@as(u32, 1), app.virtual_placements[0].image_id);
+    try testing.expectEqual(@as(u16, 24), app.virtual_placements[0].cols);
     try testing.expectEqualStrings("\u{10eeee}\u{0305}", win.readCell(0, 0).?.char.grapheme);
 
     app.virtual_placement_count = 0;
-    try testing.expectEqual(@as(usize, 6), app.renderEntry(win, &entry, 0, 4));
+    try testing.expectEqual(@as(usize, 2), app.renderEntry(win, &entry, 0, 4));
     try testing.expectEqual(@as(usize, 0), app.virtual_placement_count);
     try testing.expectEqualStrings("\u{10eeee}\u{0312}", win.readCell(0, 0).?.char.grapheme);
 
@@ -587,6 +667,40 @@ test "ready image entry measures from its raster dimensions" {
     try testing.expectEqual(@as(usize, 1), app.next_stable_placement_count);
     try testing.expectEqual(@as(u32, 1), app.next_stable_placements[0].image_id);
     try testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
+
+    app.next_stable_placement_count = 0;
+    _ = try app.renderEntry(win, &entry, 10, 0);
+    try testing.expectEqual(@as(u16, 2), app.next_stable_placements[0].rows);
+    try testing.expectEqual(
+        Kitty.Placement.SourceRect{ .y = 0, .width = 800, .height = 134 },
+        app.next_stable_placements[0].source.?,
+    );
+
+    app.next_stable_placement_count = 0;
+    _ = try app.renderEntry(win, &entry, 0, 4);
+    try testing.expectEqual(
+        Kitty.Placement.SourceRect{ .y = 266, .width = 800, .height = 134 },
+        app.next_stable_placements[0].source.?,
+    );
+
+    app.next_stable_placement_count = 0;
+    app.placement_mode = .remainder;
+    var remainder_entry: Entry = .{
+        .elem = entry.elem,
+        .media = .{ .ready = vaxis.Image.init(2, 240, 120) },
+    };
+    _ = try app.renderEntry(win, &remainder_entry, 10, 0);
+    try testing.expectEqual(@as(u16, 6), app.next_stable_placements[0].rows);
+    try testing.expectEqual(@as(?Kitty.Placement.SourceRect, null), app.next_stable_placements[0].source);
+
+    app.next_stable_placement_count = 0;
+    _ = try app.renderEntry(win, &remainder_entry, 0, 4);
+    try testing.expectEqual(@as(u16, 2), app.next_stable_placements[0].rows);
+    try testing.expectEqual(@as(u16, 24), app.next_stable_placements[0].cols);
+    try testing.expectEqual(
+        Kitty.Placement.SourceRect{ .y = 80, .width = 240, .height = 40 },
+        app.next_stable_placements[0].source.?,
+    );
 }
 
 test "unavailable image states render a placeholder" {
@@ -663,6 +777,12 @@ test "content fills four fifths of the window" {
     try testing.expectEqual(@as(usize, 119), contentWidth(119));
     try testing.expectEqual(@as(usize, 96), contentWidth(120));
     try testing.expectEqual(@as(usize, 160), contentWidth(200));
+}
+
+test "images occupy four fifths of the screen" {
+    try testing.expectEqual(@as(usize, 80), imageWidthForScreen(100, 100));
+    try testing.expectEqual(@as(usize, 160), imageWidthForScreen(200, 160));
+    try testing.expectEqual(@as(usize, 40), imageWidthForScreen(100, 40));
 }
 
 test "scrolling reaches the last line of a long document" {

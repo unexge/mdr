@@ -9,6 +9,11 @@ pub const Dimensions = struct {
     height: u16,
 };
 
+pub const Sizing = enum {
+    fit,
+    width,
+};
+
 pub fn classify(source: []const u8) SourceKind {
     if (mem.startsWith(u8, source, "http://") or
         mem.startsWith(u8, source, "https://") or
@@ -70,7 +75,14 @@ pub const State = union(enum) {
     }
 };
 
-pub fn loadLocal(io: Io, gpa: mem.Allocator, file_path: []const u8, max_width: u16, max_height: u16) !Artifact {
+pub fn loadLocal(
+    io: Io,
+    gpa: mem.Allocator,
+    file_path: []const u8,
+    target_width: u16,
+    max_height: u16,
+    sizing: Sizing,
+) !Artifact {
     var read_buffer: [64 * 1024]u8 = undefined;
     var decoded = try vaxis.zigimg.Image.fromFilePath(gpa, io, file_path, &read_buffer);
     defer decoded.deinit(gpa);
@@ -83,12 +95,22 @@ pub fn loadLocal(io: Io, gpa: mem.Allocator, file_path: []const u8, max_width: u
     const pixels = math.mul(usize, decoded.width, decoded.height) catch return error.ImageTooLarge;
     if (pixels > 4 * 1024 * 1024) return error.ImageTooLarge;
 
-    const dimensions = fitDimensions(
-        @intCast(decoded.width),
-        @intCast(decoded.height),
-        max_width,
-        max_height,
-    );
+    const dimensions = switch (sizing) {
+        .fit => fitDimensions(
+            @intCast(decoded.width),
+            @intCast(decoded.height),
+            target_width,
+            max_height,
+        ),
+        .width => dimensionsForWidth(
+            @intCast(decoded.width),
+            @intCast(decoded.height),
+            target_width,
+            max_height,
+        ),
+    };
+    const output_pixels = math.mul(usize, dimensions.width, dimensions.height) catch return error.ImageTooLarge;
+    if (output_pixels > 4 * 1024 * 1024) return error.ImageTooLarge;
     var resized: ?vaxis.zigimg.Image = null;
     defer if (resized) |*image| image.deinit(gpa);
     const output_image: *vaxis.zigimg.Image = if (dimensions.width != decoded.width or dimensions.height != decoded.height) image: {
@@ -133,13 +155,25 @@ pub fn fitDimensions(width: u16, height: u16, max_width: u16, max_height: u16) D
     };
 }
 
+pub fn dimensionsForWidth(width: u16, height: u16, target_width: u16, max_height: u16) Dimensions {
+    const output_width = @max(1, target_width);
+    const bound_height = @max(1, max_height);
+    const output_height = @max(1, (@as(u64, height) * output_width + width / 2) / width);
+    if (output_height <= bound_height) {
+        return .{ .width = output_width, .height = @intCast(output_height) };
+    }
+    return .{
+        .width = @intCast(@max(1, (@as(u64, width) * bound_height + height / 2) / height)),
+        .height = bound_height,
+    };
+}
+
 pub fn rowsForSize(image_width: u16, image_height: u16, cols: usize, cell_width: usize, cell_height: usize) usize {
     if (image_width == 0 or image_height == 0 or cols == 0 or cell_width == 0 or cell_height == 0) return 1;
-    const available_pixels = @as(u64, cols) * cell_width;
-    const rendered_width = @min(@as(u64, image_width), available_pixels);
+    const rendered_width = @as(u64, cols) * cell_width;
     const rendered_height = (@as(u64, image_height) * rendered_width + image_width - 1) / image_width;
     const rows = (rendered_height + cell_height - 1) / cell_height;
-    return @intCast(@max(1, @min(16, rows)));
+    return @intCast(@max(1, @min(math.maxInt(u16), rows)));
 }
 
 const std = @import("std");
@@ -179,9 +213,9 @@ test "prepares PNG output as a reusable raster artifact" {
     try testing.expectEqual(@as(u16, 20), artifact.height);
 }
 
-test "sizes raster output to terminal cells with a height cap" {
+test "sizes raster output to terminal cells at the requested width" {
     try testing.expectEqual(@as(usize, 10), rowsForSize(800, 400, 40, 10, 20));
-    try testing.expectEqual(@as(usize, 16), rowsForSize(800, 1600, 40, 10, 20));
+    try testing.expectEqual(@as(usize, 40), rowsForSize(800, 1600, 40, 10, 20));
     try testing.expectEqual(@as(usize, 1), rowsForSize(800, 1, 40, 10, 20));
 }
 
@@ -200,7 +234,18 @@ test "fits large rasters to their terminal pixel bounds" {
     );
 }
 
-test "loads and bounds a local image raster" {
+test "sizes rasters to an exact target width" {
+    try testing.expectEqual(
+        Dimensions{ .width = 200, .height = 100 },
+        dimensionsForWidth(100, 50, 200, 320),
+    );
+    try testing.expectEqual(
+        Dimensions{ .width = 160, .height = 320 },
+        dimensionsForWidth(100, 200, 200, 320),
+    );
+}
+
+test "loads and resizes a local image raster" {
     const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAACCAYAAAB/qH1jAAAAEklEQVR4nGP4z8DwHxkzoAsAAA8hD/EEN8afAAAAAElFTkSuQmCC";
     var png: [base64.standard.Decoder.calcSizeForSlice(encoded) catch unreachable]u8 = undefined;
     try base64.standard.Decoder.decode(&png, encoded);
@@ -211,7 +256,7 @@ test "loads and bounds a local image raster" {
     var file_path_buffer: [128]u8 = undefined;
     const file_path = try fmt.bufPrint(&file_path_buffer, ".zig-cache/tmp/{s}/pixel.png", .{tmp.sub_path});
 
-    var artifact = try loadLocal(testing.io, testing.allocator, file_path, 2, 2);
+    var artifact = try loadLocal(testing.io, testing.allocator, file_path, 2, 2, .fit);
     defer artifact.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 2), artifact.width);
     try testing.expectEqual(@as(u16, 1), artifact.height);
