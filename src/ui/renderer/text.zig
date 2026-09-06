@@ -45,7 +45,7 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
         .skip = skip,
         .alignment = alignment,
     };
-    lay.styles[0] = base;
+    lay.formats[0] = .{ .style = base };
     lay.depth = 1;
 
     // Definitions are scanned once, and only when brackets may need them.
@@ -59,9 +59,9 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
             .text => |t| lay.feedText(t, lay.top()),
             .code => |t| {
                 lay.flushWord();
-                var style = lay.top();
-                style.fg = .{ .index = 6 };
-                lay.feedText(t, style);
+                var format = lay.top();
+                format.style.fg = .{ .index = 6 };
+                lay.feedText(t, format);
             },
             .entity => |raw| {
                 lay.flushWord();
@@ -71,7 +71,7 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
             },
             .escape => |char| {
                 if (lay.piece_count == max_word_pieces) lay.flushWord();
-                lay.pieces[lay.piece_count] = .{ .text = char, .style = lay.top() };
+                lay.pieces[lay.piece_count] = .{ .text = char, .format = lay.top() };
                 lay.piece_count += 1;
                 lay.word_width += 1;
             },
@@ -83,13 +83,16 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
             // column decides where lines end.
             .soft_break => {
                 lay.flushWord();
-                if (lay.col > 0) lay.pending_space = true;
+                if (lay.col > 0) {
+                    lay.pending_space = true;
+                    lay.pending_space_format = lay.top();
+                }
             },
             .em_open => {
                 lay.flushWord();
-                var style = lay.top();
-                style.italic = true;
-                lay.push(style);
+                var format = lay.top();
+                format.style.italic = true;
+                lay.push(format);
             },
             .em_close => {
                 lay.flushWord();
@@ -97,9 +100,9 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
             },
             .strong_open => {
                 lay.flushWord();
-                var style = lay.top();
-                style.bold = true;
-                lay.push(style);
+                var format = lay.top();
+                format.style.bold = true;
+                lay.push(format);
             },
             .strong_close => {
                 lay.flushWord();
@@ -107,20 +110,21 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
             },
             .strike_open => {
                 lay.flushWord();
-                var style = lay.top();
-                style.strikethrough = true;
-                lay.push(style);
+                var format = lay.top();
+                format.style.strikethrough = true;
+                lay.push(format);
             },
             .strike_close => {
                 lay.flushWord();
                 lay.pop();
             },
-            .link => {
+            .link => |link| {
                 lay.flushWord();
-                var style = lay.top();
-                style.ul_style = .single;
-                style.fg = .{ .index = 4 };
-                lay.push(style);
+                var format = lay.top();
+                format.style.ul_style = .single;
+                format.style.fg = .{ .index = 4 };
+                format.link.uri = link.destination;
+                lay.push(format);
             },
             .link_close => {
                 lay.flushWord();
@@ -141,12 +145,17 @@ fn gwidth(text: []const u8) usize {
 
 const Piece = struct {
     text: []const u8,
+    format: Format,
+};
+
+const Format = struct {
     style: vaxis.Style,
+    link: vaxis.Cell.Hyperlink = .{},
 };
 
 const LineCell = struct {
     text: []const u8,
-    style: vaxis.Style,
+    format: Format,
     width: usize,
 };
 
@@ -158,6 +167,7 @@ const Lay = struct {
     alignment: Document.Alignment = .left,
     col: usize = 0,
     pending_space: bool = false,
+    pending_space_format: Format = .{ .style = .{} },
     pieces: [max_word_pieces]Piece = undefined,
     piece_count: usize = 0,
     word_width: usize = 0,
@@ -165,16 +175,16 @@ const Lay = struct {
     line_count: usize = 0,
     line_width: usize = 0,
     line_plain: bool = false,
-    styles: [max_style_depth]vaxis.Style = undefined,
+    formats: [max_style_depth]Format = undefined,
     depth: usize = 0,
 
-    fn top(self: *Lay) vaxis.Style {
-        return self.styles[self.depth - 1];
+    fn top(self: *Lay) Format {
+        return self.formats[self.depth - 1];
     }
 
-    fn push(self: *Lay, style: vaxis.Style) void {
+    fn push(self: *Lay, format: Format) void {
         if (self.depth >= max_style_depth) return;
-        self.styles[self.depth] = style;
+        self.formats[self.depth] = format;
         self.depth += 1;
     }
 
@@ -217,7 +227,8 @@ const Lay = struct {
         for (self.line[0..self.line_count]) |c| {
             win.writeCell(@intCast(x), @intCast(self.row), .{
                 .char = .{ .grapheme = c.text, .width = @intCast(c.width) },
-                .style = c.style,
+                .style = c.format.style,
+                .link = c.format.link,
             });
             x += c.width;
         }
@@ -232,7 +243,8 @@ const Lay = struct {
                 for (self.line[0..self.line_count]) |c| {
                     win.writeCell(@intCast(x), @intCast(self.row), .{
                         .char = .{ .grapheme = c.text, .width = @intCast(c.width) },
-                        .style = c.style,
+                        .style = c.format.style,
+                        .link = c.format.link,
                     });
                     x += c.width;
                 }
@@ -243,21 +255,22 @@ const Lay = struct {
         self.line_plain = true;
     }
 
-    fn put(self: *Lay, g: []const u8, style: vaxis.Style) void {
+    fn put(self: *Lay, g: []const u8, format: Format) void {
         const w = gwidth(g);
         if (w == 0) return;
         if (self.col + w > self.width) self.lineBreak();
-        if (self.skip == 0) self.write(g, style, w);
+        if (self.skip == 0) self.write(g, format, w);
         self.col += w;
     }
 
-    fn write(self: *Lay, g: []const u8, style: vaxis.Style, w: usize) void {
+    fn write(self: *Lay, g: []const u8, format: Format, w: usize) void {
         const win = self.win orelse return;
         if (self.alignment == .left or self.line_plain) {
             if (self.row < win.height) {
                 win.writeCell(@intCast(self.col), @intCast(self.row), .{
                     .char = .{ .grapheme = g, .width = @intCast(w) },
-                    .style = style,
+                    .style = format.style,
+                    .link = format.link,
                 });
             }
             return;
@@ -267,31 +280,35 @@ const Lay = struct {
             if (self.row < win.height) {
                 win.writeCell(@intCast(self.col), @intCast(self.row), .{
                     .char = .{ .grapheme = g, .width = @intCast(w) },
-                    .style = style,
+                    .style = format.style,
+                    .link = format.link,
                 });
             }
             return;
         }
-        self.line[self.line_count] = .{ .text = g, .style = style, .width = w };
+        self.line[self.line_count] = .{ .text = g, .format = format, .width = w };
         self.line_count += 1;
         self.line_width += w;
     }
 
     /// Writes graphemes directly, wrapping mid-word when needed.
-    fn putText(self: *Lay, text: []const u8, style: vaxis.Style) void {
+    fn putText(self: *Lay, text: []const u8, format: Format) void {
         var iter = vaxis.unicode.graphemeIterator(text);
-        while (iter.next()) |g| self.put(g.bytes(text), style);
+        while (iter.next()) |g| self.put(g.bytes(text), format);
     }
 
     /// Accumulates one span's text into word pieces, wrapping on spaces
     /// and newlines.
-    fn feedText(self: *Lay, text: []const u8, style: vaxis.Style) void {
+    fn feedText(self: *Lay, text: []const u8, format: Format) void {
         var i: usize = 0;
         while (i < text.len) {
             switch (text[i]) {
                 ' ', '\t' => {
                     self.flushWord();
-                    if (self.col > 0) self.pending_space = true;
+                    if (self.col > 0) {
+                        self.pending_space = true;
+                        self.pending_space_format = format;
+                    }
                     i += 1;
                 },
                 '\n' => {
@@ -303,7 +320,7 @@ const Lay = struct {
                     const start = i;
                     while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\n') i += 1;
                     if (self.piece_count == max_word_pieces) self.flushWord();
-                    self.pieces[self.piece_count] = .{ .text = text[start..i], .style = style };
+                    self.pieces[self.piece_count] = .{ .text = text[start..i], .format = format };
                     self.piece_count += 1;
                     self.word_width += gwidth(text[start..i]);
                 },
@@ -331,11 +348,11 @@ const Lay = struct {
         } else if (self.col + @intFromBool(self.pending_space) + word_width > self.width) {
             self.lineBreak();
         }
-        if (self.pending_space and self.col > 0) self.put(" ", pieces[0].style);
+        if (self.pending_space and self.col > 0) self.put(" ", self.pending_space_format);
         self.pending_space = false;
 
         for (pieces) |piece| {
-            self.putText(piece.text, piece.style);
+            self.putText(piece.text, piece.format);
         }
     }
 };

@@ -108,4 +108,26 @@ test "list and quote footprints" {
     try testing.expectEqual(@as(usize, 2), measure(.{ .block_quote = quote }, 20));
 }
 
+test "renders link destinations on visible label cells" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 1,
+        .screen = &screen,
+    };
+
+    _ = render(win, .{ .paragraph = .{ .content = "see [site](https://example.com) now" } }, 0, 0);
+
+    try testing.expectEqualStrings("", win.readCell(3, 0).?.link.uri);
+    for (4..8) |col| {
+        try testing.expectEqualStrings("https://example.com", win.readCell(@intCast(col), 0).?.link.uri);
+    }
+    try testing.expectEqualStrings("", win.readCell(8, 0).?.link.uri);
+}
+
 const testing = std.testing;
