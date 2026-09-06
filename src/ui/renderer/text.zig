@@ -75,9 +75,15 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
                 lay.piece_count += 1;
                 lay.word_width += 1;
             },
-            .hard_break, .soft_break => {
+            .hard_break => {
                 lay.flushWord();
                 lay.lineBreak();
+            },
+            // Soft breaks reflow: source newlines become spaces and the
+            // column decides where lines end.
+            .soft_break => {
+                lay.flushWord();
+                if (lay.col > 0) lay.pending_space = true;
             },
             .em_open => {
                 lay.flushWord();
@@ -349,8 +355,10 @@ test "hard wraps words longer than the width" {
     try testing.expectEqual(@as(usize, 3), measure("abcdefghij", 4, .{}));
 }
 
-test "keeps hard newlines" {
-    try testing.expectEqual(@as(usize, 2), measure("a\nb", 10, .{}));
+test "soft breaks reflow, hard breaks keep lines" {
+    try testing.expectEqual(@as(usize, 1), measure("a\nb", 10, .{}));
+    try testing.expectEqual(@as(usize, 1), measure("aa bb\ncc dd", 11, .{}));
+    try testing.expectEqual(@as(usize, 2), measure("a  \nb", 10, .{}));
 }
 
 test "spans measure like their text" {

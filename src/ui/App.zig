@@ -99,13 +99,26 @@ fn pageRows(viewport: usize) usize {
 
 fn draw(self: *App, vx: *vaxis.Vaxis, tty: *Io.Writer) !void {
     const win = vx.window();
-    self.syncWidth(win.width);
-    try self.prepareFrame(win.height);
+    const content = win.child(.{
+        .x_off = 0,
+        .width = @intCast(contentWidth(win.width)),
+    });
+    self.syncWidth(content.width);
+    try self.prepareFrame(content.height);
 
     Renderer.beginFrame();
     win.clear();
-    self.renderViewport(win);
+    self.renderViewport(content);
     try vx.render(tty);
+}
+
+/// Content fills four fifths of the window; narrower windows than this
+/// (about 960px at 8px cells) use the full width instead of side margins.
+const full_width_cols = 120;
+
+fn contentWidth(full: usize) usize {
+    if (full < full_width_cols) return full;
+    return full * 4 / 5;
 }
 
 /// Draws the visible rows, skipping everything above `scroll` and stopping
@@ -292,6 +305,16 @@ test "scrolling shifts content up" {
     app.renderViewport(win);
     try expectCell(win, 0, 0, 's');
     try expectCell(win, 0, 2, 't');
+}
+
+test "content fills four fifths of the window" {
+    try testing.expectEqual(@as(usize, 100), contentWidth(100));
+    try testing.expectEqual(@as(usize, 20), contentWidth(20));
+    try testing.expectEqual(@as(usize, 1), contentWidth(1));
+    try testing.expectEqual(@as(usize, 0), contentWidth(0));
+    try testing.expectEqual(@as(usize, 119), contentWidth(119));
+    try testing.expectEqual(@as(usize, 96), contentWidth(120));
+    try testing.expectEqual(@as(usize, 160), contentWidth(200));
 }
 
 test "scrolling reaches the last line of a long document" {

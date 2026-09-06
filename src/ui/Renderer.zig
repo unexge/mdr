@@ -95,7 +95,7 @@ const table = @import("renderer/table.zig");
 test "block footprints include the trailing gap" {
     try testing.expectEqual(@as(usize, 2), measure(.{ .thematic_break = .{} }, 10));
     try testing.expectEqual(@as(usize, 2), measure(.{ .paragraph = .{ .content = "hi" } }, 10));
-    try testing.expectEqual(@as(usize, 3), measure(.{ .header = .{ .level = 3, .content = "a\nb" } }, 10));
+    try testing.expectEqual(@as(usize, 2), measure(.{ .header = .{ .level = 3, .content = "a\nb" } }, 10));
 }
 
 test "list and quote footprints" {
@@ -108,8 +108,8 @@ test "list and quote footprints" {
     const quote_doc = Document.init("> a\n> b\n");
     var quote_blocks: Document.Blocks = .{ .text = quote_doc.text, .cursor = 0, .end = quote_doc.text.len };
     const quote = quote_blocks.next().?.block_quote;
-    // Two content rows inset by the quote bar, plus the quote's gap.
-    try testing.expectEqual(@as(usize, 3), measure(.{ .block_quote = quote }, 20));
+    // One reflowed content row inset by the quote bar, plus the quote's gap.
+    try testing.expectEqual(@as(usize, 2), measure(.{ .block_quote = quote }, 20));
 }
 
 const testing = std.testing;
