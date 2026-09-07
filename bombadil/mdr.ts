@@ -69,6 +69,12 @@ export const startHeadingIsBold = always(() =>
   !terminal.current.startVisible || terminal.current.startBold,
 );
 
+export const loneTagsNeverRender = always(() =>
+  !terminal.current.lines.some((line) =>
+    line.includes("BOMBADIL_BADGE") || line.includes("data-bombadil"),
+  ),
+);
+
 const navigation = typeFromSet(CharSet.fromLiterals(
   "j",
   "k",

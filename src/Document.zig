@@ -12,7 +12,7 @@
 //! in the library; `init` borrows text already in memory. Markdown has no
 //! syntax errors, so parsing cannot fail.
 //!
-//! Not supported yet: HTML and inline or reference
+//! Not supported yet: inline or reference
 //! images. Standalone direct images are block elements. Container nesting
 //! deeper than 8 levels degrades to plain text.
 
@@ -334,21 +334,39 @@ pub const Blocks = struct {
             if (extra >= 4) return self.parseIndentedCode(line);
             if (extra <= 3) {
                 const body = line.content[extra..];
-                if (parseAtxHeader(body)) |header| {
-                    self.cursor = line.next;
-                    return .{ .header = .{ .level = header.level, .content = header.content, .chain = self.chain, .refs = self.refs } };
-                }
-                if (parseFence(body)) |fence| return self.parseCodeBlock(fence, line);
-                if (isThematicBreak(body)) {
-                    self.cursor = line.next;
-                    return .thematic_break;
-                }
-                if (body.len > 0 and body[0] == '>') return self.parseQuote(line);
-                if (parseMarkerLine(body)) |marker| return self.parseList(marker);
-                if (self.parseTable(line)) |table| return table;
-                if (self.parseStandaloneImage(body)) |image| {
-                    self.cursor = line.next;
-                    return .{ .image = image };
+                // HTML renders as nothing; consume through the blank line.
+                if (isHtmlBlockStart(body)) {
+                    var scan = line.next;
+                    while (scan < self.end) {
+                        const html = chainLine(self.chain, text, scan, self.end, false);
+                        if (isBlankLine(html.content)) break;
+                        scan = html.next;
+                    }
+                    self.cursor = scan;
+                    continue;
+                } else {
+                    // A line holding nothing but one tag (`<br>`, `<img ..>`)
+                    // has no renderable text; autolinks never match.
+                    if (isLoneTag(body)) {
+                        self.cursor = line.next;
+                        continue;
+                    }
+                    if (parseAtxHeader(body)) |header| {
+                        self.cursor = line.next;
+                        return .{ .header = .{ .level = header.level, .content = header.content, .chain = self.chain, .refs = self.refs } };
+                    }
+                    if (parseFence(body)) |fence| return self.parseCodeBlock(fence, line);
+                    if (isThematicBreak(body)) {
+                        self.cursor = line.next;
+                        return .thematic_break;
+                    }
+                    if (body.len > 0 and body[0] == '>') return self.parseQuote(line);
+                    if (parseMarkerLine(body)) |marker| return self.parseList(marker);
+                    if (self.parseTable(line)) |table| return table;
+                    if (self.parseStandaloneImage(body)) |image| {
+                        self.cursor = line.next;
+                        return .{ .image = image };
+                    }
                 }
             }
             if (self.parseParagraph(line)) |elem| return elem;
@@ -1778,6 +1796,75 @@ fn isThematicBreak(body: []const u8) bool {
     return count >= 3;
 }
 
+/// An HTML block opener: comments, declarations, processing instructions
+/// or a complete open/closing tag of a block-level element. Autolinks
+/// (`<https://..>`, `<a@b>`) never match: their interiors fail the tag
+/// shape, so they keep parsing as paragraphs.
+fn isHtmlBlockStart(line: []const u8) bool {
+    if (line.len < 2 or line[0] != '<') return false;
+    var i: usize = 1;
+    if (line[i] == '/') {
+        i += 1;
+        if (i >= line.len) return false;
+    }
+    if (line[i] == '!' or line[i] == '?') return true;
+    if (!ascii.isAlphabetic(line[i])) return false;
+    var j = i + 1;
+    while (j < line.len and (ascii.isAlphanumeric(line[j]) or line[j] == '-')) j += 1;
+    if (j < line.len and line[j] != ' ' and line[j] != '\t' and line[j] != '>' and line[j] != '/') return false;
+    return isBlockTagName(line[i..j]);
+}
+
+/// The whole line is one complete tag and nothing else. Attribute values
+/// may contain `>` inside quotes; `@` and `:` never belong in a tag, so
+/// autolinks (`<https://..>`, `<a@b>`) keep parsing as paragraphs.
+fn isLoneTag(line: []const u8) bool {
+    if (line.len < 3 or line[0] != '<') return false;
+    var i: usize = 1;
+    if (line[i] == '/') {
+        i += 1;
+        if (i >= line.len) return false;
+    }
+    if (!ascii.isAlphabetic(line[i])) return false;
+    while (i < line.len and (ascii.isAlphanumeric(line[i]) or line[i] == '-')) i += 1;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == '"' or c == '\'') {
+            i += 1;
+            while (i < line.len and line[i] != c) i += 1;
+            if (i >= line.len) return false;
+            i += 1;
+        } else if (c == '>') {
+            i += 1;
+            while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+            return i >= line.len;
+        } else if (c == '@' or c == ':' or c == '<' or c < 0x20) {
+            return false;
+        } else {
+            i += 1;
+        }
+    }
+    return false;
+}
+
+fn isBlockTagName(name: []const u8) bool {
+    const tags = [_][]const u8{
+        "address",  "article",  "aside",    "base",       "basefont", "blockquote", "body",     "caption",
+        "center",   "col",      "colgroup", "dd",         "details",  "dialog",     "dir",      "div",
+        "dl",       "dt",       "fieldset", "figcaption", "figure",   "footer",     "form",     "frame",
+        "frameset", "h1",       "h2",       "h3",         "h4",       "h5",         "h6",       "head",
+        "header",   "hr",       "html",     "iframe",     "legend",   "li",         "link",     "main",
+        "menu",     "menuitem", "meta",     "nav",        "noframes", "ol",         "optgroup", "option",
+        "p",        "param",    "section",  "source",     "summary",  "table",      "tbody",    "td",
+        "tfoot",    "th",       "thead",    "title",      "tr",       "track",      "ul",       "script",
+        "style",    "pre",      "textarea",
+    };
+    for (tags) |tag| {
+        if (labelsEqual(tag, name)) return true;
+    }
+    return false;
+}
+
 fn setextLevel(body: []const u8) ?u8 {
     const t = mem.trim(u8, body, " \t");
     if (t.len == 0) return null;
@@ -2254,6 +2341,40 @@ test "indented code in containers" {
     var qlines = qblocks.next().?.code_block.lines();
     try testing.expectEqualStrings("code", qlines.next().?);
     try testing.expect(qlines.next() == null);
+}
+
+test "html blocks are skipped" {
+    var doc = Document.init("<div>\nraw <b>junk</b>\n</div>\n\npara\n");
+    try testing.expectEqualStrings("para", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+
+    var comment = Document.init("<!-- note -->\n\npara\n");
+    try testing.expectEqualStrings("para", comment.next().?.paragraph.content);
+    try testing.expect(comment.next() == null);
+}
+
+test "autolinks and inline html are not blocks" {
+    var doc = Document.init("<https://example.com>\n");
+    try testing.expectEqualStrings("<https://example.com>", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+
+    var mid = Document.init("a\n<div>\n");
+    try testing.expectEqualStrings("a\n<div>", mid.next().?.paragraph.content);
+    try testing.expect(mid.next() == null);
+}
+
+test "lone tag lines are skipped" {
+    var doc = Document.init("<div align=\"center\">\n\n<img width=\"50%\" alt=\"Flash\" src=\"images/logo.png\">\n<br>\n\ntext\n");
+    try testing.expectEqualStrings("text", doc.next().?.paragraph.content);
+    try testing.expect(doc.next() == null);
+
+    var quoted = Document.init("<img alt=\"a>b\" src=\"x\">\n\npara\n");
+    try testing.expectEqualStrings("para", quoted.next().?.paragraph.content);
+    try testing.expect(quoted.next() == null);
+
+    var auto = Document.init("<br/>\n\n<https://example.com>\n");
+    try testing.expectEqualStrings("<https://example.com>", auto.next().?.paragraph.content);
+    try testing.expect(auto.next() == null);
 }
 
 test "bullet lists" {

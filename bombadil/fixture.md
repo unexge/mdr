@@ -98,6 +98,17 @@ Line 19 keeps the document taller than the viewport.
 
 Line 20 keeps the document taller than the viewport.
 
+## HTML boilerplate
+
+<div align="center">
+
+<img width="50%" alt="BOMBADIL_BADGE" src="images/logo.png">
+<br data-bombadil="spacer">
+
+Visible caption under skipped boilerplate.
+
+</div>
+
 ## Final section
 
 The final marker must be reachable after End or `G` from every explored state.
