@@ -1,9 +1,11 @@
 //! Fenced code blocks: verbatim lines hard-wrapped at the window width,
 //! rendered as a card with a filled background and the info string dimmed
-//! above the content. Diagram-style blocks (mermaid, latex) will get their
-//! own submodules dispatched from here.
+//! above the content. Mermaid flowcharts dispatch to mermaid.zig and fall
+//! back to the card when they cannot render.
 
 const Document = @import("../../Document.zig");
+const Mermaid = @import("../../Mermaid.zig");
+const mermaid = @import("mermaid.zig");
 const vaxis = @import("vaxis");
 
 const card_style: vaxis.Style = .{ .bg = .{ .index = 236 } };
@@ -12,6 +14,13 @@ const info_style: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 236 
 /// One walk measures (null window: no writes, no clipping, no skipping)
 /// and renders, returning the row after the last content row.
 pub fn layout(win: ?vaxis.Window, cb: Document.Element.CodeBlock, start_row: usize, skip: usize, width: usize) usize {
+    if (cb.info) |info| {
+        if (info.isMermaid()) {
+            if (Mermaid.parseBlock(cb)) |flow| {
+                if (mermaid.layout(win, &flow, start_row, skip, width)) |after| return after;
+            }
+        }
+    }
     const cols = @max(width, 1);
     var row = start_row;
     var skip_rows = if (win == null) 0 else skip;
@@ -21,7 +30,7 @@ pub fn layout(win: ?vaxis.Window, cb: Document.Element.CodeBlock, start_row: usi
             skip_rows -= 1;
         } else if (win) |w| {
             if (row < w.height) {
-                fillRest(w, row, writeInfo(w, row, info));
+                fillRest(w, row, writeInfo(w, row, info.text()));
                 row += 1;
             }
         } else {
@@ -105,8 +114,47 @@ fn gwidth(g: []const u8) usize {
 
 const std = @import("std");
 
+test "mermaid flowcharts render as diagrams" {
+    const diagram: Document.Element.CodeBlock = .{ .info = .{ .mermaid = "mermaid" }, .content = "graph TD\nA-->B\n" };
+    try testing.expectEqual(@as(usize, 8), layout(null, diagram, 0, 0, 40));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 8, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 8,
+        .screen = &screen,
+    };
+    _ = layout(win, diagram, 0, 0, 40);
+    try testing.expectEqualStrings("┌", win.readCell(0, 0).?.char.grapheme);
+    try testing.expectEqualStrings("▼", win.readCell(2, 4).?.char.grapheme);
+}
+
+test "unrenderable mermaid falls back to the card" {
+    const diagram: Document.Element.CodeBlock = .{ .info = .{ .mermaid = "mermaid" }, .content = "sequenceDiagram\nA->B\n" };
+    try testing.expectEqual(@as(usize, 3), layout(null, diagram, 0, 0, 40));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 3,
+        .screen = &screen,
+    };
+    _ = layout(win, diagram, 0, 0, 40);
+    try testing.expect(win.readCell(0, 1).?.style.bg.eql(vaxis.Color{ .index = 236 }));
+}
+
 test "counts the info line and wrapped content lines" {
-    try testing.expectEqual(@as(usize, 2), layout(null, .{ .info = "zig", .content = "short\n" }, 0, 0, 40));
+    try testing.expectEqual(@as(usize, 2), layout(null, .{ .info = .{ .other = "zig" }, .content = "short\n" }, 0, 0, 40));
     try testing.expectEqual(@as(usize, 2), layout(null, .{ .info = null, .content = "abcdefgh\n" }, 0, 0, 4));
     try testing.expectEqual(@as(usize, 3), layout(null, .{ .info = null, .content = "ab\n\ncd\n" }, 0, 0, 40));
 }

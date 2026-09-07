@@ -42,6 +42,14 @@ pub fn main() void {
     indented code remains visible
     across multiple source lines
 
+## Diagram
+
+```mermaid
+graph TD
+A[x] --> B[y]
+A --> C[z]
+```
+
 ---
 
 ## Unicode

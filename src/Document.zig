@@ -111,7 +111,7 @@ pub const Element = union(enum) {
     };
 
     pub const CodeBlock = struct {
-        info: ?[]const u8,
+        info: ?Info,
         /// Raw text between the fences, including container prefixes; use
         /// `lines` for the stripped, verbatim lines.
         content: []const u8,
@@ -119,6 +119,28 @@ pub const Element = union(enum) {
         /// Indented blocks pre-strip their first line; the chain carries
         /// the remaining four-column strip for continuation lines.
         indented: bool = false,
+
+        pub const Info = union(enum) {
+            mermaid: []const u8,
+            other: []const u8,
+
+            pub fn parse(raw: []const u8) Info {
+                var end: usize = 0;
+                while (end < raw.len and raw[end] != ' ' and raw[end] != '\t') : (end += 1) {}
+                if (labelsEqual(raw[0..end], "mermaid")) return .{ .mermaid = raw };
+                return .{ .other = raw };
+            }
+
+            pub fn text(self: Info) []const u8 {
+                return switch (self) {
+                    .mermaid, .other => |raw| raw,
+                };
+            }
+
+            pub fn isMermaid(self: Info) bool {
+                return self == .mermaid;
+            }
+        };
 
         pub fn lines(self: CodeBlock) LineIterator {
             if (self.indented) return .{ .remaining = self.content, .chain = self.chain, .first = true };
@@ -1745,7 +1767,7 @@ fn chainLine(chain: Chain, text: []const u8, pos: usize, end: usize, mid_line: b
 const Fence = struct {
     ch: u8,
     len: usize,
-    info: ?[]const u8,
+    info: ?Element.CodeBlock.Info,
 };
 
 fn parseAtxHeader(body: []const u8) ?Element.Header {
@@ -1778,7 +1800,7 @@ fn parseFence(body: []const u8) ?Fence {
     const info_raw = mem.trim(u8, body[len..], " \t");
     // CommonMark: the info string may not contain the fence character.
     if (mem.indexOfScalar(u8, info_raw, ch) != null) return null;
-    return .{ .ch = ch, .len = len, .info = if (info_raw.len == 0) null else info_raw };
+    return .{ .ch = ch, .len = len, .info = if (info_raw.len == 0) null else Element.CodeBlock.Info.parse(info_raw) };
 }
 
 fn isThematicBreak(body: []const u8) bool {
@@ -2267,11 +2289,11 @@ test "fenced code blocks" {
     );
 
     const zig = doc.next().?.code_block;
-    try testing.expectEqualStrings("zig", zig.info.?);
+    try testing.expectEqualStrings("zig", zig.info.?.text());
     try testing.expectEqualStrings("const x = 1;\n\nconst y = # hash inside code;", zig.content);
 
     const css = doc.next().?.code_block;
-    try testing.expectEqualStrings("css", css.info.?);
+    try testing.expectEqualStrings("css", css.info.?.text());
     try testing.expectEqualStrings("body { color: red }", css.content);
 
     const nested = doc.next().?.code_block;
@@ -2279,10 +2301,19 @@ test "fenced code blocks" {
     try testing.expectEqualStrings("```\nnested fence\n```", nested.content);
 
     const unclosed = doc.next().?.code_block;
-    try testing.expectEqualStrings("go unclosed", unclosed.info.?);
+    try testing.expectEqualStrings("go unclosed", unclosed.info.?.text());
     try testing.expectEqualStrings("runs to eof", unclosed.content);
 
     try testing.expect(doc.next() == null);
+}
+
+test "code info classifies diagrams" {
+    try testing.expect(Element.CodeBlock.Info.parse("mermaid").isMermaid());
+    try testing.expect(Element.CodeBlock.Info.parse("Mermaid").isMermaid());
+    try testing.expect(Element.CodeBlock.Info.parse("mermaid extra").isMermaid());
+    try testing.expect(!Element.CodeBlock.Info.parse("zig").isMermaid());
+    try testing.expectEqualStrings("zig", Element.CodeBlock.Info.parse("zig").text());
+    try testing.expectEqualStrings("mermaid", Element.CodeBlock.Info.parse("mermaid").text());
 }
 
 test "code fence edge cases" {
@@ -2782,7 +2813,7 @@ test "code blocks inside containers" {
     var doc = Document.init("> ```zig\n> let x = 1;\n> ```\n");
     var blocks = doc.next().?.block_quote.blocks;
     const cb = blocks.next().?.code_block;
-    try testing.expectEqualStrings("zig", cb.info.?);
+    try testing.expectEqualStrings("zig", cb.info.?.text());
     var lines = cb.lines();
     try testing.expectEqualStrings("let x = 1;", lines.next().?);
     try testing.expect(lines.next() == null);
@@ -3047,7 +3078,7 @@ fn expectValidElement(elem: Element, text: []const u8, depth: usize) anyerror!vo
             if (image.title) |title| try expectWithin(title, text);
         },
         .code_block => |cb| {
-            if (cb.info) |info| try expectWithin(info, text);
+            if (cb.info) |info| try expectWithin(info.text(), text);
             try expectWithin(cb.content, text);
             var lines = cb.lines();
             while (lines.next()) |l| try expectWithin(l, text);
@@ -3128,7 +3159,11 @@ fn expectEqualElements(a: Element, b: Element, depth: usize) anyerror!void {
         },
         .code_block => |cb| {
             try testing.expectEqual(cb.info != null, b.code_block.info != null);
-            if (cb.info) |info| try testing.expectEqualStrings(info, b.code_block.info.?);
+            if (cb.info) |info| {
+                const other = b.code_block.info.?;
+                try testing.expectEqual(meta.activeTag(info), meta.activeTag(other));
+                try testing.expectEqualStrings(info.text(), other.text());
+            }
             try testing.expectEqualStrings(cb.content, b.code_block.content);
         },
         .thematic_break => {},

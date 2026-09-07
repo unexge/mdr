@@ -1,5 +1,5 @@
 //! Renders Document elements into a vaxis Window. Block kinds live in
-//! `renderer/` submodules; future block renderers (mermaid, latex) slot in
+//! `renderer/` submodules; future block renderers slot in
 //! there and dispatch from here. Containers (lists, block quotes) recurse
 //! through `layoutBlocks`, bounded by depth so that deeply nested input
 //! cannot exhaust the stack.

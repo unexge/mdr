@@ -5,12 +5,15 @@
 //! that lazily renders a `Document`.
 
 pub const Document = @import("Document.zig");
+pub const Mermaid = @import("Mermaid.zig");
 pub const ui = @import("ui/App.zig");
 
 const std = @import("std");
 
 test {
     _ = Document;
+    _ = Mermaid;
     _ = ui;
     std.testing.refAllDecls(Document);
+    std.testing.refAllDecls(Mermaid);
 }
