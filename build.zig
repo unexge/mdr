@@ -148,6 +148,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    const bombadil_step = b.step("bombadil", "Run Bombadil terminal property tests");
+    bombadil_step.dependOn(&addBombadilTest(b, exe).step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
@@ -159,4 +162,34 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn addBombadilTest(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
+    const output_path = b.getInstallPath(.prefix, "bombadil");
+    const run = b.addSystemCommand(&.{
+        "bombadil",
+        "terminal",
+        "test",
+        "--specification",
+    });
+    run.addFileArg(b.path("bombadil/mdr.ts"));
+    run.addArgs(&.{
+        "--time-limit",
+        "5m",
+        "--exit-on-violation",
+        "--columns",
+        "80",
+        "--rows",
+        "24",
+        "--quiescence-timeout-ms",
+        "250",
+        "--output-path",
+        output_path,
+        "--output-path-overwrite",
+        "--",
+    });
+    run.addArtifactArg(exe);
+    run.addFileArg(b.path("bombadil/fixture.md"));
+    run.has_side_effects = true;
+    return run;
 }

@@ -1,0 +1,105 @@
+# BOMBADIL_START
+
+This fixture exercises the markdown reader through a real pseudo-terminal.
+
+It contains **strong text**, *emphasis*, ~~deleted text~~, and a [link](https://example.com).
+
+> A block quote introduces nested content.
+>
+> - quoted item one
+> - quoted item two
+
+## Lists
+
+- first unordered item
+- second unordered item
+  - nested unordered item
+- third unordered item
+
+1. first ordered item
+2. second ordered item
+3. third ordered item
+
+- [ ] unfinished task
+- [x] finished task
+
+## Table
+
+| Feature | State | Notes |
+|:--------|:-----:|------:|
+| headings | ready | bold |
+| lists | ready | nested |
+| tables | ready | aligned |
+
+## Code
+
+```zig
+pub fn main() void {
+    std.debug.print("hello from mdr\\n", .{});
+}
+```
+
+    indented code remains visible
+    across multiple source lines
+
+---
+
+## Unicode
+
+Greek: α β γ δ ε ζηθ.
+
+Cyrillic: Ж Д Й Ф Я.
+
+Wide characters: 日本語 한국어 中文.
+
+Emoji: 😀 🐉 🚀.
+
+## Scrolling section one
+
+Line 01 keeps the document taller than the viewport.
+
+Line 02 keeps the document taller than the viewport.
+
+Line 03 keeps the document taller than the viewport.
+
+Line 04 keeps the document taller than the viewport.
+
+Line 05 keeps the document taller than the viewport.
+
+Line 06 keeps the document taller than the viewport.
+
+Line 07 keeps the document taller than the viewport.
+
+Line 08 keeps the document taller than the viewport.
+
+Line 09 keeps the document taller than the viewport.
+
+Line 10 keeps the document taller than the viewport.
+
+## Scrolling section two
+
+Line 11 keeps the document taller than the viewport.
+
+Line 12 keeps the document taller than the viewport.
+
+Line 13 keeps the document taller than the viewport.
+
+Line 14 keeps the document taller than the viewport.
+
+Line 15 keeps the document taller than the viewport.
+
+Line 16 keeps the document taller than the viewport.
+
+Line 17 keeps the document taller than the viewport.
+
+Line 18 keeps the document taller than the viewport.
+
+Line 19 keeps the document taller than the viewport.
+
+Line 20 keeps the document taller than the viewport.
+
+## Final section
+
+The final marker must be reachable after End or `G` from every explored state.
+
+BOMBADIL_END

@@ -15,6 +15,25 @@ jobs:
       - run: zig build test --summary all
       - run: zig build
 
+  bombadil:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+      - name: Install Bombadil
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/bombadil" https://github.com/antithesishq/bombadil/releases/download/v0.7.2/bombadil-x86_64-linux
+          chmod +x "$RUNNER_TEMP/bombadil"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Bombadil
+        run: zig build bombadil -Doptimize=ReleaseSafe --summary all
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bombadil-trace
+          path: zig-out/bombadil
+
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 10

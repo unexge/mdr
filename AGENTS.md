@@ -17,6 +17,7 @@ Make sure to run all after each change:
 
 ## Testing
 - Only test behaviours, do not unnecessary tests
+- Update relevant Bombadil properties, actions, or fixtures in `bombadil/` when a feature or bug fix changes observable TUI behaviour
 
 ## Style
 - Keep regular imports at the end of the file just before tests, and keep test-only imports at the very end of the file
