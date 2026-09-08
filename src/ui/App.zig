@@ -10,6 +10,7 @@ const App = @This();
 /// One lazily parsed element and its height at the current width.
 const Entry = struct {
     elem: Element,
+    source_end: usize = 0,
     media: Media.State = .idle,
     virtual_rows: u16 = 0,
     virtual_cols: u16 = 0,
@@ -220,10 +221,11 @@ fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop
 /// windows where the content uses the full width, so it never covers text.
 fn drawScrollbar(self: *App, win: vaxis.Window) void {
     if (win.width < full_width_cols or win.height < 2) return;
-    if (self.total_height <= self.viewport) return;
-    const max_scroll = self.maxScroll();
+    const total_height = self.scrollbarTotalHeight();
+    if (total_height <= self.viewport) return;
+    const max_scroll = total_height -| (self.viewport + 1);
     const height: usize = win.height;
-    const thumb_h = @max(1, self.viewport * height / self.total_height);
+    const thumb_h = @max(1, self.viewport * height / total_height);
     const thumb_y = if (max_scroll == 0) 0 else self.scroll * (height - thumb_h) / max_scroll;
     const x: u16 = win.width - 1;
     var r: usize = 0;
@@ -347,6 +349,7 @@ fn ensureVisible(self: *App, bottom: usize) !void {
         };
         try self.entries.append(self.gpa, .{
             .elem = elem,
+            .source_end = self.doc.cursor,
             .media = switch (elem) {
                 .image => |image| Media.State.init(image.source),
                 else => .idle,
@@ -570,6 +573,20 @@ fn clampScroll(self: *App) void {
 fn maxScroll(self: *App) usize {
     // The trailing gap row of the last element is never worth showing.
     return self.total_height -| (self.viewport + 1);
+}
+
+/// Estimates unparsed rows from source progress so the scrollbar does not
+/// treat the lazily measured prefix as the whole document.
+fn scrollbarTotalHeight(self: *const App) usize {
+    if (self.total_height == 0 or self.measured == 0) return self.total_height;
+    if (self.fully_parsed and self.measured == self.entries.items.len) return self.total_height;
+    const source_end = self.entries.items[self.measured - 1].source_end;
+    if (source_end == 0) return self.total_height;
+    const scaled = math.mul(usize, self.total_height, self.doc.text.len) catch return math.maxInt(usize);
+    return @max(
+        self.total_height,
+        math.divCeil(usize, scaled, source_end) catch self.total_height,
+    );
 }
 
 const std = @import("std");
@@ -852,6 +869,66 @@ test "content fills four fifths of the window" {
     try testing.expectEqual(@as(usize, 119), contentWidth(119));
     try testing.expectEqual(@as(usize, 96), contentWidth(120));
     try testing.expectEqual(@as(usize, 160), contentWidth(200));
+}
+
+test "scrollbar estimates full height before layout is complete" {
+    var doc = Document.init(lazy_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+
+    app.width = contentWidth(130);
+    try app.prepareFrame(10);
+    try testing.expect(!app.fully_parsed);
+
+    var complete_doc = Document.init(lazy_text);
+    var complete_app = App.init(testing.allocator, &complete_doc);
+    defer complete_app.deinit();
+    complete_app.width = app.width;
+    complete_app.viewport = app.viewport;
+    try complete_app.ensureVisible(math.maxInt(usize));
+    const expected_thumb_h = @max(1, app.viewport * 10 / complete_app.total_height);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 130, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 130,
+        .height = 10,
+        .screen = &screen,
+    };
+
+    app.drawScrollbar(win);
+    var thumb_h: usize = 0;
+    for (0..win.height) |row| {
+        const cell = win.readCell(129, @intCast(row)) orelse return error.TestUnexpectedCell;
+        if (mem.eql(u8, "█", cell.char.grapheme)) thumb_h += 1;
+    }
+    try testing.expectEqual(expected_thumb_h, thumb_h);
+
+    const resized_width = contentWidth(120);
+    var resized_doc = Document.init(lazy_text);
+    var resized_app = App.init(testing.allocator, &resized_doc);
+    defer resized_app.deinit();
+    resized_app.width = resized_width;
+    resized_app.viewport = app.viewport;
+    try resized_app.ensureVisible(math.maxInt(usize));
+    const resized_thumb_h = @max(1, app.viewport * 10 / resized_app.total_height);
+
+    complete_app.syncWidth(resized_width);
+    try complete_app.prepareFrame(10);
+    try testing.expect(complete_app.measured < complete_app.entries.items.len);
+
+    win.clear();
+    complete_app.drawScrollbar(win);
+    thumb_h = 0;
+    for (0..win.height) |row| {
+        const cell = win.readCell(129, @intCast(row)) orelse return error.TestUnexpectedCell;
+        if (mem.eql(u8, "█", cell.char.grapheme)) thumb_h += 1;
+    }
+    try testing.expectEqual(resized_thumb_h, thumb_h);
 }
 
 test "scrollbar tracks scroll position" {

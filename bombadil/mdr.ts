@@ -16,10 +16,14 @@ const terminal = extract((state) => {
   const lines: string[] = [];
   let startVisible = false;
   let startBold = true;
+  let scrollbarThumbRows = 0;
+  let scrollbarRailRows = 0;
 
   for (let row = 0; row < state.grid.size.rows; row++) {
     const text = state.grid.rowText(row);
     lines.push(text);
+    if (text.endsWith("█")) scrollbarThumbRows++;
+    if (text.endsWith("│")) scrollbarRailRows++;
 
     const start = text.indexOf(startMarker);
     if (start < 0) continue;
@@ -37,6 +41,8 @@ const terminal = extract((state) => {
     lines,
     startVisible,
     startBold,
+    scrollbarThumbRows,
+    scrollbarRailRows,
     exitStatus: state.exitStatus,
     lastAction: state.lastAction,
   };
@@ -67,6 +73,11 @@ export const endShowsEnd = always(() =>
 
 export const startHeadingIsBold = always(() =>
   !terminal.current.startVisible || terminal.current.startBold,
+);
+
+export const scrollbarFitsLongDocument = always(() =>
+  terminal.current.scrollbarRailRows === 0 ||
+  terminal.current.scrollbarThumbRows <= terminal.current.scrollbarRailRows,
 );
 
 export const loneTagsNeverRender = always(() =>

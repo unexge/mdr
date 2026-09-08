@@ -182,7 +182,7 @@ fn addBombadilTest(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.
         "5m",
         "--exit-on-violation",
         "--columns",
-        "80",
+        "120",
         "--rows",
         "24",
         "--quiescence-timeout-ms",
