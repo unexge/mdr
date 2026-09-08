@@ -137,26 +137,40 @@ const Event = union(enum) {
 fn handleKey(self: *App, vx: *vaxis.Vaxis, key: vaxis.Key) !void {
     if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) {
         self.quit = true;
-    } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-        self.scroll += 1;
-    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-        self.scroll -|= 1;
-    } else if (key.matches(vaxis.Key.page_down, .{})) {
-        self.scroll += pageRows(self.viewport);
-    } else if (key.matches(vaxis.Key.page_up, .{})) {
-        self.scroll -|= pageRows(self.viewport);
-    } else if (key.matches('g', .{}) or key.matches(vaxis.Key.home, .{})) {
-        self.scroll = 0;
     } else if (key.matches('G', .{}) or key.matches(vaxis.Key.end, .{})) {
         try self.ensureVisible(math.maxInt(usize));
         self.scroll = self.maxScroll();
     } else if (key.matches('l', .{ .ctrl = true })) {
         vx.queueRefresh();
+    } else {
+        self.scrollKeys(key);
+    }
+}
+
+fn scrollKeys(self: *App, key: vaxis.Key) void {
+    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+        self.scroll += 1;
+    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+        self.scroll -|= 1;
+    } else if (key.matches(' ', .{}) or key.matches('f', .{}) or key.matches(vaxis.Key.page_down, .{}) or key.matches('f', .{ .ctrl = true })) {
+        self.scroll += pageRows(self.viewport);
+    } else if (key.matches('b', .{}) or key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{ .ctrl = true })) {
+        self.scroll -|= pageRows(self.viewport);
+    } else if (key.matches('d', .{ .ctrl = true })) {
+        self.scroll += halfRows(self.viewport);
+    } else if (key.matches('u', .{ .ctrl = true })) {
+        self.scroll -|= halfRows(self.viewport);
+    } else if (key.matches('g', .{}) or key.matches(vaxis.Key.home, .{})) {
+        self.scroll = 0;
     }
 }
 
 fn pageRows(viewport: usize) usize {
     return if (viewport > 1) viewport - 1 else 1;
+}
+
+fn halfRows(viewport: usize) usize {
+    return @max(viewport / 2, 1);
 }
 
 fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop(Event), media_tasks: *Io.Group) !void {
@@ -583,6 +597,45 @@ test "scroll clamps to the parsed content" {
     app.clampScroll();
     try testing.expectEqual(app.maxScroll(), app.scroll);
     try testing.expect(app.scroll < app.total_height);
+}
+
+test "scroll key bindings" {
+    var doc = Document.init(lazy_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.viewport = 11;
+
+    app.scrollKeys(.{ .codepoint = 'j' });
+    try testing.expectEqual(@as(usize, 1), app.scroll);
+    app.scrollKeys(.{ .codepoint = 'k' });
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+    app.scrollKeys(.{ .codepoint = 'k' });
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+
+    app.scrollKeys(.{ .codepoint = ' ' });
+    try testing.expectEqual(@as(usize, 10), app.scroll);
+    app.scrollKeys(.{ .codepoint = 'g' });
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+
+    app.scrollKeys(.{ .codepoint = 'f' });
+    try testing.expectEqual(@as(usize, 10), app.scroll);
+    app.scrollKeys(.{ .codepoint = 'b' });
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+
+    app.scrollKeys(.{ .codepoint = 'f', .mods = .{ .ctrl = true } });
+    try testing.expectEqual(@as(usize, 10), app.scroll);
+    app.scrollKeys(.{ .codepoint = 'b', .mods = .{ .ctrl = true } });
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+
+    app.scrollKeys(.{ .codepoint = 'd', .mods = .{ .ctrl = true } });
+    try testing.expectEqual(@as(usize, 5), app.scroll);
+    app.scrollKeys(.{ .codepoint = 'd', .mods = .{ .ctrl = true } });
+    try testing.expectEqual(@as(usize, 10), app.scroll);
+    app.scrollKeys(.{ .codepoint = 'u', .mods = .{ .ctrl = true } });
+    try testing.expectEqual(@as(usize, 5), app.scroll);
+
+    app.scrollKeys(.{ .codepoint = 'x' });
+    try testing.expectEqual(@as(usize, 5), app.scroll);
 }
 
 test "width change re-measures without re-parsing" {
