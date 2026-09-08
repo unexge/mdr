@@ -1,13 +1,9 @@
 //! Block quotes: content rendered into a child window inset by two columns
 //! with a dim bar marking the quoted rows.
 
-const Document = @import("../../Document.zig");
-const Renderer = @import("../Renderer.zig");
-const vaxis = @import("vaxis");
-
 const inset = 2;
 const bar = "\u{2502}";
-const bar_style: vaxis.Style = .{ .fg = .{ .index = 8 } };
+const bar_style: vaxis.Style = .{ .fg = Theme.accent };
 
 /// One walk measures (null window: no writes, no clipping, no skipping)
 /// and renders, returning the row after the last content row.
@@ -34,3 +30,7 @@ pub fn layout(win: ?vaxis.Window, blocks: Document.Blocks, start_row: usize, ski
 }
 
 const std = @import("std");
+const Document = @import("../../Document.zig");
+const Renderer = @import("../Renderer.zig");
+const Theme = @import("../Theme.zig");
+const vaxis = @import("vaxis");

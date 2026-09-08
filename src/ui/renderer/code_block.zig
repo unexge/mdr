@@ -3,14 +3,8 @@
 //! above the content. Mermaid diagrams dispatch to mermaid.zig and
 //! sequence.zig and fall back to the card when they cannot render.
 
-const Document = @import("../../Document.zig");
-const Mermaid = @import("../../Mermaid.zig");
-const mermaid = @import("mermaid.zig");
-const sequence = @import("sequence.zig");
-const vaxis = @import("vaxis");
-
-const card_style: vaxis.Style = .{ .bg = .{ .index = 236 } };
-const info_style: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 236 } };
+const card_style: vaxis.Style = .{ .bg = Theme.panel };
+const info_style: vaxis.Style = .{ .fg = Theme.muted, .bg = Theme.panel };
 
 /// One walk measures (null window: no writes, no clipping, no skipping)
 /// and renders, returning the row after the last content row.
@@ -117,6 +111,12 @@ fn gwidth(g: []const u8) usize {
 }
 
 const std = @import("std");
+const Document = @import("../../Document.zig");
+const Mermaid = @import("../../Mermaid.zig");
+const mermaid = @import("mermaid.zig");
+const sequence = @import("sequence.zig");
+const Theme = @import("../Theme.zig");
+const vaxis = @import("vaxis");
 
 test "mermaid flowcharts render as diagrams" {
     const diagram: Document.Element.CodeBlock = .{ .info = .{ .mermaid = "mermaid" }, .content = "graph TD\nA-->B\n" };
@@ -154,7 +154,7 @@ test "unrenderable mermaid falls back to the card" {
         .screen = &screen,
     };
     _ = layout(win, diagram, 0, 0, 40);
-    try testing.expect(win.readCell(0, 1).?.style.bg.eql(vaxis.Color{ .index = 236 }));
+    try testing.expect(win.readCell(0, 1).?.style.bg.eql(Theme.panel));
 }
 
 test "sequence diagrams render lifelines" {
@@ -198,7 +198,7 @@ test "fills the card background past the text" {
     };
     _ = layout(win, .{ .info = null, .content = "hi\n" }, 0, 0, win.width);
     try testing.expectEqualStrings("h", win.readCell(0, 0).?.char.grapheme);
-    try testing.expect(win.readCell(9, 0).?.style.bg.eql(vaxis.Color{ .index = 236 }));
+    try testing.expect(win.readCell(9, 0).?.style.bg.eql(Theme.panel));
 }
 
 const testing = std.testing;

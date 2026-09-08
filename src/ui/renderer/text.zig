@@ -60,7 +60,8 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
             .code => |t| {
                 lay.flushWord();
                 var format = lay.top();
-                format.style.fg = .{ .index = 6 };
+                format.style.fg = Theme.code;
+                format.style.bg = Theme.panel;
                 lay.feedText(t, format);
             },
             .entity => |raw| {
@@ -112,6 +113,7 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
                 lay.flushWord();
                 var format = lay.top();
                 format.style.strikethrough = true;
+                format.style.dim = true;
                 lay.push(format);
             },
             .strike_close => {
@@ -122,7 +124,8 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
                 lay.flushWord();
                 var format = lay.top();
                 format.style.ul_style = .single;
-                format.style.fg = .{ .index = 4 };
+                format.style.fg = Theme.link;
+                format.style.bg = Theme.panel;
                 format.link.uri = link.destination;
                 lay.push(format);
             },
@@ -360,6 +363,7 @@ const Lay = struct {
 const std = @import("std");
 const mem = std.mem;
 const Document = @import("../../Document.zig");
+const Theme = @import("../Theme.zig");
 const vaxis = @import("vaxis");
 
 test "wraps words at the width" {

@@ -3,6 +3,8 @@
 A Markdown reader for the terminal, written in Zig. Parses lazily so huge
 files open instantly, and renders through [libvaxis](https://github.com/rockorager/libvaxis).
 
+![mdr demo](docs/demo.png)
+
 ## Build and run
 
 Requires Zig 0.16 or newer.

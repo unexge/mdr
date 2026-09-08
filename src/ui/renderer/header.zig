@@ -1,4 +1,4 @@
-//! Headers use progressively lighter accent bars, with a rule below H1.
+//! Headers use level-tinted accent bars, with a rule below H1.
 //! Wrapping accounts for the accent inset, like list item content.
 
 /// One walk measures (null window: no writes, no clipping, no skipping)
@@ -40,7 +40,7 @@ fn drawAccent(win: vaxis.Window, row: usize, level: u8) void {
     if (row >= win.height or win.width == 0) return;
     win.writeCell(0, @intCast(row), .{
         .char = .{ .grapheme = accent(level), .width = 1 },
-        .style = accent_style,
+        .style = accentStyle(level),
     });
 }
 
@@ -50,7 +50,7 @@ fn drawRule(win: vaxis.Window, row: usize) void {
     while (col < win.width) : (col += 1) {
         win.writeCell(col, @intCast(row), .{
             .char = .{ .grapheme = "━", .width = 1 },
-            .style = accent_style,
+            .style = accentStyle(1),
         });
     }
 }
@@ -67,10 +67,21 @@ fn accent(level: u8) []const u8 {
 }
 
 const style: vaxis.Style = .{ .bold = true };
-const accent_style: vaxis.Style = .{};
+
+fn accentStyle(level: u8) vaxis.Style {
+    return .{ .fg = switch (level) {
+        1 => Theme.accent,
+        2 => Theme.gold,
+        3 => Theme.success,
+        4 => Theme.link,
+        5 => Theme.violet,
+        else => Theme.muted,
+    } };
+}
 
 const std = @import("std");
 const Document = @import("../../Document.zig");
+const Theme = @import("../Theme.zig");
 const vaxis = @import("vaxis");
 const text = @import("text.zig");
 
@@ -79,7 +90,7 @@ test "wraps within the inset width" {
     try testing.expectEqual(@as(usize, 4), layout(null, header, 0, 0, 6));
 }
 
-test "renders bold default-color heading text and level accent" {
+test "renders bold heading text and level accent" {
     const header: Document.Element.Header = .{ .level = 2, .content = "Hi" };
     var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(testing.allocator);
@@ -95,9 +106,9 @@ test "renders bold default-color heading text and level accent" {
     const end = layout(win, header, 0, 0, win.width);
     try testing.expectEqual(@as(usize, 1), end);
     try testing.expectEqualStrings("▍", win.readCell(0, 0).?.char.grapheme);
-    try testing.expectEqual(vaxis.Style{}, win.readCell(0, 0).?.style);
+    try testing.expectEqual(accentStyle(2), win.readCell(0, 0).?.style);
     try testing.expectEqualStrings("H", win.readCell(2, 0).?.char.grapheme);
-    try testing.expectEqual(vaxis.Style{ .bold = true }, win.readCell(2, 0).?.style);
+    try testing.expectEqual(style, win.readCell(2, 0).?.style);
 }
 
 test "renders a rule below a level one heading" {
@@ -124,7 +135,7 @@ test "renders a rule below a level one heading" {
     try testing.expectEqualStrings("━", win.readCell(0, 0).?.char.grapheme);
 }
 
-test "renders progressively lighter accents for deeper headings" {
+test "renders distinct accents for deeper headings" {
     const expected = [_][]const u8{ "▌", "▍", "▎", "▏", "╎", "┊" };
     var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 7, .cols = 8, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(testing.allocator);

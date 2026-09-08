@@ -37,7 +37,7 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
     const w = win.?;
     var row = start_row;
     var skip_rows = skip;
-    row = renderRow(w, header_cells[0..@min(header_count, ncols)], table, widths[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
+    row = renderRow(w, header_cells[0..@min(header_count, ncols)], table, widths[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows, .header);
     if (row >= w.height) return row;
     if (skip_rows > 0) {
         skip_rows -= 1;
@@ -47,15 +47,19 @@ pub fn layout(win: ?vaxis.Window, table: Document.Element.Table, start_row: usiz
     }
     var lines = Document.LineIterator{ .remaining = table.body, .chain = table.chain, .first = false };
     var buf: [Document.max_table_cols][]const u8 = undefined;
+    var index: usize = 0;
     while (lines.next()) |line| {
         if (row >= w.height) break;
         const n = Document.splitCells(line, &buf);
-        row = renderRow(w, buf[0..@min(n, ncols)], table, widths[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows);
+        row = renderRow(w, buf[0..@min(n, ncols)], table, widths[0..ncols], cells_x[0..ncols], borders[0 .. ncols + 1], row, &skip_rows, if (index % 2 == 1) .striped else .body);
+        index += 1;
     }
     return row;
 }
 
-fn renderRow(w: vaxis.Window, cells: [][]const u8, table: Document.Element.Table, widths: []usize, cells_x: []usize, borders: []usize, row: usize, skip_rows: *usize) usize {
+const RowKind = enum { header, body, striped };
+
+fn renderRow(w: vaxis.Window, cells: [][]const u8, table: Document.Element.Table, widths: []usize, cells_x: []usize, borders: []usize, row: usize, skip_rows: *usize, kind: RowKind) usize {
     const ncols = table.ncols;
     const aligns = table.aligns[0..ncols];
     const height = rowHeight(cells, ncols, widths, table.refs);
@@ -66,13 +70,26 @@ fn renderRow(w: vaxis.Window, cells: [][]const u8, table: Document.Element.Table
     const cell_skip = skip_rows.*;
     skip_rows.* = 0;
     const visible = height - cell_skip;
+    const base: vaxis.Style = switch (kind) {
+        .header => .{ .bold = true },
+        .body => .{},
+        .striped => .{ .bg = Theme.panel },
+    };
+    const edge_style: vaxis.Style = switch (kind) {
+        .striped => .{ .fg = Theme.muted, .bg = Theme.panel },
+        else => border_style,
+    };
+    if (kind == .striped) {
+        var s: usize = 0;
+        while (s < visible and row + s < w.height) : (s += 1) fillStripe(w, row + s, borders[ncols]);
+    }
     var r: usize = 0;
     while (r < visible and row + r < w.height) : (r += 1) {
         for (borders) |x| {
             if (x >= w.width) continue;
             w.writeCell(@intCast(x), @intCast(row + r), .{
                 .char = .{ .grapheme = "|", .width = 1 },
-                .style = border_style,
+                .style = edge_style,
             });
         }
     }
@@ -84,7 +101,7 @@ fn renderRow(w: vaxis.Window, cells: [][]const u8, table: Document.Element.Table
             .width = @intCast(widths[i]),
             .height = w.height -| @as(u16, @intCast(row)),
         });
-        _ = text.layout(inner, cell, .{}, 0, cell_skip, widths[i], .{}, aligns[i], table.refs);
+        _ = text.layout(inner, cell, base, 0, cell_skip, widths[i], .{}, aligns[i], table.refs);
     }
     return row + visible;
 }
@@ -163,12 +180,26 @@ fn gwidth(s: []const u8) usize {
     return vaxis.gwidth.gwidth(s, .unicode);
 }
 
-const border_style: vaxis.Style = .{ .fg = .{ .index = 8 } };
+const border_style: vaxis.Style = .{ .fg = Theme.muted };
+const stripe_style: vaxis.Style = .{ .bg = Theme.panel };
+
+/// Paints the stripe wash behind a body row up to the table's right edge;
+/// borders and cell text draw over it afterwards.
+fn fillStripe(w: vaxis.Window, row: usize, edge: usize) void {
+    var x: usize = 0;
+    while (x <= edge and x < w.width) : (x += 1) {
+        w.writeCell(@intCast(x), @intCast(row), .{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = stripe_style,
+        });
+    }
+}
 
 const std = @import("std");
 const Document = @import("../../Document.zig");
 const vaxis = @import("vaxis");
 const text = @import("text.zig");
+const Theme = @import("../Theme.zig");
 
 test "counts header, separator and body rows" {
     const table: Document.Element.Table = .{

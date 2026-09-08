@@ -2,13 +2,9 @@
 //! renders into a child window inset by the marker width; tight lists keep
 //! items adjacent, loose lists separate them with a blank row.
 
-const Document = @import("../../Document.zig");
-const Renderer = @import("../Renderer.zig");
-const vaxis = @import("vaxis");
-
-const marker_style: vaxis.Style = .{ .fg = .{ .index = 8 } };
-const task_open_style: vaxis.Style = .{ .fg = .{ .index = 8 } };
-const task_done_style: vaxis.Style = .{ .fg = .{ .index = 2 } };
+const marker_style: vaxis.Style = .{ .fg = Theme.muted };
+const task_open_style: vaxis.Style = .{ .fg = Theme.muted };
+const task_done_style: vaxis.Style = .{ .fg = Theme.success };
 
 /// One walk measures (null window: no writes, no clipping, no skipping)
 /// and renders, returning the row after the last content row.
@@ -69,7 +65,7 @@ fn drawMarker(win: vaxis.Window, row: usize, item: Document.ListItem, inset: usi
     // Cells hold grapheme slices, so the marker text must outlive this
     // call: the parser's slices point into the document text.
     if (row >= win.height or inset == 0) return;
-    const marker = if (item.task != null) item.task_glyph else item.marker;
+    const marker = if (item.task) |done| (if (done) "[✔]" else item.task_glyph) else if (item.marker.len == 1) "*" else item.marker;
     const style = if (item.task) |done| (if (done) task_done_style else task_open_style) else marker_style;
     var col: usize = 0;
     var iter = vaxis.unicode.graphemeIterator(marker);
@@ -84,6 +80,10 @@ fn drawMarker(win: vaxis.Window, row: usize, item: Document.ListItem, inset: usi
 }
 
 const std = @import("std");
+const Document = @import("../../Document.zig");
+const Renderer = @import("../Renderer.zig");
+const Theme = @import("../Theme.zig");
+const vaxis = @import("vaxis");
 
 test "marker width" {
     const doc = Document.init("- a\n2. b\n- [x] c\n");

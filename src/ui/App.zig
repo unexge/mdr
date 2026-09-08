@@ -197,6 +197,7 @@ fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop
     self.virtual_placement_count = 0;
     self.next_stable_placement_count = 0;
     try self.renderViewport(content);
+    self.drawScrollbar(win);
     if (self.placement_mode == .unicode and self.virtual_placement_count > 0) {
         try Kitty.defineVirtualPlacements(tty, self.virtual_placements[0..self.virtual_placement_count]);
     }
@@ -212,6 +213,26 @@ fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop
             self.next_stable_placements[0..self.next_stable_placement_count],
         );
         self.stable_placement_count = self.next_stable_placement_count;
+    }
+}
+
+/// Draws a reading-progress rail in the right margin; skipped on narrow
+/// windows where the content uses the full width, so it never covers text.
+fn drawScrollbar(self: *App, win: vaxis.Window) void {
+    if (win.width < full_width_cols or win.height < 2) return;
+    if (self.total_height <= self.viewport) return;
+    const max_scroll = self.maxScroll();
+    const height: usize = win.height;
+    const thumb_h = @max(1, self.viewport * height / self.total_height);
+    const thumb_y = if (max_scroll == 0) 0 else self.scroll * (height - thumb_h) / max_scroll;
+    const x: u16 = win.width - 1;
+    var r: usize = 0;
+    while (r < height) : (r += 1) {
+        const thumb = r >= thumb_y and r < thumb_y + thumb_h;
+        win.writeCell(x, @intCast(r), .{
+            .char = .{ .grapheme = if (thumb) "█" else "│", .width = 1 },
+            .style = if (thumb) .{ .fg = Theme.accent } else .{ .fg = Theme.muted },
+        });
     }
 }
 
@@ -559,6 +580,7 @@ const path = std.fs.path;
 const vaxis = @import("vaxis");
 const Document = @import("../Document.zig");
 const Renderer = @import("Renderer.zig");
+const Theme = @import("Theme.zig");
 const Media = @import("Media.zig");
 const Kitty = @import("Kitty.zig");
 const Element = Document.Element;
@@ -832,6 +854,41 @@ test "content fills four fifths of the window" {
     try testing.expectEqual(@as(usize, 160), contentWidth(200));
 }
 
+test "scrollbar tracks scroll position" {
+    var doc = Document.init(lazy_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+    app.viewport = 3;
+    app.clampScroll();
+    try testing.expect(app.total_height > app.viewport);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 130, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 130,
+        .height = 10,
+        .screen = &screen,
+    };
+
+    app.scroll = 0;
+    app.drawScrollbar(win);
+    try testing.expectEqualStrings("█", win.readCell(129, 0).?.char.grapheme);
+    try testing.expectEqualStrings("│", win.readCell(129, 9).?.char.grapheme);
+
+    win.clear();
+    app.scroll = app.maxScroll();
+    app.drawScrollbar(win);
+    try testing.expectEqualStrings("│", win.readCell(129, 0).?.char.grapheme);
+    try testing.expectEqualStrings("█", win.readCell(129, 9).?.char.grapheme);
+}
+
 test "images occupy four fifths of the screen" {
     try testing.expectEqual(@as(usize, 80), imageWidthForScreen(100, 100));
     try testing.expectEqual(@as(usize, 160), imageWidthForScreen(200, 160));
@@ -913,9 +970,9 @@ test "lists render markers and item content" {
     };
 
     try app.renderViewport(win);
-    try expectCell(win, 0, 0, '-');
+    try expectCell(win, 0, 0, '*');
     try expectCell(win, 2, 0, 'o');
-    try expectCell(win, 0, 1, '-');
+    try expectCell(win, 0, 1, '*');
     try expectCell(win, 2, 1, 't');
     try expectCell(win, 0, 2, ' ');
 }
@@ -946,7 +1003,8 @@ test "ordered and task markers" {
     try expectCell(win, 3, 0, 'x');
     // The loose gap after the list, then the task checkbox.
     try expectCell(win, 0, 2, '[');
-    try expectCell(win, 1, 2, 'x');
+    const check = win.readCell(1, 2) orelse return error.TestUnexpectedCell;
+    try testing.expectEqualStrings("✔", check.char.grapheme);
 }
 
 test "block quotes render the bar and inset content" {

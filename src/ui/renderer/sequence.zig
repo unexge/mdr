@@ -3,10 +3,6 @@
 //! message order, so measuring and rendering can never disagree;
 //! anything that does not fit returns null and the caller shows the card.
 
-const Mermaid = @import("../../Mermaid.zig");
-const cells = @import("cells.zig");
-const vaxis = @import("vaxis");
-
 pub const max_rows = 200;
 
 pub fn layout(win: ?vaxis.Window, seq: *const Mermaid.Sequence, start_row: usize, skip: usize, width: usize) ?usize {
@@ -238,7 +234,7 @@ const Layout = struct {
         for (self.seq.notes[0..self.seq.note_count]) |*n| {
             const nb = self.noteBox(n) orelse continue;
             const row = self.rowOf(n.pos);
-            cells.box(win, nb.c1, row, nb.c2 - nb.c1 + 1, n.text, cells.square, start_row, skip, .{ .bg = .{ .index = 236 } });
+            cells.box(win, nb.c1, row, nb.c2 - nb.c1 + 1, n.text, cells.square, start_row, skip, .{ .bg = Theme.panel });
         }
         for (self.seq.messages[0..self.seq.message_count], 0..) |*m, i| {
             self.drawLabel(win, m, i, start_row, skip);
@@ -393,6 +389,10 @@ fn wireCell(style: Mermaid.MsgStyle, win: vaxis.Window, r: usize, c: usize, star
 
 const std = @import("std");
 const mem = std.mem;
+const Mermaid = @import("../../Mermaid.zig");
+const cells = @import("cells.zig");
+const Theme = @import("../Theme.zig");
+const vaxis = @import("vaxis");
 
 test "participants render boxes and lifelines" {
     var seq = Mermaid.parseSequenceBlockText("sequenceDiagram\nA->>B: hi\n").?;
@@ -480,9 +480,9 @@ test "notes span lifelines" {
     try expectGlyph(win, 0, 6, "┌");
     try expectGlyph(win, 2, 7, "t");
     try expectGlyph(win, 3, 9, "┌");
-    try testing.expect(win.readCell(4, 4).?.style.bg.eql(vaxis.Color{ .index = 236 }));
-    try testing.expect(win.readCell(8, 4).?.style.bg.eql(vaxis.Color{ .index = 236 }));
-    try testing.expect(!win.readCell(0, 0).?.style.bg.eql(vaxis.Color{ .index = 236 }));
+    try testing.expect(win.readCell(4, 4).?.style.bg.eql(Theme.panel));
+    try testing.expect(win.readCell(8, 4).?.style.bg.eql(Theme.panel));
+    try testing.expect(!win.readCell(0, 0).?.style.bg.eql(Theme.panel));
 }
 
 test "loop fragments box messages" {
