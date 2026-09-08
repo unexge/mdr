@@ -27,7 +27,12 @@ jobs:
           chmod +x "$RUNNER_TEMP/bombadil"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Bombadil
-        run: zig build bombadil -Doptimize=ReleaseSafe --summary all
+        run: |
+          log="$RUNNER_TEMP/bombadil.log"
+          code=0
+          zig build bombadil -Doptimize=ReleaseSafe --summary all >"$log" 2>&1 || code=$?
+          tail -n 20 "$log"
+          exit "$code"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
