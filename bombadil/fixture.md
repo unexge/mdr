@@ -50,6 +50,15 @@ A[x] --> B[y]
 A --> C[z]
 ```
 
+```mermaid
+sequenceDiagram
+    Alice->>Bob: Hello
+    activate Bob
+    Note over Bob: Thinking
+    Bob-->>Alice: Hi
+    deactivate Bob
+```
+
 ---
 
 ## Unicode

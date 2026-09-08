@@ -6,6 +6,7 @@
 //! travel along one spare wire row or column. Crossings merge into junctions.
 
 const Mermaid = @import("../../Mermaid.zig");
+const cells = @import("cells.zig");
 const vaxis = @import("vaxis");
 
 pub const max_rows = 200;
@@ -64,7 +65,7 @@ const Grid = struct {
             .rows = 0,
             .cols = 0,
         };
-        for (flow.nodeList(), 0..) |node, i| grid.w[i] = labelWidth(node.label) + 4;
+        for (flow.nodeList(), 0..) |node, i| grid.w[i] = cells.labelWidth(node.label) + 4;
         grid.computeRanks();
         if (grid.vertical) {
             grid.layoutVertical(width) orelse return null;
@@ -77,7 +78,7 @@ const Grid = struct {
                 const d = nodeIndex(flow, edge.dst) orelse continue;
                 if (grid.rank[d] <= grid.rank[s]) continue;
                 if (grid.labelInfo(edge)) |info| {
-                    grid.cols = @max(grid.cols, info.c + labelWidth(info.text));
+                    grid.cols = @max(grid.cols, info.c + cells.labelWidth(info.text));
                 }
             }
             if (grid.cols > width) return null;
@@ -165,7 +166,7 @@ const Grid = struct {
             const d = nodeIndex(self.flow, edge.dst) orelse continue;
             if (self.rank[d] <= self.rank[s]) continue;
             const g = self.rank[d] - 1;
-            self.lmax[g] = @max(self.lmax[g], labelWidth(text));
+            self.lmax[g] = @max(self.lmax[g], cells.labelWidth(text));
         }
         self.fwd[0] = 0;
         for (0..self.n_layers) |l| {
@@ -208,7 +209,7 @@ const Grid = struct {
             const d = nodeIndex(self.flow, edge.dst) orelse continue;
             if (self.rank[d] <= self.rank[s]) continue;
             const c = self.x[d] + self.w[d] / 2 + 2;
-            const end = c + labelWidth(text);
+            const end = c + cells.labelWidth(text);
             var r: usize = 0;
             while (self.labelRowTaken(s, i, r, c, end)) r += 1;
             self.lrow[i] = r;
@@ -223,7 +224,7 @@ const Grid = struct {
             if (self.rank[os] != self.rank[s]) continue;
             const od = nodeIndex(self.flow, other.dst) orelse continue;
             const oc = self.x[od] + self.w[od] / 2 + 2;
-            const oend = oc + labelWidth(other.label.?);
+            const oend = oc + cells.labelWidth(other.label.?);
             if (c < oend and oc < end) return true;
         }
         return false;
@@ -407,7 +408,7 @@ const Grid = struct {
             return .{ .r = if (self.forward) base + k else base - k, .c = self.x[d] + self.w[d] / 2 + 2, .text = text };
         }
         const d = nodeIndex(self.flow, edge.dst) orelse return null;
-        const lw = labelWidth(text);
+        const lw = cells.labelWidth(text);
         if (lw == 0) return null;
         const r = self.y[d] + 1;
         const s = nodeIndex(self.flow, edge.src) orelse return null;
@@ -447,7 +448,7 @@ const Grid = struct {
             const info = self.labelInfo(edge) orelse continue;
             rows[n] = info.r;
             starts[n] = info.c;
-            ends[n] = info.c + labelWidth(info.text);
+            ends[n] = info.c + cells.labelWidth(info.text);
             n += 1;
         }
         for (0..n) |i| {
@@ -470,40 +471,30 @@ const Grid = struct {
             const path = self.route(edge) orelse continue;
             for (path.segs[0..path.n]) |*seg| {
                 if (seg.r1 == seg.r2 and seg.c1 == seg.c2) {
-                    putLine(win, seg.r1, seg.c1, start_row, skip, seg.glyph);
+                    cells.putLine(win, seg.r1, seg.c1, start_row, skip, seg.glyph, .{});
                 } else if (seg.r1 == seg.r2) {
                     var c = seg.c1;
-                    while (c <= seg.c2) : (c += 1) putLine(win, seg.r1, c, start_row, skip, seg.glyph);
+                    while (c <= seg.c2) : (c += 1) cells.putLine(win, seg.r1, c, start_row, skip, seg.glyph, .{});
                 } else {
                     var r = seg.r1;
-                    while (r <= seg.r2) : (r += 1) putLine(win, r, seg.c1, start_row, skip, seg.glyph);
+                    while (r <= seg.r2) : (r += 1) cells.putLine(win, r, seg.c1, start_row, skip, seg.glyph, .{});
                 }
             }
-            putArrow(win, path.arrow_at.r, path.arrow_at.c, start_row, skip, path.arrow);
+            cells.putRaw(win, path.arrow_at.r, path.arrow_at.c, start_row, skip, path.arrow, .{});
         }
         for (self.flow.edgeList()) |*edge| {
             const path = self.route(edge) orelse continue;
-            if (path.label) |label| putText(win, label.r, label.c, start_row, skip, label.text, self.cols);
+            if (path.label) |label| cells.putText(win, label.r, label.c, start_row, skip, label.text, self.cols, .{});
         }
     }
 
     fn drawBox(win: vaxis.Window, node: *const Mermaid.Node, x: usize, y: usize, bw: usize, start_row: usize, skip: usize) void {
-        const tl: []const u8, const tr: []const u8, const bl: []const u8, const br: []const u8 = switch (node.shape) {
-            .rounded, .stadium, .circle => .{ "╭", "╮", "╰", "╯" },
-            .diamond => .{ "◇", "◇", "◇", "◇" },
-            else => .{ "┌", "┐", "└", "┘" },
+        const corners = switch (node.shape) {
+            .rounded, .stadium, .circle => cells.round,
+            .diamond => cells.diamond,
+            else => cells.square,
         };
-        putLine(win, y, x, start_row, skip, tl);
-        var c: usize = 1;
-        while (c + 1 < bw) : (c += 1) putLine(win, y, x + c, start_row, skip, "─");
-        putLine(win, y, x + bw - 1, start_row, skip, tr);
-        putLine(win, y + 1, x, start_row, skip, "│");
-        putText(win, y + 1, x + 2, start_row, skip, node.label, x + bw - 2);
-        putLine(win, y + 1, x + bw - 1, start_row, skip, "│");
-        putLine(win, y + 2, x, start_row, skip, bl);
-        c = 1;
-        while (c + 1 < bw) : (c += 1) putLine(win, y + 2, x + c, start_row, skip, "─");
-        putLine(win, y + 2, x + bw - 1, start_row, skip, br);
+        cells.box(win, x, y, bw, node.label, corners, start_row, skip, .{});
     }
 };
 
@@ -555,97 +546,6 @@ fn nodeIndex(flow: *const Mermaid.Flowchart, id: []const u8) ?usize {
         if (mem.eql(u8, node.id, id)) return i;
     }
     return null;
-}
-
-fn labelWidth(label: []const u8) usize {
-    var width: usize = 0;
-    var iter = vaxis.unicode.graphemeIterator(label);
-    while (iter.next()) |g| width += vaxis.gwidth.gwidth(g.bytes(label), .unicode);
-    return width;
-}
-
-fn putLine(win: vaxis.Window, r: usize, c: usize, start_row: usize, skip: usize, glyph: []const u8) void {
-    if (r < skip) return;
-    const rr = start_row + (r - skip);
-    if (rr >= win.height or c >= win.width) return;
-    const own = maskOf(glyph) orelse {
-        win.writeCell(@intCast(c), @intCast(rr), .{ .char = .{ .grapheme = glyph, .width = 1 }, .style = .{} });
-        return;
-    };
-    var mask = own;
-    if (win.readCell(@intCast(c), @intCast(rr))) |cell| {
-        const existing = cell.char.grapheme;
-        if (isArrowGlyph(existing)) return;
-        if (!isBlank(existing)) mask |= maskOf(existing) orelse 0;
-    }
-    const out = if (mask == own) glyph else glyphFor(mask);
-    win.writeCell(@intCast(c), @intCast(rr), .{ .char = .{ .grapheme = out, .width = 1 }, .style = .{} });
-}
-
-fn putArrow(win: vaxis.Window, r: usize, c: usize, start_row: usize, skip: usize, glyph: []const u8) void {
-    if (r < skip) return;
-    const rr = start_row + (r - skip);
-    if (rr >= win.height or c >= win.width) return;
-    win.writeCell(@intCast(c), @intCast(rr), .{ .char = .{ .grapheme = glyph, .width = 1 }, .style = .{} });
-}
-
-fn putText(win: vaxis.Window, r: usize, c0: usize, start_row: usize, skip: usize, text: []const u8, max_c: usize) void {
-    if (r < skip) return;
-    const rr = start_row + (r - skip);
-    if (rr >= win.height) return;
-    var c = c0;
-    var iter = vaxis.unicode.graphemeIterator(text);
-    while (iter.next()) |g| {
-        const bytes = g.bytes(text);
-        const gw = vaxis.gwidth.gwidth(bytes, .unicode);
-        if (gw == 0) continue;
-        if (c + gw > max_c or c + gw > win.width) break;
-        win.writeCell(@intCast(c), @intCast(rr), .{ .char = .{ .grapheme = bytes, .width = @intCast(gw) }, .style = .{} });
-        c += gw;
-    }
-}
-
-fn isBlank(grapheme: []const u8) bool {
-    return grapheme.len == 0 or (grapheme.len == 1 and grapheme[0] == ' ');
-}
-
-fn isArrowGlyph(grapheme: []const u8) bool {
-    for ([_][]const u8{ "▼", "▲", "►", "◄" }) |arrow| {
-        if (mem.eql(u8, grapheme, arrow)) return true;
-    }
-    return false;
-}
-
-fn maskOf(grapheme: []const u8) ?u4 {
-    if (grapheme.len == 1) return if (grapheme[0] == ' ') 0 else null;
-    if (mem.eql(u8, grapheme, "─")) return 0b0011;
-    if (mem.eql(u8, grapheme, "│")) return 0b1100;
-    if (mem.eql(u8, grapheme, "┌") or mem.eql(u8, grapheme, "╭")) return 0b0110;
-    if (mem.eql(u8, grapheme, "┐") or mem.eql(u8, grapheme, "╮")) return 0b0101;
-    if (mem.eql(u8, grapheme, "└") or mem.eql(u8, grapheme, "╰")) return 0b1010;
-    if (mem.eql(u8, grapheme, "┘") or mem.eql(u8, grapheme, "╯")) return 0b1001;
-    if (mem.eql(u8, grapheme, "├")) return 0b1110;
-    if (mem.eql(u8, grapheme, "┤")) return 0b1101;
-    if (mem.eql(u8, grapheme, "┬")) return 0b0111;
-    if (mem.eql(u8, grapheme, "┴")) return 0b1011;
-    if (mem.eql(u8, grapheme, "┼")) return 0b1111;
-    return null;
-}
-
-fn glyphFor(mask: u4) []const u8 {
-    return switch (mask) {
-        0b0011, 0b0010, 0b0001 => "─",
-        0b1100, 0b1000, 0b0100 => "│",
-        0b0110 => "┌",
-        0b0101 => "┐",
-        0b1010 => "└",
-        0b1001 => "┘",
-        0b1110 => "├",
-        0b1101 => "┤",
-        0b0111 => "┬",
-        0b1011 => "┴",
-        else => "┼",
-    };
 }
 
 const std = @import("std");
