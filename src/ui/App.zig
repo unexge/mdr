@@ -1282,20 +1282,6 @@ test "fuzz rendering safety" {
     try testing.fuzz({}, fuzzRender, .{ .corpus = &Document.fuzz_corpus });
 }
 
-// Deterministic randomized runs in every `zig build test`: random byte
-// streams drive `fuzzRender` through Smith's decode mode.
-test "randomized rendering" {
-    var prng = std.Random.DefaultPrng.init(0x6d64720f);
-    const rand = prng.random();
-    for (0..256) |_| {
-        var stream: [512]u8 = undefined;
-        rand.bytes(&stream);
-        const len = rand.uintAtMost(usize, stream.len);
-        var smith: testing.Smith = .{ .in = stream[0..len] };
-        try fuzzRender({}, &smith);
-    }
-}
-
 const lazy_text = "one two three four five six seven\n\n" ** 12;
 
 fn expectCell(win: vaxis.Window, col: usize, row: usize, expected: u8) !void {

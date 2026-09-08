@@ -7,7 +7,7 @@ files open instantly, and renders through [libvaxis](https://github.com/rockorag
 
 ## Build and run
 
-Requires Zig 0.16 or newer.
+Requires Zig 0.17.0-dev.27+0dd99c37c.
 
 ```sh
 zig build            # produces zig-out/bin/mdr
@@ -37,6 +37,6 @@ mdr <file.md>
 
 ## Testing
 
-`zig build test` runs unit tests, property-style randomized rendering
-checks, and fuzz corpora. `zig build bombadil` drives the TUI through a
-pseudo-terminal with randomized input (see `bombadil/`).
+`zig build test` runs unit tests and fuzz corpora. `zig build bombadil`
+drives the TUI through a pseudo-terminal with randomized input (see
+`bombadil/`).

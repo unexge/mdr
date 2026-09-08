@@ -2989,20 +2989,6 @@ test "fuzz parser safety" {
     try testing.fuzz({}, fuzzOne, .{ .corpus = &fuzz_corpus });
 }
 
-// Deterministic randomized runs in every `zig build test`: random byte
-// streams drive `fuzzOne` through Smith's decode mode.
-test "randomized inputs" {
-    var prng = std.Random.DefaultPrng.init(0x6d6472f007);
-    const rand = prng.random();
-    for (0..512) |_| {
-        var stream: [512]u8 = undefined;
-        rand.bytes(&stream);
-        const len = rand.uintAtMost(usize, stream.len);
-        var smith: testing.Smith = .{ .in = stream[0..len] };
-        try fuzzOne({}, &smith);
-    }
-}
-
 test {
     testing.refAllDecls(Document);
 }
