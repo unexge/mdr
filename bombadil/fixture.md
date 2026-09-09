@@ -55,6 +55,10 @@ C <--> D(((done)))
 
 ```mermaid
 sequenceDiagram
+    box Services
+        participant Alice@{ "type": "boundary" }
+        participant Bob@{ "type": "database" }
+    end
     critical Greeting
         Alice->>Bob: Hello
     option Retry
@@ -64,6 +68,10 @@ sequenceDiagram
     Note over Bob: Thinking
     Bob-->>Alice: Hi
     deactivate Bob
+    create actor Carol
+    Alice->>Carol: Welcome
+    destroy Carol
+    Carol--xAlice: Bye
 ```
 
 ---

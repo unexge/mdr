@@ -59,6 +59,16 @@ const Layout = struct {
             cols += lay.w[i] + 3 + extra[i];
         }
         cols -|= 3;
+        if (seq.participant_box_count > 0) {
+            for (lay.x[0..lay.count]) |*x| x.* += 1;
+            cols += 2;
+            for (seq.participant_boxes[0..seq.participant_box_count]) |box| {
+                if (box.count == 0 or box.first + box.count > lay.count) return null;
+                const last = box.first + box.count - 1;
+                const box_width = lay.x[last] + lay.w[last] - (lay.x[box.first] - 1) + 1;
+                if (cells.labelWidth(box.label) + 4 > box_width) return null;
+            }
+        }
         for (seq.messages[0..seq.message_count]) |*m| {
             if (!mem.eql(u8, m.src, m.dst)) continue;
             const s = partIndex(seq, m.src) orelse continue;
@@ -78,7 +88,7 @@ const Layout = struct {
         }
         if (cols > width) return null;
         lay.cols = cols;
-        lay.rows = 3 + lay.rowsBefore(seq.message_count + seq.note_count);
+        lay.rows = lay.headerRows() + lay.rowsBefore(seq.message_count + seq.note_count);
         if (lay.rows > max_rows) return null;
         var max_depth: usize = 0;
         for (seq.fragments[0..seq.fragment_count]) |*f| {
@@ -111,6 +121,11 @@ const Layout = struct {
                 ni += 1;
             }
         }
+        for (self.seq.participants[0..self.seq.participant_count]) |participant| {
+            if (participant.created_at) |created_at| {
+                if (created_at <= pos) r += 3;
+            }
+        }
         for (self.seq.fragments[0..self.seq.fragment_count]) |*f| {
             if (f.start <= pos) r += 1;
             if (f.end > f.start and f.end <= pos) r += 1;
@@ -124,7 +139,19 @@ const Layout = struct {
     }
 
     fn rowOf(self: *const Layout, pos: usize) usize {
-        return 3 + self.rowsBefore(pos);
+        return self.headerRows() + self.rowsBefore(pos);
+    }
+
+    fn rowAfter(self: *const Layout, pos: usize) usize {
+        return self.headerRows() + self.rowsBefore(pos + 1);
+    }
+
+    fn headerRows(self: *const Layout) usize {
+        return if (self.seq.participant_box_count > 0) 6 else 3;
+    }
+
+    fn participantTop(self: *const Layout) usize {
+        return if (self.seq.participant_box_count > 0) 2 else 0;
     }
 
     fn msgHeight(self: *const Layout, m: *const Mermaid.Message) usize {
@@ -213,18 +240,29 @@ const Layout = struct {
     }
 
     fn draw(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
-        for (0..self.count) |i| {
-            cells.box(win, self.x[i], 0, self.w[i], self.seq.participants[i].label, cells.square, start_row, skip, .{});
+        self.drawParticipantBoxes(win, start_row, skip);
+        for (self.seq.participants[0..self.count], 0..) |*participant, index| {
+            if (participant.created_at == null) {
+                self.drawParticipant(win, index, self.participantTop(), start_row, skip);
+            } else if (participant.created_at) |created_at| {
+                self.drawParticipant(win, index, self.rowOf(created_at) - 3, start_row, skip);
+            }
         }
-        var r: usize = 3;
-        while (r < self.rows) : (r += 1) {
-            for (0..self.count) |i| {
-                const cx = self.x[i] + self.w[i] / 2;
-                cells.putLine(win, r, cx, start_row, skip, if (self.activeAt(i, r)) "┃" else "│", .{});
+        for (self.seq.participants[0..self.count], 0..) |participant, index| {
+            const cx = self.x[index] + self.w[index] / 2;
+            var row = if (participant.created_at) |created_at| self.rowOf(created_at) else self.headerRows();
+            const end = if (participant.destroyed_at) |destroyed_at| self.rowAfter(destroyed_at) else self.rows;
+            while (row < end) : (row += 1) {
+                cells.putLine(win, row, cx, start_row, skip, if (self.activeAt(index, row)) "┃" else "│", .{});
             }
         }
         for (self.seq.messages[0..self.seq.message_count]) |*m| {
             self.drawMessage(win, m, start_row, skip);
+        }
+        for (self.seq.participants[0..self.count], 0..) |participant, index| {
+            if (participant.destroyed_at) |destroyed_at| {
+                cells.putRaw(win, self.rowAfter(destroyed_at) - 1, self.x[index] + self.w[index] / 2, start_row, skip, "×", .{});
+            }
         }
         for (0..self.seq.fragment_count) |i| {
             self.drawFragment(win, i, start_row, skip);
@@ -237,6 +275,38 @@ const Layout = struct {
         for (self.seq.messages[0..self.seq.message_count], 0..) |*m, i| {
             self.drawLabel(win, m, i, start_row, skip);
         }
+    }
+
+    fn drawParticipantBoxes(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
+        const style: vaxis.Style = .{ .dim = true };
+        for (self.seq.participant_boxes[0..self.seq.participant_box_count]) |box| {
+            const last = box.first + box.count - 1;
+            const x1 = self.x[box.first] - 1;
+            const x2 = self.x[last] + self.w[last];
+            cells.putLine(win, 0, x1, start_row, skip, "┌", style);
+            cells.putLine(win, 0, x2, start_row, skip, "┐", style);
+            cells.putLine(win, 5, x1, start_row, skip, "└", style);
+            cells.putLine(win, 5, x2, start_row, skip, "┘", style);
+            var col = x1 + 1;
+            while (col < x2) : (col += 1) {
+                cells.putLine(win, 0, col, start_row, skip, "─", style);
+                cells.putLine(win, 5, col, start_row, skip, "─", style);
+            }
+            for (1..5) |row| {
+                cells.putLine(win, row, x1, start_row, skip, "│", style);
+                cells.putLine(win, row, x2, start_row, skip, "│", style);
+            }
+            cells.putText(win, 0, x1 + 2, start_row, skip, box.label, x2 - 1, style);
+        }
+    }
+
+    fn drawParticipant(self: *const Layout, win: vaxis.Window, index: usize, top: usize, start_row: usize, skip: usize) void {
+        const participant = &self.seq.participants[index];
+        const corners = switch (participant.kind) {
+            .actor, .database => cells.round,
+            .participant, .boundary, .control, .entity, .collections, .queue => cells.square,
+        };
+        cells.box(win, self.x[index], top, self.w[index], participant.label, corners, start_row, skip, .{});
     }
 
     fn drawMessage(self: *const Layout, win: vaxis.Window, m: *const Mermaid.Message, start_row: usize, skip: usize) void {
@@ -407,6 +477,45 @@ test "participants render boxes and lifelines" {
     try expectGlyph(win, 3, 3, "h");
     try expectGlyph(win, 10, 4, "►");
     try expectGlyph(win, 2, 4, "┼");
+}
+
+test "participant stereotypes and boxes render" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "box Services\n" ++
+            "participant A@{ \"type\": \"boundary\" }\n" ++
+            "participant DB@{ \"type\": \"database\" }\n" ++
+            "end\n" ++
+            "A->>DB: query\n",
+    ).?;
+    const rows = layout(null, &seq, 0, 0, 40).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(rows), .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 2, 0, "S");
+    try expectGlyph(win, 1, 2, "┌");
+    try expectGlyph(win, 9, 2, "╭");
+    try expectGlyph(win, 0, 5, "└");
+}
+
+test "created and destroyed participants render lifecycle" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "participant A\n" ++
+            "create participant B as Bob\n" ++
+            "A->>B: hello\n" ++
+            "destroy B\n" ++
+            "B--xA: bye\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 10), layout(null, &seq, 0, 0, 40).?);
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 10, 4, "B");
+    try expectGlyph(win, 11, 6, "│");
+    try expectGlyph(win, 11, 9, "×");
 }
 
 test "all eight arrows" {

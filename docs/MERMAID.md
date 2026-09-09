@@ -34,7 +34,11 @@ Falls back:
 
 Supported:
 
-- `participant` and `actor`, including `as` aliases
+- `participant` and `actor`, including `as` aliases and boundary, control,
+  entity, database, collections, and queue stereotypes
+- Participant `box` groups declared before messages; color descriptors are
+  accepted but terminal rendering uses the active theme
+- Actor and participant creation and destruction outside fragments
 - Solid and dotted plain, arrow, cross, open, and bidirectional messages
 - Notes over, left of, and right of participants
 - `loop`, `alt`/`else`, `opt`, `par`/`and`, `critical`/`option`, `break`, and
@@ -45,7 +49,8 @@ Supported:
 
 Falls back:
 
-- Participant stereotypes, participant boxes, and actor creation/destruction
+- Participant boxes declared after messages or containing non-participant lines
+- Actor creation and destruction inside fragments or without a matching message
 - Half arrows and central connections
 - Stacked activations
 - Autonumber start and increment arguments
