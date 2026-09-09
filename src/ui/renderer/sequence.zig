@@ -35,20 +35,32 @@ const Layout = struct {
             .cols = 0,
         };
         for (seq.participants[0..lay.count], 0..) |*p, i| lay.w[i] = cells.labelWidth(p.label) + 4;
+        for (seq.activations[0..seq.activation_count]) |*activation| {
+            const participant = partIndex(seq, activation.actor) orelse continue;
+            lay.spans[lay.span_count] = .{
+                .p = participant,
+                .r1 = lay.rowOf(activation.start),
+                .r2 = lay.rowOf(activation.end),
+                .depth = activation.depth,
+            };
+            lay.span_count += 1;
+        }
         var cols: usize = 0;
         for (0..lay.count) |i| {
             lay.x[i] = cols;
             cols += lay.w[i] + 3;
         }
         var extra = [_]usize{0} ** Mermaid.max_participants;
+        for (lay.spans[0..lay.span_count]) |span| extra[span.p] = @max(extra[span.p], span.depth);
         for (seq.messages[0..seq.message_count], 0..) |*m, i| {
-            if ((!seq.autonumber and m.text.len == 0) or mem.eql(u8, m.src, m.dst)) continue;
+            if ((seq.autonumber == null and m.text.len == 0) or mem.eql(u8, m.src, m.dst)) continue;
             const s = partIndex(seq, m.src) orelse continue;
             const d = partIndex(seq, m.dst) orelse continue;
             var lw = cells.labelWidth(m.text);
-            if (seq.autonumber) lw += numWidth(i + 1);
-            const scx = lay.x[s] + lay.w[s] / 2;
-            const dcx = lay.x[d] + lay.w[d] / 2;
+            if (seq.autonumber != null) lw += numberWidth(sequenceNumber(seq, i));
+            const row = lay.rowOf(m.pos);
+            const scx = lay.lifelineCol(s, row);
+            const dcx = lay.lifelineCol(d, row);
             const span = if (scx > dcx) scx - dcx else dcx - scx;
             const g = @min(s, d);
             extra[g] = @max(extra[g], (lw + 1) -| span);
@@ -79,11 +91,12 @@ const Layout = struct {
             cols = @max(cols, nb.c2 + 1);
         }
         for (seq.messages[0..seq.message_count], 0..) |*m, i| {
-            if (!seq.autonumber and m.text.len == 0) continue;
+            if (seq.autonumber == null and m.text.len == 0) continue;
             const s = partIndex(seq, m.src) orelse continue;
             const d = partIndex(seq, m.dst) orelse continue;
-            var end = lay.labelStart(s, d) + cells.labelWidth(m.text);
-            if (seq.autonumber) end += numWidth(i + 1);
+            const row = lay.rowOf(m.pos);
+            var end = lay.labelStart(s, d, row) + cells.labelWidth(m.text);
+            if (seq.autonumber != null) end += numberWidth(sequenceNumber(seq, i));
             cols = @max(cols, end + 1);
         }
         if (cols > width) return null;
@@ -95,11 +108,6 @@ const Layout = struct {
             max_depth = @max(max_depth, f.depth);
         }
         if (max_depth * 2 + 4 > lay.cols) return null;
-        for (seq.activations[0..seq.activation_count]) |*a| {
-            const p = partIndex(seq, a.actor) orelse continue;
-            lay.spans[lay.span_count] = .{ .p = p, .r1 = lay.rowOf(a.start), .r2 = lay.rowOf(a.end) };
-            lay.span_count += 1;
-        }
         return lay;
     }
 
@@ -155,20 +163,25 @@ const Layout = struct {
     }
 
     fn msgHeight(self: *const Layout, m: *const Mermaid.Message) usize {
-        var r: usize = if (self.seq.autonumber or m.text.len > 0) 1 else 0;
+        var r: usize = if (self.seq.autonumber != null or m.text.len > 0) 1 else 0;
         r += if (mem.eql(u8, m.src, m.dst)) 2 else 1;
         return r;
     }
 
-    fn activeAt(self: *const Layout, p: usize, r: usize) bool {
+    fn activeDepth(self: *const Layout, participant: usize, row: usize) usize {
+        var depth: usize = 0;
         for (self.spans[0..self.span_count]) |*span| {
-            if (span.p == p and span.r1 <= r and r < span.r2) return true;
+            if (span.p == participant and span.r1 <= row and row < span.r2) depth = @max(depth, span.depth + 1);
         }
-        return false;
+        return depth;
     }
 
-    fn labelStart(self: *const Layout, s: usize, d: usize) usize {
-        return @min(self.x[s] + self.w[s] / 2, self.x[d] + self.w[d] / 2) + 1;
+    fn lifelineCol(self: *const Layout, participant: usize, row: usize) usize {
+        return self.x[participant] + self.w[participant] / 2 + (self.activeDepth(participant, row) -| 1);
+    }
+
+    fn labelStart(self: *const Layout, s: usize, d: usize, row: usize) usize {
+        return @min(self.lifelineCol(s, row), self.lifelineCol(d, row)) + 1;
     }
 
     const NoteBox = struct { c1: usize, c2: usize };
@@ -253,7 +266,12 @@ const Layout = struct {
             var row = if (participant.created_at) |created_at| self.rowOf(created_at) else self.headerRows();
             const end = if (participant.destroyed_at) |destroyed_at| self.rowAfter(destroyed_at) else self.rows;
             while (row < end) : (row += 1) {
-                cells.putLine(win, row, cx, start_row, skip, if (self.activeAt(index, row)) "┃" else "│", .{});
+                const depth = self.activeDepth(index, row);
+                if (depth == 0) {
+                    cells.putLine(win, row, cx, start_row, skip, "│", .{});
+                } else {
+                    for (0..depth) |offset| cells.putRaw(win, row, cx + offset, start_row, skip, "┃", .{});
+                }
             }
         }
         for (self.seq.messages[0..self.seq.message_count]) |*m| {
@@ -312,10 +330,10 @@ const Layout = struct {
     fn drawMessage(self: *const Layout, win: vaxis.Window, m: *const Mermaid.Message, start_row: usize, skip: usize) void {
         const s = partIndex(self.seq, m.src) orelse return;
         const d = partIndex(self.seq, m.dst) orelse return;
-        const scx = self.x[s] + self.w[s] / 2;
-        const dcx = self.x[d] + self.w[d] / 2;
         const base = self.rowOf(m.pos);
-        const wire = base + @intFromBool(self.seq.autonumber or m.text.len > 0);
+        const wire = base + @intFromBool(self.seq.autonumber != null or m.text.len > 0);
+        const scx = self.lifelineCol(s, wire);
+        const dcx = self.lifelineCol(d, wire);
         if (mem.eql(u8, m.src, m.dst)) {
             wireCell(m.style, win, wire, scx + 1, start_row, skip);
             wireCell(m.style, win, wire, scx + 2, start_row, skip);
@@ -348,14 +366,14 @@ const Layout = struct {
     }
 
     fn drawLabel(self: *const Layout, win: vaxis.Window, m: *const Mermaid.Message, index: usize, start_row: usize, skip: usize) void {
-        if (!self.seq.autonumber and m.text.len == 0) return;
+        if (self.seq.autonumber == null and m.text.len == 0) return;
         const s = partIndex(self.seq, m.src) orelse return;
         const d = partIndex(self.seq, m.dst) orelse return;
-        const c = self.labelStart(s, d);
         const row = self.rowOf(m.pos);
-        if (self.seq.autonumber) {
-            const numW = putNumber(win, row, c, start_row, skip, index + 1, self.cols -| 1);
-            cells.putText(win, row, c + numW, start_row, skip, m.text, self.cols -| 1, .{});
+        const c = self.labelStart(s, d, row);
+        if (self.seq.autonumber != null) {
+            const num_width = putNumber(win, row, c, start_row, skip, sequenceNumber(self.seq, index), self.cols -| 1);
+            cells.putText(win, row, c + num_width, start_row, skip, m.text, self.cols -| 1, .{});
         } else {
             cells.putText(win, row, c, start_row, skip, m.text, self.cols -| 1, .{});
         }
@@ -409,26 +427,64 @@ const ActiveSpan = struct {
     p: usize,
     r1: usize,
     r2: usize,
+    depth: usize,
 };
 
-fn putNumber(win: vaxis.Window, r: usize, c0: usize, start_row: usize, skip: usize, n: usize, max_c: usize) usize {
+fn sequenceNumber(seq: *const Mermaid.Sequence, index: usize) u64 {
+    const config = seq.autonumber.?;
+    return @as(u64, config.start) + @as(u64, config.increment) * index;
+}
+
+fn numberWidth(value: u64) usize {
+    const fraction = value % 100;
+    const fraction_width: usize = if (fraction == 0) 2 else if (fraction % 10 == 0) 4 else 5;
+    return digitCount(value / 100) + fraction_width;
+}
+
+fn digitCount(value: u64) usize {
+    var count: usize = 1;
+    var remaining = value;
+    while (remaining >= 10) {
+        remaining /= 10;
+        count += 1;
+    }
+    return count;
+}
+
+fn putNumber(win: vaxis.Window, r: usize, c0: usize, start_row: usize, skip: usize, value: u64, max_c: usize) usize {
     const digits = "0123456789";
-    var div: usize = 1;
-    while (n / (div * 10) > 0) div *= 10;
-    var c = c0;
-    var d = div;
-    while (d > 0) : (d /= 10) {
-        if (c + 1 > max_c or c + 1 > win.width) break;
-        cells.putRaw(win, r, c, start_row, skip, digits[(n / d) % 10 ..][0..1], .{});
-        c += 1;
+    const whole = value / 100;
+    var divisor: u64 = 1;
+    while (whole / divisor >= 10) divisor *= 10;
+    var col = c0;
+    var current = divisor;
+    while (current > 0) : (current /= 10) {
+        if (col + 1 > max_c or col + 1 > win.width) return col - c0;
+        const digit: usize = @intCast((whole / current) % 10);
+        cells.putRaw(win, r, col, start_row, skip, digits[digit .. digit + 1], .{});
+        col += 1;
     }
-    const suffix = ". ";
-    for (0..suffix.len) |k| {
-        if (c + 1 > max_c or c + 1 > win.width) break;
-        cells.putRaw(win, r, c, start_row, skip, suffix[k .. k + 1], .{});
-        c += 1;
+    const fraction = value % 100;
+    if (fraction > 0) {
+        if (col + 2 > max_c or col + 2 > win.width) return col - c0;
+        cells.putRaw(win, r, col, start_row, skip, ".", .{});
+        col += 1;
+        const tens: usize = @intCast(fraction / 10);
+        cells.putRaw(win, r, col, start_row, skip, digits[tens .. tens + 1], .{});
+        col += 1;
+        if (fraction % 10 > 0) {
+            if (col + 1 > max_c or col + 1 > win.width) return col - c0;
+            const ones: usize = @intCast(fraction % 10);
+            cells.putRaw(win, r, col, start_row, skip, digits[ones .. ones + 1], .{});
+            col += 1;
+        }
     }
-    return c - c0;
+    for ([_][]const u8{ ".", " " }) |glyph| {
+        if (col + 1 > max_c or col + 1 > win.width) return col - c0;
+        cells.putRaw(win, r, col, start_row, skip, glyph, .{});
+        col += 1;
+    }
+    return col - c0;
 }
 
 fn partIndex(seq: *const Mermaid.Sequence, id: []const u8) ?usize {
@@ -436,16 +492,6 @@ fn partIndex(seq: *const Mermaid.Sequence, id: []const u8) ?usize {
         if (mem.eql(u8, p.id, id)) return i;
     }
     return null;
-}
-
-fn numWidth(n: usize) usize {
-    var w: usize = 1;
-    var v = n;
-    while (v >= 10) {
-        v /= 10;
-        w += 1;
-    }
-    return w + 2;
 }
 
 fn wireCell(style: Mermaid.MsgStyle, win: vaxis.Window, r: usize, c: usize, start_row: usize, skip: usize) void {
@@ -705,6 +751,26 @@ test "activations widen lifelines" {
     try expectGlyph(win, 10, 3, "│");
 }
 
+test "stacked activations widen lifelines" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "activate A\n" ++
+            "activate A\n" ++
+            "A->>B: nested\n" ++
+            "deactivate A\n" ++
+            "A->>B: outer\n" ++
+            "deactivate A\n",
+    ).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 7, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 2, 3, "┃");
+    try expectGlyph(win, 3, 3, "┃");
+    try expectGlyph(win, 4, 3, "n");
+    try expectGlyph(win, 2, 5, "┃");
+}
+
 test "autonumber prefixes" {
     var seq = Mermaid.parseSequenceBlockText(
         "sequenceDiagram\n" ++
@@ -719,6 +785,24 @@ test "autonumber prefixes" {
     try expectGlyph(win, 3, 3, "1");
     try expectGlyph(win, 3, 5, "2");
     try expectGlyph(win, 6, 3, "f");
+}
+
+test "configured autonumber prefixes" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "autonumber 2.5 0.25\n" ++
+            "A->>B: first\n" ++
+            "A->>B: second\n" ++
+            "A->>B: third\n",
+    ).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 9, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 3, 3, "2");
+    try expectGlyph(win, 5, 3, "5");
+    try expectGlyph(win, 6, 5, "5");
+    try expectGlyph(win, 3, 7, "3");
 }
 
 test "long labels extend the diagram" {

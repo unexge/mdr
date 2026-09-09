@@ -728,6 +728,12 @@ pub const Activation = struct {
     actor: []const u8,
     start: usize,
     end: usize,
+    depth: usize,
+};
+
+pub const Autonumber = struct {
+    start: u32,
+    increment: u32,
 };
 
 pub const Sequence = struct {
@@ -743,7 +749,7 @@ pub const Sequence = struct {
     activation_count: usize = 0,
     participant_boxes: [max_participant_boxes]ParticipantBox = undefined,
     participant_box_count: usize = 0,
-    autonumber: bool = false,
+    autonumber: ?Autonumber = null,
     degraded: bool = false,
 };
 
@@ -768,6 +774,12 @@ pub fn parseSequenceBlock(cb: Document.Element.CodeBlock) ?Sequence {
     return parser.seq;
 }
 
+const PendingActivation = struct {
+    participant: usize,
+    start: usize,
+    depth: usize,
+};
+
 const PendingLifecycle = union(enum) {
     create: usize,
     destroy: usize,
@@ -780,7 +792,8 @@ const SeqParser = struct {
     pos: usize = 0,
     stack: [max_fragment_depth]usize = undefined,
     stack_len: usize = 0,
-    active_from: [max_participants]?usize = [_]?usize{null} ** max_participants,
+    pending_activations: [max_activations]PendingActivation = undefined,
+    pending_activation_count: usize = 0,
     open_participant_box: ?usize = null,
     pending_lifecycle: ?PendingLifecycle = null,
 
@@ -843,19 +856,11 @@ const SeqParser = struct {
             self.supported = false;
             return;
         }
-        for (self.active_from[0..self.seq.participant_count], 0..) |from, i| {
-            const start = from orelse continue;
-            if (self.seq.activation_count >= max_activations) {
-                self.seq.degraded = true;
-                return;
-            }
-            self.seq.activations[self.seq.activation_count] = .{
-                .actor = self.seq.participants[i].id,
-                .start = start,
-                .end = self.pos,
-            };
-            self.seq.activation_count += 1;
+        for (self.pending_activations[0..self.pending_activation_count]) |pending| {
+            self.appendActivation(pending, self.pos);
+            if (self.seq.degraded) return;
         }
+        self.pending_activation_count = 0;
     }
 
     fn intern(self: *SeqParser, id: []const u8) ?usize {
@@ -935,7 +940,10 @@ const SeqParser = struct {
         if (self.pending_lifecycle) |pending| {
             switch (pending) {
                 .create => |participant| self.seq.participants[participant].created_at = self.pos,
-                .destroy => |participant| self.seq.participants[participant].destroyed_at = self.pos,
+                .destroy => |participant| {
+                    self.seq.participants[participant].destroyed_at = self.pos;
+                    self.endAllActivations(participant, self.pos + 1);
+                },
             }
             self.pending_lifecycle = null;
         }
@@ -1024,34 +1032,72 @@ const SeqParser = struct {
     }
 
     fn startActivation(self: *SeqParser, idx: usize, at: usize) void {
-        if (self.active_from[idx] != null) {
-            self.supported = false;
+        if (self.seq.activation_count + self.pending_activation_count >= max_activations) {
+            self.seq.degraded = true;
             return;
         }
-        self.active_from[idx] = at;
+        var depth: usize = 0;
+        for (self.pending_activations[0..self.pending_activation_count]) |pending| {
+            if (pending.participant == idx) depth += 1;
+        }
+        self.pending_activations[self.pending_activation_count] = .{
+            .participant = idx,
+            .start = at,
+            .depth = depth,
+        };
+        self.pending_activation_count += 1;
     }
 
     fn endActivation(self: *SeqParser, idx: usize, at: usize) void {
-        const start = self.active_from[idx] orelse {
+        const index = self.pendingActivationIndex(idx) orelse {
             self.supported = false;
             return;
         };
+        self.closeActivation(index, at);
+    }
+
+    fn endAllActivations(self: *SeqParser, participant: usize, at: usize) void {
+        while (self.pendingActivationIndex(participant)) |index| self.closeActivation(index, at);
+    }
+
+    fn pendingActivationIndex(self: *const SeqParser, participant: usize) ?usize {
+        var i = self.pending_activation_count;
+        while (i > 0) {
+            i -= 1;
+            if (self.pending_activations[i].participant == participant) return i;
+        }
+        return null;
+    }
+
+    fn closeActivation(self: *SeqParser, index: usize, at: usize) void {
+        self.appendActivation(self.pending_activations[index], at);
+        var shift = index;
+        while (shift + 1 < self.pending_activation_count) : (shift += 1) {
+            self.pending_activations[shift] = self.pending_activations[shift + 1];
+        }
+        self.pending_activation_count -= 1;
+    }
+
+    fn appendActivation(self: *SeqParser, pending: PendingActivation, end: usize) void {
         if (self.seq.activation_count >= max_activations) {
             self.seq.degraded = true;
             return;
         }
         self.seq.activations[self.seq.activation_count] = .{
-            .actor = self.seq.participants[idx].id,
-            .start = start,
-            .end = at,
+            .actor = self.seq.participants[pending.participant].id,
+            .start = pending.start,
+            .end = end,
+            .depth = pending.depth,
         };
         self.seq.activation_count += 1;
-        self.active_from[idx] = null;
     }
 
     fn feedControl(self: *SeqParser, line: []const u8) bool {
         if (stripKeyword(line, "autonumber")) |options| {
-            if (options.len > 0) self.supported = false else self.seq.autonumber = true;
+            self.seq.autonumber = parseAutonumber(options) orelse {
+                self.supported = false;
+                return true;
+            };
             return true;
         }
         if (stripKeyword(line, "activate")) |raw_id| {
@@ -1155,6 +1201,41 @@ fn boundary(s: []const u8, n: usize) bool {
 fn stripKeyword(s: []const u8, kw: []const u8) ?[]const u8 {
     if (!mem.startsWith(u8, s, kw) or !boundary(s, kw.len)) return null;
     return mem.trim(u8, s[kw.len..], " \t");
+}
+
+fn parseAutonumber(raw: []const u8) ?Autonumber {
+    const options = mem.trim(u8, raw, " \t");
+    if (options.len == 0) return .{ .start = 100, .increment = 100 };
+    var tokens = mem.tokenizeAny(u8, options, " \t");
+    const start = parseHundredths(tokens.next() orelse return null) orelse return null;
+    const increment = parseHundredths(tokens.next() orelse return null) orelse return null;
+    if (tokens.next() != null) return null;
+    return .{ .start = start, .increment = increment };
+}
+
+fn parseHundredths(raw: []const u8) ?u32 {
+    if (raw.len == 0) return null;
+    const dot = mem.indexOfScalar(u8, raw, '.');
+    const whole_text = if (dot) |index| raw[0..index] else raw;
+    const fraction_text = if (dot) |index| raw[index + 1 ..] else "";
+    if (whole_text.len == 0 and fraction_text.len == 0) return null;
+    if (fraction_text.len > 2 or mem.indexOfScalar(u8, fraction_text, '.') != null) return null;
+
+    var whole: u32 = 0;
+    for (whole_text) |digit| {
+        if (!ascii.isDigit(digit)) return null;
+        const value: u32 = digit - '0';
+        if (whole > (std.math.maxInt(u32) - value) / 10) return null;
+        whole = whole * 10 + value;
+    }
+    var fraction: u32 = 0;
+    for (fraction_text) |digit| {
+        if (!ascii.isDigit(digit)) return null;
+        fraction = fraction * 10 + digit - '0';
+    }
+    if (fraction_text.len == 1) fraction *= 10;
+    if (whole > (std.math.maxInt(u32) - fraction) / 100) return null;
+    return whole * 100 + fraction;
 }
 
 fn parseId(s: []const u8) ?[]const u8 {
@@ -1742,6 +1823,7 @@ test "sequence actor creation and destruction" {
             "participant A\n" ++
             "create participant B as Bob\n" ++
             "A->>B: hello\n" ++
+            "activate B\n" ++
             "destroy B\n" ++
             "B--xA: bye\n",
     ).?;
@@ -1749,6 +1831,8 @@ test "sequence actor creation and destruction" {
     try testing.expect(seq.participants[0].created_at == null);
     try testing.expectEqual(@as(?usize, 0), seq.participants[1].created_at);
     try testing.expectEqual(@as(?usize, 1), seq.participants[1].destroyed_at);
+    try testing.expectEqual(@as(usize, 1), seq.activation_count);
+    try testing.expectEqual(@as(usize, 2), seq.activations[0].end);
 }
 
 test "unsupported sequence participant state is rejected" {
@@ -1892,7 +1976,6 @@ test "unsupported sequence statements are rejected" {
         "sequenceDiagram\nA->>B: before\nbox Group\nparticipant C\nend\n",
         "sequenceDiagram\nA->>B: before\nnot sequence syntax\n",
         "sequenceDiagram\nloop forever\nA->>B: again\n",
-        "sequenceDiagram\nactivate A\nactivate A\nA->>B: nested\n",
         "sequenceDiagram\nA->>B: one; B->>A: two\n",
         "%%{init: {'theme': 'dark'}}%%\nsequenceDiagram\nA->>B: before\n",
     }) |text| {
@@ -1933,16 +2016,49 @@ test "sequence activations" {
     try testing.expect(!seq.degraded);
 }
 
-test "sequence autonumber flag" {
+test "stacked sequence activations" {
+    const seq = parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "activate A\n" ++
+            "activate A\n" ++
+            "A->>B: nested\n" ++
+            "deactivate A\n" ++
+            "A->>B: outer\n" ++
+            "deactivate A\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 2), seq.activation_count);
+    try testing.expectEqual(@as(usize, 1), seq.activations[0].depth);
+    try testing.expectEqual(@as(usize, 0), seq.activations[0].start);
+    try testing.expectEqual(@as(usize, 1), seq.activations[0].end);
+    try testing.expectEqual(@as(usize, 0), seq.activations[1].depth);
+    try testing.expectEqual(@as(usize, 2), seq.activations[1].end);
+}
+
+test "sequence autonumber configuration" {
     const seq = parseSequenceBlockText("sequenceDiagram\nautonumber\nA->>B: x\n").?;
-    try testing.expect(seq.autonumber);
+    try testing.expectEqual(@as(u32, 100), seq.autonumber.?.start);
+    try testing.expectEqual(@as(u32, 100), seq.autonumber.?.increment);
+
+    const configured = parseSequenceBlockText("sequenceDiagram\nautonumber 2.5 0.25\nA->>B: x\n").?;
+    try testing.expectEqual(@as(u32, 250), configured.autonumber.?.start);
+    try testing.expectEqual(@as(u32, 25), configured.autonumber.?.increment);
+
     const plain = parseSequenceBlockText("sequenceDiagram\nA->>B: x\n").?;
-    try testing.expect(!plain.autonumber);
+    try testing.expect(plain.autonumber == null);
+    for ([_][]const u8{
+        "sequenceDiagram\nautonumber 1\nA->>B: x\n",
+        "sequenceDiagram\nautonumber 1.001 1\nA->>B: x\n",
+        "sequenceDiagram\nautonumber x 1\nA->>B: x\n",
+    }) |text| {
+        try testing.expect(parseSequenceBlockText(text) == null);
+    }
 }
 
 test "sequence over-cap degrades" {
     const many = parseSequenceBlockText("sequenceDiagram\n" ++ ("A->>B: x\n" ** 200)).?;
     try testing.expect(many.degraded);
+    const activations = parseSequenceBlockText("sequenceDiagram\n" ++ ("activate A\n" ** 65)).?;
+    try testing.expect(activations.degraded);
     var deep: [512]u8 = undefined;
     @memcpy(deep[0..16], "sequenceDiagram\n");
     var pos: usize = 16;

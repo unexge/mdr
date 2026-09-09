@@ -43,8 +43,8 @@ Supported:
 - Notes over, left of, and right of participants
 - `loop`, `alt`/`else`, `opt`, `par`/`and`, `critical`/`option`, `break`, and
   `rect` fragments
-- Activations and the `+`/`-` activation shorthand
-- `autonumber`
+- Stacked activations and the `+`/`-` activation shorthand
+- `autonumber` with optional start and increment values up to two decimal places
 - `%%` comments
 
 Falls back:
@@ -52,8 +52,6 @@ Falls back:
 - Participant boxes declared after messages or containing non-participant lines
 - Actor creation and destruction inside fragments or without a matching message
 - Half arrows and central connections
-- Stacked activations
-- Autonumber start and increment arguments
 - Actor links, styling, configuration directives, and semicolon-separated
   statements
 

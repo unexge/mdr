@@ -57,7 +57,8 @@ unsupported instead of rendering a partial result. Anything unsupported,
 over capacity, cyclic, or wider than the viewport degrades back to the code
 card instead of failing. Flowchart subgraphs are bounded cluster overlays;
 layouts with ambiguous or overlapping clusters also fall back. Sequence
-participant groups and lifecycle positions are fixed parser state from which
-header and lifeline rows are derived. The supported grammar is listed in
+participant groups, lifecycle positions, and activation stacks are fixed
+parser state from which header and lifeline rows are derived. Sequence numbers
+use bounded fixed-point hundredths. The supported grammar is listed in
 [`MERMAID.md`](MERMAID.md). Shared cell drawing (junction merging, clipping,
 display widths) lives in `renderer/cells.zig`.

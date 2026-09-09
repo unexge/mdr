@@ -59,14 +59,17 @@ sequenceDiagram
         participant Alice@{ "type": "boundary" }
         participant Bob@{ "type": "database" }
     end
+    autonumber 2.5 0.25
     critical Greeting
         Alice->>Bob: Hello
     option Retry
         Alice->>Bob: Hello again
     end
     activate Bob
+    activate Bob
     Note over Bob: Thinking
     Bob-->>Alice: Hi
+    deactivate Bob
     deactivate Bob
     create actor Carol
     Alice->>Carol: Welcome
