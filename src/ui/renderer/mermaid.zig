@@ -11,12 +11,38 @@ const vaxis = @import("vaxis");
 
 pub const max_rows = 200;
 
+const Bounds = struct {
+    x1: usize,
+    y1: usize,
+    x2: usize,
+    y2: usize,
+};
+
 pub fn layout(win: ?vaxis.Window, flow: *const Mermaid.Flowchart, start_row: usize, skip: usize, width: usize) ?usize {
     var grid = Grid.compute(flow, width) orelse return null;
     if (win == null) return start_row + grid.rows;
     const w = win.?;
     grid.draw(w, start_row, skip);
     return start_row + @min(grid.rows -| skip, w.height -| start_row);
+}
+
+fn subgraphPadding(flow: *const Mermaid.Flowchart) usize {
+    var padding: usize = 0;
+    for (flow.subgraphList()) |subgraph| padding = @max(padding, subgraph.level + 1);
+    return padding;
+}
+
+fn subgraphInSubgraph(flow: *const Mermaid.Flowchart, child: usize, parent: usize) bool {
+    var current: ?usize = child;
+    while (current) |index| {
+        if (index == parent) return true;
+        current = flow.subgraphs[index].parent;
+    }
+    return false;
+}
+
+fn boundsIntersect(a: Bounds, b: Bounds) bool {
+    return a.x1 <= b.x2 and b.x1 <= a.x2 and a.y1 <= b.y2 and b.y1 <= a.y2;
 }
 
 const Grid = struct {
@@ -37,6 +63,8 @@ const Grid = struct {
     glabels: [Mermaid.max_nodes]usize,
     lrow: [Mermaid.max_edges]usize,
     lmax: [Mermaid.max_nodes]usize,
+    subgraphs: [Mermaid.max_subgraphs]Bounds,
+    pad: usize,
     wire: ?usize,
     rows: usize,
     cols: usize,
@@ -61,6 +89,8 @@ const Grid = struct {
             .glabels = [_]usize{0} ** Mermaid.max_nodes,
             .lrow = [_]usize{0} ** Mermaid.max_edges,
             .lmax = [_]usize{0} ** Mermaid.max_nodes,
+            .subgraphs = undefined,
+            .pad = subgraphPadding(flow),
             .wire = null,
             .rows = 0,
             .cols = 0,
@@ -72,6 +102,8 @@ const Grid = struct {
         } else {
             grid.layoutHorizontal(width) orelse return null;
         }
+        grid.applySubgraphPadding(width) orelse return null;
+        grid.computeSubgraphBounds() orelse return null;
         if (grid.vertical) {
             for (flow.edgeList()) |*edge| {
                 const s = nodeIndex(flow, edge.src) orelse continue;
@@ -131,19 +163,20 @@ const Grid = struct {
             }
             self.cw[c] = cw;
         }
+        const cross_gap = 3 + 2 * self.pad;
         var cols: usize = 0;
         for (0..self.n_cross) |c| {
             self.cpos[c] = cols;
-            cols += self.cw[c] + 3;
+            cols += self.cw[c] + cross_gap;
         }
-        cols -|= 3;
+        cols -|= cross_gap;
         for (0..self.count) |i| {
             self.x[i] = self.cpos[self.slot[i]] + (self.cw[self.slot[i]] - self.w[i]) / 2;
         }
         self.assignLabelRows();
         self.fwd[0] = 0;
         for (0..self.n_layers) |l| {
-            self.fwd[l + 1] = self.fwd[l] + 3 + 2 + self.glabels[l];
+            self.fwd[l + 1] = self.fwd[l] + 3 + 2 + 2 * self.pad + self.glabels[l];
         }
         self.rows = self.fwd[self.n_layers - 1] + 3;
         if (self.rows > max_rows) return null;
@@ -168,11 +201,12 @@ const Grid = struct {
             const g = self.rank[d] - 1;
             self.lmax[g] = @max(self.lmax[g], cells.labelWidth(text));
         }
+        const forward_gap = 4 + 2 * self.pad;
         self.fwd[0] = 0;
         for (0..self.n_layers) |l| {
-            self.fwd[l + 1] = self.fwd[l] + self.bandWidth(l) + 4 + if (self.lmax[l] > 0) self.lmax[l] + 1 else 0;
+            self.fwd[l + 1] = self.fwd[l] + self.bandWidth(l) + forward_gap + if (self.lmax[l] > 0) self.lmax[l] + 1 else 0;
         }
-        const cols = self.fwd[self.n_layers] -| 4;
+        const cols = self.fwd[self.n_layers] -| forward_gap;
         for (0..self.count) |i| {
             const fx = self.fwd[self.rank[i]];
             const bw = self.bandWidth(self.rank[i]);
@@ -181,9 +215,9 @@ const Grid = struct {
         }
         self.cpos[0] = 0;
         for (0..self.n_cross) |t| {
-            self.cpos[t + 1] = self.cpos[t] + 3;
+            self.cpos[t + 1] = self.cpos[t] + 3 + 2 * self.pad;
         }
-        self.rows = self.cpos[self.n_cross];
+        self.rows = self.cpos[self.n_cross - 1] + 3;
         if (self.hasLongEdge()) {
             self.wire = self.rows;
             self.rows += 1;
@@ -192,6 +226,72 @@ const Grid = struct {
         self.cols = cols;
         if (self.cols > width) return null;
         for (0..self.count) |i| self.y[i] = self.cpos[self.slot[i]];
+    }
+
+    fn applySubgraphPadding(self: *Grid, width: usize) ?void {
+        if (self.pad == 0) return;
+        for (0..self.count) |i| {
+            self.x[i] += self.pad;
+            self.y[i] += self.pad;
+        }
+        for (self.fwd[0 .. self.n_layers + 1]) |*position| position.* += self.pad;
+        for (self.cpos[0 .. self.n_cross + 1]) |*position| position.* += self.pad;
+        if (self.wire) |*wire| wire.* += self.pad;
+        self.rows += 2 * self.pad;
+        self.cols += 2 * self.pad;
+        if (self.rows > max_rows or self.cols > width) return null;
+    }
+
+    fn computeSubgraphBounds(self: *Grid) ?void {
+        for (self.flow.subgraphList(), 0..) |_, subgraph_index| {
+            var found = false;
+            var x1: usize = self.cols;
+            var y1: usize = self.rows;
+            var x2: usize = 0;
+            var y2: usize = 0;
+            for (self.flow.nodeList(), 0..) |*node, node_index| {
+                if (!self.flow.nodeInSubgraph(node, subgraph_index)) continue;
+                found = true;
+                x1 = @min(x1, self.x[node_index]);
+                y1 = @min(y1, self.y[node_index]);
+                x2 = @max(x2, self.x[node_index] + self.w[node_index] - 1);
+                y2 = @max(y2, self.y[node_index] + 2);
+            }
+            if (!found) return null;
+            const expansion = self.subgraphExpansion(subgraph_index);
+            self.subgraphs[subgraph_index] = .{
+                .x1 = x1 - expansion,
+                .y1 = y1 - expansion,
+                .x2 = x2 + expansion,
+                .y2 = y2 + expansion,
+            };
+        }
+        for (self.flow.subgraphList(), 0..) |_, subgraph_index| {
+            const bounds = self.subgraphs[subgraph_index];
+            for (self.flow.nodeList(), 0..) |*node, node_index| {
+                if (self.flow.nodeInSubgraph(node, subgraph_index)) continue;
+                const node_bounds: Bounds = .{
+                    .x1 = self.x[node_index],
+                    .y1 = self.y[node_index],
+                    .x2 = self.x[node_index] + self.w[node_index] - 1,
+                    .y2 = self.y[node_index] + 2,
+                };
+                if (boundsIntersect(bounds, node_bounds)) return null;
+            }
+            for (self.flow.subgraphList()[subgraph_index + 1 ..], subgraph_index + 1..) |_, other_index| {
+                if (subgraphInSubgraph(self.flow, other_index, subgraph_index) or
+                    subgraphInSubgraph(self.flow, subgraph_index, other_index)) continue;
+                if (boundsIntersect(bounds, self.subgraphs[other_index])) return null;
+            }
+        }
+    }
+
+    fn subgraphExpansion(self: *const Grid, subgraph: usize) usize {
+        var deepest = self.flow.subgraphs[subgraph].level;
+        for (self.flow.subgraphList(), 0..) |candidate, candidate_index| {
+            if (subgraphInSubgraph(self.flow, candidate_index, subgraph)) deepest = @max(deepest, candidate.level);
+        }
+        return deepest - self.flow.subgraphs[subgraph].level + 1;
     }
 
     fn bandWidth(self: *const Grid, layer: usize) usize {
@@ -466,6 +566,9 @@ const Grid = struct {
     }
 
     fn draw(self: *const Grid, win: vaxis.Window, start_row: usize, skip: usize) void {
+        for (self.flow.subgraphList(), 0..) |subgraph, index| {
+            drawSubgraph(win, self.subgraphs[index], subgraph.label, start_row, skip);
+        }
         for (self.flow.nodeList(), 0..) |*node, i| {
             drawBox(win, node, self.x[i], self.y[i], self.w[i], start_row, skip);
         }
@@ -494,6 +597,25 @@ const Grid = struct {
             const path = self.route(edge) orelse continue;
             if (path.label) |label| cells.putText(win, label.r, label.c, start_row, skip, label.text, self.cols, .{});
         }
+    }
+
+    fn drawSubgraph(win: vaxis.Window, bounds: Bounds, label: []const u8, start_row: usize, skip: usize) void {
+        const style: vaxis.Style = .{ .dim = true };
+        cells.putLine(win, bounds.y1, bounds.x1, start_row, skip, "┌", style);
+        cells.putLine(win, bounds.y1, bounds.x2, start_row, skip, "┐", style);
+        cells.putLine(win, bounds.y2, bounds.x1, start_row, skip, "└", style);
+        cells.putLine(win, bounds.y2, bounds.x2, start_row, skip, "┘", style);
+        var col = bounds.x1 + 1;
+        while (col < bounds.x2) : (col += 1) {
+            cells.putLine(win, bounds.y1, col, start_row, skip, "─", style);
+            cells.putLine(win, bounds.y2, col, start_row, skip, "─", style);
+        }
+        var row = bounds.y1 + 1;
+        while (row < bounds.y2) : (row += 1) {
+            cells.putLine(win, row, bounds.x1, start_row, skip, "│", style);
+            cells.putLine(win, row, bounds.x2, start_row, skip, "│", style);
+        }
+        cells.putText(win, bounds.y1, bounds.x1 + 2, start_row, skip, label, bounds.x2 - 1, style);
     }
 
     fn sourceMarkerAt(self: *const Grid, edge: *const Mermaid.Edge) ?CellPos {
@@ -626,6 +748,52 @@ test "branch lays out siblings side by side" {
     try expectGlyph(win, 10, 4, "▼");
     try expectGlyph(win, 2, 3, "├");
     try expectGlyph(win, 10, 3, "┐");
+}
+
+test "subgraphs render labeled boundaries" {
+    var flow = Mermaid.parseText(
+        "flowchart LR\n" ++
+            "subgraph group [Group]\n" ++
+            "A-->B\n" ++
+            "subgraph inner [Inner]\n" ++
+            "C-->D\n" ++
+            "end\n" ++
+            "B-->C\n" ++
+            "end\n" ++
+            "D-->E\n",
+    ).?;
+    const rows = layout(null, &flow, 0, 0, 80).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(rows), .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &flow, 0, 0, 80).?;
+
+    var found_group = false;
+    var found_inner = false;
+    var found_border = false;
+    for (0..win.height) |row| {
+        for (0..win.width) |col| {
+            const cell = win.readCell(@intCast(col), @intCast(row)) orelse continue;
+            if (!cell.style.dim) continue;
+            if (mem.eql(u8, cell.char.grapheme, "G")) found_group = true;
+            if (mem.eql(u8, cell.char.grapheme, "I")) found_inner = true;
+            if (mem.eql(u8, cell.char.grapheme, "┌")) found_border = true;
+        }
+    }
+    try testing.expect(found_group and found_inner and found_border);
+}
+
+test "interleaved subgraph members fall back" {
+    var flow = Mermaid.parseText(
+        "flowchart TD\n" ++
+            "subgraph group\n" ++
+            "A\n" ++
+            "C\n" ++
+            "end\n" ++
+            "B\n" ++
+            "A-->B-->C\n",
+    ).?;
+    try testing.expect(layout(null, &flow, 0, 0, 80) == null);
 }
 
 test "left to right flows horizontally" {

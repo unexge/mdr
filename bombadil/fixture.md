@@ -46,8 +46,11 @@ pub fn main() void {
 
 ```mermaid
 graph TD
-A["x"] --> B[(database)] & C{choice}
-B <--> D(((done)))
+subgraph process [Process]
+A["x"] --> B[(database)]
+end
+B --> C{choice}
+C <--> D(((done)))
 ```
 
 ```mermaid

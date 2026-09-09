@@ -7,6 +7,8 @@
 
 pub const max_nodes = 64;
 pub const max_edges = 128;
+pub const max_subgraphs = 16;
+pub const max_subgraph_depth = 8;
 
 pub const Direction = enum { tb, bt, lr, rl };
 
@@ -32,6 +34,15 @@ pub const Node = struct {
     id: []const u8,
     label: []const u8,
     shape: Shape,
+    subgraph: ?usize = null,
+};
+
+pub const Subgraph = struct {
+    id: []const u8,
+    label: []const u8,
+    parent: ?usize,
+    level: usize,
+    direction: ?Direction = null,
 };
 
 pub const Edge = struct {
@@ -49,6 +60,8 @@ pub const Flowchart = struct {
     node_count: usize = 0,
     edges: [max_edges]Edge = undefined,
     edge_count: usize = 0,
+    subgraphs: [max_subgraphs]Subgraph = undefined,
+    subgraph_count: usize = 0,
     degraded: bool = false,
 
     pub fn nodeList(self: *const Flowchart) []const Node {
@@ -57,6 +70,19 @@ pub const Flowchart = struct {
 
     pub fn edgeList(self: *const Flowchart) []const Edge {
         return self.edges[0..self.edge_count];
+    }
+
+    pub fn subgraphList(self: *const Flowchart) []const Subgraph {
+        return self.subgraphs[0..self.subgraph_count];
+    }
+
+    pub fn nodeInSubgraph(self: *const Flowchart, node: *const Node, subgraph: usize) bool {
+        var current = node.subgraph;
+        while (current) |index| {
+            if (index == subgraph) return true;
+            current = self.subgraphs[index].parent;
+        }
+        return false;
     }
 };
 
@@ -67,6 +93,8 @@ pub fn parseBlock(cb: Document.Element.CodeBlock) ?Flowchart {
     var lines = cb.lines();
     while (lines.next()) |line| parser.feed(line);
     if (!parser.seen_header or !parser.supported) return null;
+    parser.finish();
+    if (!parser.supported) return null;
     return parser.flow;
 }
 
@@ -74,6 +102,8 @@ pub fn parseText(text: []const u8) ?Flowchart {
     var parser: Parser = .{};
     feedLines(&parser, text);
     if (!parser.seen_header or !parser.supported) return null;
+    parser.finish();
+    if (!parser.supported) return null;
     return parser.flow;
 }
 
@@ -94,9 +124,11 @@ const Parser = struct {
     flow: Flowchart = .{},
     seen_header: bool = false,
     supported: bool = true,
+    subgraph_stack: [max_subgraph_depth]usize = undefined,
+    subgraph_stack_len: usize = 0,
 
     fn feed(self: *Parser, raw: []const u8) void {
-        if (!self.supported) return;
+        if (!self.supported or self.flow.degraded) return;
         const line = mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or isComment(line)) return;
         if (!self.seen_header) {
@@ -107,13 +139,105 @@ const Parser = struct {
             self.seen_header = true;
             return;
         }
-        for ([_][]const u8{ "end", "subgraph", "direction", "style", "classDef", "class", "click", "linkStyle" }) |keyword| {
+        if (isKeywordLine(line, "subgraph")) {
+            self.openSubgraph(line["subgraph".len..]);
+            return;
+        }
+        if (isKeywordLine(line, "end")) {
+            if (mem.trim(u8, line["end".len..], " \t\r").len > 0 or self.subgraph_stack_len == 0) {
+                self.supported = false;
+            } else {
+                self.subgraph_stack_len -= 1;
+            }
+            return;
+        }
+        if (isKeywordLine(line, "direction")) {
+            self.setSubgraphDirection(line["direction".len..]);
+            return;
+        }
+        for ([_][]const u8{ "style", "classDef", "class", "click", "linkStyle" }) |keyword| {
             if (isKeywordLine(line, keyword)) {
                 self.supported = false;
                 return;
             }
         }
         if (!self.feedBody(line)) self.supported = false;
+    }
+
+    fn finish(self: *Parser) void {
+        if (self.flow.degraded) return;
+        if (self.subgraph_stack_len > 0) {
+            self.supported = false;
+            return;
+        }
+        for (self.flow.subgraphList(), 0..) |subgraph, index| {
+            if (subgraph.direction) |direction| {
+                if (direction != self.flow.direction) {
+                    self.supported = false;
+                    return;
+                }
+            }
+            var has_node = false;
+            for (self.flow.nodeList()) |*node| {
+                if (self.flow.nodeInSubgraph(node, index)) {
+                    has_node = true;
+                    break;
+                }
+            }
+            if (!has_node) {
+                self.supported = false;
+                return;
+            }
+            for (self.flow.edgeList()) |edge| {
+                if (mem.eql(u8, edge.src, subgraph.id) or mem.eql(u8, edge.dst, subgraph.id)) {
+                    self.supported = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn openSubgraph(self: *Parser, raw: []const u8) void {
+        if (self.flow.subgraph_count >= max_subgraphs or self.subgraph_stack_len >= self.subgraph_stack.len) {
+            self.flow.degraded = true;
+            return;
+        }
+        const declaration = parseSubgraphDeclaration(raw) orelse {
+            self.supported = false;
+            return;
+        };
+        for (self.flow.subgraphList()) |subgraph| {
+            if (mem.eql(u8, subgraph.id, declaration.id)) {
+                self.supported = false;
+                return;
+            }
+        }
+        const index = self.flow.subgraph_count;
+        self.flow.subgraphs[index] = .{
+            .id = declaration.id,
+            .label = declaration.label,
+            .parent = self.currentSubgraph(),
+            .level = self.subgraph_stack_len,
+        };
+        self.flow.subgraph_count += 1;
+        self.subgraph_stack[self.subgraph_stack_len] = index;
+        self.subgraph_stack_len += 1;
+    }
+
+    fn setSubgraphDirection(self: *Parser, raw: []const u8) void {
+        const index = self.currentSubgraph() orelse {
+            self.supported = false;
+            return;
+        };
+        self.flow.subgraphs[index].direction = parseDirection(mem.trim(u8, raw, " \t\r")) orelse {
+            self.supported = false;
+            return;
+        };
+    }
+
+    fn currentSubgraph(self: *const Parser) ?usize {
+        if (self.subgraph_stack_len == 0) return null;
+        return self.subgraph_stack[self.subgraph_stack_len - 1];
     }
 
     fn feedBody(self: *Parser, line: []const u8) bool {
@@ -176,16 +300,25 @@ const Parser = struct {
         return if (count > 0) count else null;
     }
 
-    fn intern(self: *Parser, node: Node) ?[]const u8 {
+    fn intern(self: *Parser, parsed: Node) ?[]const u8 {
+        var node = parsed;
+        const current_subgraph = self.currentSubgraph();
+        const explicit = node.shape != .rect or node.label.ptr != node.id.ptr or node.label.len != node.id.len;
         for (self.flow.nodes[0..self.flow.node_count]) |*existing| {
             if (!mem.eql(u8, existing.id, node.id)) continue;
-            if (node.shape != .rect or node.label.ptr != node.id.ptr or node.label.len != node.id.len) existing.* = node;
+            const subgraph = if (explicit and current_subgraph != null)
+                current_subgraph
+            else
+                existing.subgraph orelse current_subgraph;
+            if (explicit) existing.* = node;
+            existing.subgraph = subgraph;
             return existing.id;
         }
         if (self.flow.node_count >= max_nodes) {
             self.flow.degraded = true;
             return null;
         }
+        node.subgraph = current_subgraph;
         self.flow.nodes[self.flow.node_count] = node;
         self.flow.node_count += 1;
         return node.id;
@@ -219,19 +352,18 @@ fn parseHeader(line: []const u8) ?Direction {
     var end: usize = 0;
     while (end < rest.len and rest[end] != ' ' and rest[end] != '\t' and rest[end] != ';') : (end += 1) {}
     const dir = rest[0..end];
-    const direction: Direction = if (eqlIgnoreCase(dir, "TD") or eqlIgnoreCase(dir, "TB"))
-        .tb
-    else if (eqlIgnoreCase(dir, "BT"))
-        .bt
-    else if (eqlIgnoreCase(dir, "LR"))
-        .lr
-    else if (eqlIgnoreCase(dir, "RL"))
-        .rl
-    else
-        return null;
+    const direction = parseDirection(dir) orelse return null;
     const tail = mem.trim(u8, rest[end..], " \t\r");
     if (tail.len > 0 and !mem.eql(u8, tail, ";")) return null;
     return direction;
+}
+
+fn parseDirection(raw: []const u8) ?Direction {
+    if (eqlIgnoreCase(raw, "TD") or eqlIgnoreCase(raw, "TB")) return .tb;
+    if (eqlIgnoreCase(raw, "BT")) return .bt;
+    if (eqlIgnoreCase(raw, "LR")) return .lr;
+    if (eqlIgnoreCase(raw, "RL")) return .rl;
+    return null;
 }
 
 fn isKeywordLine(line: []const u8, keyword: []const u8) bool {
@@ -239,6 +371,30 @@ fn isKeywordLine(line: []const u8, keyword: []const u8) bool {
     if (line.len == keyword.len) return true;
     const c = line[keyword.len];
     return c == ' ' or c == '\t';
+}
+
+const SubgraphDeclaration = struct {
+    id: []const u8,
+    label: []const u8,
+};
+
+fn parseSubgraphDeclaration(raw: []const u8) ?SubgraphDeclaration {
+    const declaration = mem.trim(u8, raw, " \t\r");
+    if (declaration.len == 0) return null;
+    var id_end: usize = 0;
+    while (id_end < declaration.len and isIdChar(declaration[id_end])) : (id_end += 1) {}
+    if (id_end > 0) {
+        const tail = mem.trim(u8, declaration[id_end..], " \t\r");
+        if (tail.len >= 2 and tail[0] == '[' and tail[tail.len - 1] == ']') {
+            const label = metadataValue(tail[1 .. tail.len - 1]) orelse return null;
+            if (isMarkdownLabel(label)) return null;
+            return .{ .id = declaration[0..id_end], .label = label };
+        }
+        if (tail.len > 0 and (tail[0] == '[' or tail[tail.len - 1] == ']')) return null;
+    }
+    const label = metadataValue(declaration) orelse return null;
+    if (isMarkdownLabel(label)) return null;
+    return .{ .id = label, .label = label };
 }
 
 fn parseNode(seg: []const u8) ?Node {
@@ -1185,6 +1341,42 @@ test "dashes inside labels never split" {
     try testing.expectEqual(@as(usize, 2), flow.edge_count);
 }
 
+test "nested flowchart subgraphs" {
+    const flow = parseText(
+        "graph LR\n" ++
+            "subgraph outer [Outer group]\n" ++
+            "A-->B\n" ++
+            "subgraph inner [\"Inner group\"]\n" ++
+            "direction LR\n" ++
+            "C-->D\n" ++
+            "end\n" ++
+            "B-->C\n" ++
+            "end\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 2), flow.subgraph_count);
+    try testing.expectEqualStrings("outer", flow.subgraphs[0].id);
+    try testing.expectEqualStrings("Outer group", flow.subgraphs[0].label);
+    try testing.expect(flow.subgraphs[0].parent == null);
+    try testing.expectEqual(@as(?usize, 0), flow.subgraphs[1].parent);
+    try testing.expectEqualStrings("Inner group", flow.subgraphs[1].label);
+    try testing.expectEqual(@as(?usize, 0), flow.nodes[0].subgraph);
+    try testing.expectEqual(@as(?usize, 0), flow.nodes[1].subgraph);
+    try testing.expectEqual(@as(?usize, 1), flow.nodes[2].subgraph);
+    try testing.expectEqual(@as(?usize, 1), flow.nodes[3].subgraph);
+}
+
+test "unsupported subgraph semantics are rejected" {
+    for ([_][]const u8{
+        "graph LR\nsubgraph g\ndirection TB\nA-->B\nend\n",
+        "graph LR\nsubgraph g\nA-->B\nend\ng-->C\n",
+        "graph LR\nsubgraph empty\nend\n",
+        "graph LR\nsubgraph open\nA-->B\n",
+        "graph LR\nsubgraph bad [label] trailing\nA\nend\n",
+    }) |text| {
+        try testing.expect(parseText(text) == null);
+    }
+}
+
 test "flowchart comments are skipped" {
     const flow = parseText("%% a comment\ngraph TD\nA-->B\n").?;
     try testing.expectEqual(@as(usize, 2), flow.node_count);
@@ -1193,7 +1385,6 @@ test "flowchart comments are skipped" {
 
 test "unsupported flowchart statements are rejected" {
     for ([_][]const u8{
-        "graph TD\nA-->B\nsubgraph inner\nB-->C\nend\n",
         "graph TD\nA-->B\nstyle A fill:red\n",
         "graph TD\nA-->B\nnot a node !!!\n",
         "graph TD\nA[\"`Markdown`\"]\n",

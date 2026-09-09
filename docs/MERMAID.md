@@ -18,11 +18,13 @@ Supported:
   `hexagon`, `lean-r`, `lean-l`, `trap-b`, `trap-t`, and `dbl-circ`
 - Solid, dotted, thick, invisible, circle, cross, and bidirectional links
 - Link labels, chained links, and `A & B --> C & D` multi-node links
+- Labeled and nested subgraphs whose direction matches the parent flowchart
 - `%%` comments
 
 Falls back:
 
-- Subgraphs and subgraph directions
+- Subgraph direction overrides and edges targeting a subgraph ID
+- Subgraph layouts whose boundaries would overlap unrelated nodes or groups
 - Unlisted expanded shapes, icons, and image nodes
 - Edge IDs, animation, and requested minimum link lengths
 - Styles, classes, click actions, and configuration directives
