@@ -55,5 +55,6 @@ Mermaid fences dispatch twice: `Mermaid.parseBlock` (flowcharts) then
 with bounded tables. They reject the whole diagram when a statement is
 unsupported instead of rendering a partial result. Anything unsupported,
 over capacity, cyclic, or wider than the viewport degrades back to the code
-card instead of failing. Shared cell drawing (junction merging, clipping,
+card instead of failing. The supported grammar is listed in
+[`MERMAID.md`](MERMAID.md). Shared cell drawing (junction merging, clipping,
 display widths) lives in `renderer/cells.zig`.

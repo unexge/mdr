@@ -102,7 +102,7 @@ fn isBlank(grapheme: []const u8) bool {
 }
 
 fn isTerminalGlyph(grapheme: []const u8) bool {
-    for ([_][]const u8{ "▼", "▲", "►", "◄", "×", ">", "<" }) |glyph| {
+    for ([_][]const u8{ "▼", "▲", "►", "◄", "○", "×", ">", "<" }) |glyph| {
         if (mem.eql(u8, grapheme, glyph)) return true;
     }
     return false;

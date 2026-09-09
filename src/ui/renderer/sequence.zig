@@ -256,11 +256,12 @@ const Layout = struct {
             wireCell(m.style, win, wire + 1, scx + 3, start_row, skip);
             cells.putLine(win, wire + 1, scx + 4, start_row, skip, "┘", .{});
             switch (m.kind) {
-                .arrow => cells.putRaw(win, wire + 1, scx + 1, start_row, skip, "◄", .{}),
+                .arrow, .bidirectional => cells.putRaw(win, wire + 1, scx + 1, start_row, skip, "◄", .{}),
                 .cross => cells.putRaw(win, wire + 1, scx + 1, start_row, skip, "×", .{}),
                 .open => cells.putRaw(win, wire + 1, scx + 1, start_row, skip, "<", .{}),
                 .plain => {},
             }
+            if (m.kind == .bidirectional) cells.putRaw(win, wire, scx + 1, start_row, skip, "►", .{});
             return;
         }
         const lo = @min(scx, dcx);
@@ -268,11 +269,12 @@ const Layout = struct {
         var c = lo;
         while (c <= hi) : (c += 1) wireCell(m.style, win, wire, c, start_row, skip);
         switch (m.kind) {
-            .arrow => cells.putRaw(win, wire, dcx, start_row, skip, if (dcx > scx) "►" else "◄", .{}),
+            .arrow, .bidirectional => cells.putRaw(win, wire, dcx, start_row, skip, if (dcx > scx) "►" else "◄", .{}),
             .cross => cells.putRaw(win, wire, dcx, start_row, skip, "×", .{}),
             .open => cells.putRaw(win, wire, dcx, start_row, skip, if (dcx > scx) ">" else "<", .{}),
             .plain => {},
         }
+        if (m.kind == .bidirectional) cells.putRaw(win, wire, scx, start_row, skip, if (dcx > scx) "◄" else "►", .{});
     }
 
     fn drawLabel(self: *const Layout, win: vaxis.Window, m: *const Mermaid.Message, index: usize, start_row: usize, skip: usize) void {
@@ -444,6 +446,16 @@ test "all eight arrows" {
     try expectGlyph(win, 2, 22, "<");
 }
 
+test "bidirectional arrows mark both participants" {
+    var seq = Mermaid.parseSequenceBlockText("sequenceDiagram\nA<<->>B: hi\n").?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 5, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 2, 4, "◄");
+    try expectGlyph(win, 10, 4, "►");
+}
+
 test "self messages bump east" {
     var seq = Mermaid.parseSequenceBlockText("sequenceDiagram\nA->>A: ping\n").?;
     try testing.expectEqual(@as(usize, 6), layout(null, &seq, 0, 0, 40).?);
@@ -548,6 +560,24 @@ test "alt else dividers" {
     try expectGlyph(win, 0, 9, "└");
     try testing.expect(win.readCell(2, 6).?.style.dim);
     try testing.expect(win.readCell(0, 6).?.style.dim);
+}
+
+test "critical fragments render option dividers" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "critical Connect\n" ++
+            "A->>B: try\n" ++
+            "option Timeout\n" ++
+            "A->>B: retry\n" ++
+            "end\n",
+    ).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 3, 3, "c");
+    try expectGlyph(win, 3, 6, "o");
+    try expectGlyph(win, 0, 9, "└");
 }
 
 test "activations widen lifelines" {

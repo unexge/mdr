@@ -442,9 +442,11 @@ const Grid = struct {
         var acols: [Mermaid.max_edges]usize = undefined;
         for (self.flow.edgeList()) |*edge| {
             const walk = self.route(edge) orelse continue;
-            arows[na] = walk.arrow_at.r;
-            acols[na] = walk.arrow_at.c;
-            na += 1;
+            if (edge.style != .invisible and edge.dst_marker != .none) {
+                arows[na] = walk.arrow_at.r;
+                acols[na] = walk.arrow_at.c;
+                na += 1;
+            }
             const info = self.labelInfo(edge) orelse continue;
             rows[n] = info.r;
             starts[n] = info.c;
@@ -468,6 +470,7 @@ const Grid = struct {
             drawBox(win, node, self.x[i], self.y[i], self.w[i], start_row, skip);
         }
         for (self.flow.edgeList()) |*edge| {
+            if (edge.style == .invisible) continue;
             const path = self.route(edge) orelse continue;
             for (path.segs[0..path.n]) |*seg| {
                 if (seg.r1 == seg.r2 and seg.c1 == seg.c2) {
@@ -480,23 +483,62 @@ const Grid = struct {
                     while (r <= seg.r2) : (r += 1) cells.putLine(win, r, seg.c1, start_row, skip, seg.glyph, .{});
                 }
             }
-            cells.putRaw(win, path.arrow_at.r, path.arrow_at.c, start_row, skip, path.arrow, .{});
+            drawMarker(win, path.arrow_at, edge.dst_marker, path.arrow, self.terminalLine(), start_row, skip);
+            if (edge.src_marker != .none) {
+                const source = self.sourceMarkerAt(edge) orelse continue;
+                drawMarker(win, source, edge.src_marker, reverseArrow(path.arrow), self.terminalLine(), start_row, skip);
+            }
         }
         for (self.flow.edgeList()) |*edge| {
+            if (edge.style == .invisible) continue;
             const path = self.route(edge) orelse continue;
             if (path.label) |label| cells.putText(win, label.r, label.c, start_row, skip, label.text, self.cols, .{});
         }
     }
 
+    fn sourceMarkerAt(self: *const Grid, edge: *const Mermaid.Edge) ?CellPos {
+        const source = nodeIndex(self.flow, edge.src) orelse return null;
+        if (self.vertical) {
+            return .{
+                .r = if (self.forward) self.y[source] + 3 else self.y[source] - 1,
+                .c = self.x[source] + self.w[source] / 2,
+            };
+        }
+        return .{
+            .r = self.y[source] + 1,
+            .c = if (self.forward) self.x[source] + self.w[source] else self.x[source] - 1,
+        };
+    }
+
+    fn terminalLine(self: *const Grid) []const u8 {
+        return if (self.vertical) "│" else "─";
+    }
+
     fn drawBox(win: vaxis.Window, node: *const Mermaid.Node, x: usize, y: usize, bw: usize, start_row: usize, skip: usize) void {
         const corners = switch (node.shape) {
-            .rounded, .stadium, .circle => cells.round,
+            .rounded, .stadium, .circle, .cylinder, .double_circle => cells.round,
             .diamond => cells.diamond,
             else => cells.square,
         };
         cells.box(win, x, y, bw, node.label, corners, start_row, skip, .{});
     }
 };
+
+fn drawMarker(win: vaxis.Window, pos: CellPos, marker: Mermaid.EdgeMarker, arrow: []const u8, line: []const u8, start_row: usize, skip: usize) void {
+    switch (marker) {
+        .none => cells.putLine(win, pos.r, pos.c, start_row, skip, line, .{}),
+        .arrow => cells.putRaw(win, pos.r, pos.c, start_row, skip, arrow, .{}),
+        .circle => cells.putRaw(win, pos.r, pos.c, start_row, skip, "○", .{}),
+        .cross => cells.putRaw(win, pos.r, pos.c, start_row, skip, "×", .{}),
+    }
+}
+
+fn reverseArrow(arrow: []const u8) []const u8 {
+    if (mem.eql(u8, arrow, "▼")) return "▲";
+    if (mem.eql(u8, arrow, "▲")) return "▼";
+    if (mem.eql(u8, arrow, "►")) return "◄";
+    return "►";
+}
 
 const Seg = struct {
     r1: usize,
@@ -597,6 +639,36 @@ test "left to right flows horizontally" {
     try expectGlyph(win, 9, 0, "┌");
     try expectGlyph(win, 8, 1, "►");
     try expectGlyph(win, 2, 1, "A");
+}
+
+test "flowchart endpoint markers render" {
+    var flow = Mermaid.parseText("flowchart LR\nA<-->B\n").?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &flow, 0, 0, 40).?;
+    try expectGlyph(win, 5, 1, "◄");
+    try expectGlyph(win, 8, 1, "►");
+
+    win.clear();
+    flow = Mermaid.parseText("flowchart LR\nA--oB\n").?;
+    _ = layout(win, &flow, 0, 0, 40).?;
+    try expectGlyph(win, 8, 1, "○");
+
+    win.clear();
+    flow = Mermaid.parseText("flowchart LR\nA--xB\n").?;
+    _ = layout(win, &flow, 0, 0, 40).?;
+    try expectGlyph(win, 8, 1, "×");
+
+    win.clear();
+    flow = Mermaid.parseText("flowchart LR\nA---B\n").?;
+    _ = layout(win, &flow, 0, 0, 40).?;
+    try expectGlyph(win, 8, 1, "─");
+
+    win.clear();
+    flow = Mermaid.parseText("flowchart LR\nA~~~B\n").?;
+    _ = layout(win, &flow, 0, 0, 40).?;
+    try testing.expect(!mem.eql(u8, win.readCell(6, 1).?.char.grapheme, "─"));
 }
 
 test "left to right branch bends inside the gap" {

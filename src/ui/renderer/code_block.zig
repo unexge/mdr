@@ -205,7 +205,7 @@ test "unsupported mermaid syntax falls back to the card" {
 
     const sequence_diagram: Document.Element.CodeBlock = .{
         .info = .{ .mermaid = "mermaid" },
-        .content = "sequenceDiagram\nA->>B: before\ncritical important\nB->>A: inside\nend\n",
+        .content = "sequenceDiagram\nA->>B: before\nbox Group\nparticipant C\nend\n",
     };
     try testing.expectEqual(@as(usize, 6), layout(null, sequence_diagram, 0, 0, 40));
 

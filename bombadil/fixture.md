@@ -46,13 +46,17 @@ pub fn main() void {
 
 ```mermaid
 graph TD
-A[x] --> B[y]
-A --> C[z]
+A["x"] --> B[(database)] & C{choice}
+B <--> D(((done)))
 ```
 
 ```mermaid
 sequenceDiagram
-    Alice->>Bob: Hello
+    critical Greeting
+        Alice->>Bob: Hello
+    option Retry
+        Alice->>Bob: Hello again
+    end
     activate Bob
     Note over Bob: Thinking
     Bob-->>Alice: Hi

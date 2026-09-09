@@ -19,9 +19,14 @@ pub const Shape = enum {
     subroutine,
     parallelogram,
     hexagon,
+    cylinder,
+    asymmetric,
+    trapezoid,
+    double_circle,
 };
 
-pub const EdgeStyle = enum { solid, dotted, thick };
+pub const EdgeStyle = enum { solid, dotted, thick, invisible };
+pub const EdgeMarker = enum { none, arrow, circle, cross };
 
 pub const Node = struct {
     id: []const u8,
@@ -34,7 +39,8 @@ pub const Edge = struct {
     dst: []const u8,
     label: ?[]const u8,
     style: EdgeStyle,
-    arrow: bool,
+    src_marker: EdgeMarker,
+    dst_marker: EdgeMarker,
 };
 
 pub const Flowchart = struct {
@@ -112,29 +118,69 @@ const Parser = struct {
 
     fn feedBody(self: *Parser, line: []const u8) bool {
         if (self.flow.degraded) return true;
+        var previous: [max_nodes][]const u8 = undefined;
+        var previous_count: usize = 0;
         var pos: usize = 0;
-        var prev_id: ?[]const u8 = null;
         var pending: ?Op = null;
         while (pos <= line.len) {
             const found = findOp(line, pos);
             const end = if (found) |f| f.at else line.len;
-            const node = parseNode(mem.trim(u8, line[pos..end], " \t\r")) orelse return false;
-            const id = self.intern(node) orelse return self.flow.degraded;
+            var current: [max_nodes][]const u8 = undefined;
+            const current_count = self.parseGroup(line[pos..end], &current) orelse return false;
+            if (self.flow.degraded) return true;
             if (pending) |op| {
-                self.addEdge(prev_id.?, id, op);
+                for (previous[0..previous_count]) |src| {
+                    for (current[0..current_count]) |dst| self.addEdge(src, dst, op);
+                }
                 if (self.flow.degraded) return true;
             }
             const f = found orelse return true;
-            prev_id = id;
+            @memcpy(previous[0..current_count], current[0..current_count]);
+            previous_count = current_count;
             pending = f.op;
             pos = f.after;
         }
         return true;
     }
 
+    fn parseGroup(self: *Parser, raw: []const u8, ids: *[max_nodes][]const u8) ?usize {
+        var count: usize = 0;
+        var start: usize = 0;
+        var depth: usize = 0;
+        var quoted = false;
+        var i: usize = 0;
+        while (i <= raw.len) : (i += 1) {
+            const at_end = i == raw.len;
+            if (!at_end) {
+                switch (raw[i]) {
+                    '"' => quoted = !quoted,
+                    '[', '(', '{' => if (!quoted) {
+                        depth += 1;
+                    },
+                    ']', ')', '}' => if (!quoted) {
+                        depth -|= 1;
+                    },
+                    else => {},
+                }
+            }
+            if (!at_end and (raw[i] != '&' or quoted or depth > 0)) continue;
+            if (count >= ids.len) {
+                self.flow.degraded = true;
+                return 0;
+            }
+            const node = parseNode(mem.trim(u8, raw[start..i], " \t\r")) orelse return null;
+            ids[count] = self.intern(node) orelse return 0;
+            count += 1;
+            start = i + 1;
+        }
+        return if (count > 0) count else null;
+    }
+
     fn intern(self: *Parser, node: Node) ?[]const u8 {
-        for (self.flow.nodes[0..self.flow.node_count]) |existing| {
-            if (mem.eql(u8, existing.id, node.id)) return existing.id;
+        for (self.flow.nodes[0..self.flow.node_count]) |*existing| {
+            if (!mem.eql(u8, existing.id, node.id)) continue;
+            if (node.shape != .rect or node.label.ptr != node.id.ptr or node.label.len != node.id.len) existing.* = node;
+            return existing.id;
         }
         if (self.flow.node_count >= max_nodes) {
             self.flow.degraded = true;
@@ -156,7 +202,8 @@ const Parser = struct {
             .dst = dst,
             .label = op.label,
             .style = op.style,
-            .arrow = op.arrow,
+            .src_marker = op.src_marker,
+            .dst_marker = op.dst_marker,
         };
         self.flow.edge_count += 1;
     }
@@ -202,6 +249,9 @@ fn parseNode(seg: []const u8) ?Node {
     const id = seg[0..id_len];
     const rest = mem.trim(u8, seg[id_len..], " \t\r");
     if (rest.len == 0) return .{ .id = id, .label = id, .shape = .rect };
+    if (mem.startsWith(u8, rest, "@{")) return parseNodeMetadata(id, rest);
+    if (rest.len >= 6 and mem.startsWith(u8, rest, "(((") and mem.endsWith(u8, rest, ")))"))
+        return shaped(id, rest[3 .. rest.len - 3], .double_circle);
     if (rest.len >= 4) {
         if (mem.startsWith(u8, rest, "((") and mem.endsWith(u8, rest, "))"))
             return shaped(id, rest[2 .. rest.len - 2], .circle);
@@ -209,6 +259,8 @@ fn parseNode(seg: []const u8) ?Node {
             return shaped(id, rest[2 .. rest.len - 2], .stadium);
         if (mem.startsWith(u8, rest, "[[") and mem.endsWith(u8, rest, "]]"))
             return shaped(id, rest[2 .. rest.len - 2], .subroutine);
+        if (mem.startsWith(u8, rest, "[(") and mem.endsWith(u8, rest, ")]"))
+            return shaped(id, rest[2 .. rest.len - 2], .cylinder);
         if (mem.startsWith(u8, rest, "{{") and mem.endsWith(u8, rest, "}}"))
             return shaped(id, rest[2 .. rest.len - 2], .hexagon);
     }
@@ -218,17 +270,98 @@ fn parseNode(seg: []const u8) ?Node {
         const inner = rest[1 .. rest.len - 1];
         if (inner.len >= 2 and (inner[0] == '/' or inner[0] == '\\') and
             (inner[inner.len - 1] == '/' or inner[inner.len - 1] == '\\'))
-            return shaped(id, inner[1 .. inner.len - 1], .parallelogram);
+        {
+            const shape: Shape = if (inner[0] == inner[inner.len - 1]) .parallelogram else .trapezoid;
+            return shaped(id, inner[1 .. inner.len - 1], shape);
+        }
         return shaped(id, inner, .rect);
     }
+    if (rest[0] == '>' and mem.endsWith(u8, rest, "]"))
+        return shaped(id, rest[1 .. rest.len - 1], .asymmetric);
     if (rest[0] == '{' and mem.endsWith(u8, rest, "}"))
         return shaped(id, rest[1 .. rest.len - 1], .diamond);
     return null;
 }
 
-fn shaped(id: []const u8, raw_label: []const u8, shape: Shape) Node {
-    const label = mem.trim(u8, raw_label, " \t\r");
+fn parseNodeMetadata(id: []const u8, raw: []const u8) ?Node {
+    if (!mem.endsWith(u8, raw, "}")) return null;
+    const body = mem.trim(u8, raw[2 .. raw.len - 1], " \t\r");
+    var shape: ?Shape = null;
+    var label: ?[]const u8 = null;
+    var start: usize = 0;
+    var quoted = false;
+    var i: usize = 0;
+    while (i <= body.len) : (i += 1) {
+        const at_end = i == body.len;
+        if (!at_end and body[i] == '"') quoted = !quoted;
+        if (!at_end and (body[i] != ',' or quoted)) continue;
+        if (quoted) return null;
+        const field = mem.trim(u8, body[start..i], " \t\r");
+        const colon = mem.indexOfScalar(u8, field, ':') orelse return null;
+        const key = mem.trim(u8, field[0..colon], " \t\r");
+        const value = metadataValue(field[colon + 1 ..]) orelse return null;
+        if (mem.eql(u8, key, "shape")) {
+            shape = parseShapeName(value) orelse return null;
+        } else if (mem.eql(u8, key, "label")) {
+            label = value;
+        } else {
+            return null;
+        }
+        start = i + 1;
+    }
+    const node_shape = shape orelse return null;
+    const node_label = label orelse id;
+    if (isMarkdownLabel(node_label)) return null;
+    return .{ .id = id, .label = if (node_label.len == 0) id else node_label, .shape = node_shape };
+}
+
+fn metadataValue(raw: []const u8) ?[]const u8 {
+    const value = mem.trim(u8, raw, " \t\r");
+    if (value.len == 0) return null;
+    if (value[0] != '"') return value;
+    if (value.len < 2 or value[value.len - 1] != '"') return null;
+    return value[1 .. value.len - 1];
+}
+
+fn parseShapeName(name: []const u8) ?Shape {
+    const shapes = [_]struct { name: []const u8, shape: Shape }{
+        .{ .name = "rect", .shape = .rect },
+        .{ .name = "rounded", .shape = .rounded },
+        .{ .name = "stadium", .shape = .stadium },
+        .{ .name = "subproc", .shape = .subroutine },
+        .{ .name = "subroutine", .shape = .subroutine },
+        .{ .name = "cyl", .shape = .cylinder },
+        .{ .name = "cylinder", .shape = .cylinder },
+        .{ .name = "circle", .shape = .circle },
+        .{ .name = "odd", .shape = .asymmetric },
+        .{ .name = "diamond", .shape = .diamond },
+        .{ .name = "diam", .shape = .diamond },
+        .{ .name = "hex", .shape = .hexagon },
+        .{ .name = "hexagon", .shape = .hexagon },
+        .{ .name = "lean-r", .shape = .parallelogram },
+        .{ .name = "lean-l", .shape = .parallelogram },
+        .{ .name = "trap-b", .shape = .trapezoid },
+        .{ .name = "trap-t", .shape = .trapezoid },
+        .{ .name = "dbl-circ", .shape = .double_circle },
+    };
+    for (shapes) |entry| {
+        if (mem.eql(u8, name, entry.name)) return entry.shape;
+    }
+    return null;
+}
+
+fn shaped(id: []const u8, raw_label: []const u8, shape: Shape) ?Node {
+    const trimmed = mem.trim(u8, raw_label, " \t\r");
+    const label = if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
+        trimmed[1 .. trimmed.len - 1]
+    else
+        trimmed;
+    if (isMarkdownLabel(label)) return null;
     return .{ .id = id, .label = if (label.len == 0) id else label, .shape = shape };
+}
+
+fn isMarkdownLabel(label: []const u8) bool {
+    return label.len >= 2 and label[0] == '`' and label[label.len - 1] == '`';
 }
 
 fn isIdChar(c: u8) bool {
@@ -237,7 +370,8 @@ fn isIdChar(c: u8) bool {
 
 const Op = struct {
     style: EdgeStyle,
-    arrow: bool,
+    src_marker: EdgeMarker,
+    dst_marker: EdgeMarker,
     label: ?[]const u8,
 };
 
@@ -250,11 +384,20 @@ const FoundOp = struct {
 fn findOp(line: []const u8, from: usize) ?FoundOp {
     var i = from;
     var depth: usize = 0;
+    var quoted = false;
     while (i < line.len) : (i += 1) {
         switch (line[i]) {
-            '[', '(', '{' => depth += 1,
-            ']', ')', '}' => depth -|= 1,
-            '-', '=' => if (depth == 0) {
+            '"' => quoted = !quoted,
+            '[', '(', '{' => if (!quoted) {
+                depth += 1;
+            },
+            ']', ')', '}' => if (!quoted) {
+                depth -|= 1;
+            },
+            '-', '=', '<', '~' => if (!quoted and depth == 0) {
+                if (matchOp(line, i)) |found| return found;
+            },
+            'o', 'x' => if (!quoted and depth == 0 and (i == from or line[i - 1] == ' ' or line[i - 1] == '\t')) {
                 if (matchOp(line, i)) |found| return found;
             },
             else => {},
@@ -265,12 +408,12 @@ fn findOp(line: []const u8, from: usize) ?FoundOp {
 
 fn matchOp(line: []const u8, i: usize) ?FoundOp {
     const rest = line[i..];
-    if (matchToken(rest)) |t| return opAt(line, i, t.len, t.style, t.arrow);
+    if (matchToken(rest)) |token| return opAt(line, i, token);
     if (rest.len <= 2) return null;
     if (line[i] == '-') {
-        if (rest[1] == '-' and rest[2] == '|') return opAt(line, i, 2, .solid, true);
+        if (rest[1] == '-' and rest[2] == '|') return opAt(line, i, .{ .len = 2, .style = .solid, .dst_marker = .arrow });
         if (rest[1] == '-' or rest[1] == '.') return spacedOp(line, i);
-    } else if (rest[1] == '=') {
+    } else if (line[i] == '=' and rest[1] == '=') {
         return spacedOp(line, i);
     }
     return null;
@@ -279,16 +422,25 @@ fn matchOp(line: []const u8, i: usize) ?FoundOp {
 const Token = struct {
     len: usize,
     style: EdgeStyle,
-    arrow: bool,
+    src_marker: EdgeMarker = .none,
+    dst_marker: EdgeMarker = .none,
 };
 
 fn matchToken(rest: []const u8) ?Token {
-    if (mem.startsWith(u8, rest, "-.->")) return .{ .len = 4, .style = .dotted, .arrow = true };
-    if (mem.startsWith(u8, rest, "-->")) return .{ .len = 3, .style = .solid, .arrow = true };
-    if (mem.startsWith(u8, rest, "---")) return .{ .len = 3, .style = .solid, .arrow = false };
-    if (mem.startsWith(u8, rest, "-.-")) return .{ .len = 3, .style = .dotted, .arrow = false };
-    if (mem.startsWith(u8, rest, "==>")) return .{ .len = 3, .style = .thick, .arrow = true };
-    if (mem.startsWith(u8, rest, "===")) return .{ .len = 3, .style = .thick, .arrow = false };
+    if (mem.startsWith(u8, rest, "<-->")) return .{ .len = 4, .style = .solid, .src_marker = .arrow, .dst_marker = .arrow };
+    if (mem.startsWith(u8, rest, "o--o")) return .{ .len = 4, .style = .solid, .src_marker = .circle, .dst_marker = .circle };
+    if (mem.startsWith(u8, rest, "x--x")) return .{ .len = 4, .style = .solid, .src_marker = .cross, .dst_marker = .cross };
+    if (mem.startsWith(u8, rest, "-.->")) return .{ .len = 4, .style = .dotted, .dst_marker = .arrow };
+    if (mem.startsWith(u8, rest, "-->")) return .{ .len = 3, .style = .solid, .dst_marker = .arrow };
+    if (mem.startsWith(u8, rest, "---o")) return .{ .len = 4, .style = .solid, .dst_marker = .circle };
+    if (mem.startsWith(u8, rest, "---x")) return .{ .len = 4, .style = .solid, .dst_marker = .cross };
+    if (mem.startsWith(u8, rest, "--o")) return .{ .len = 3, .style = .solid, .dst_marker = .circle };
+    if (mem.startsWith(u8, rest, "--x")) return .{ .len = 3, .style = .solid, .dst_marker = .cross };
+    if (mem.startsWith(u8, rest, "---")) return .{ .len = 3, .style = .solid };
+    if (mem.startsWith(u8, rest, "-.-")) return .{ .len = 3, .style = .dotted };
+    if (mem.startsWith(u8, rest, "==>")) return .{ .len = 3, .style = .thick, .dst_marker = .arrow };
+    if (mem.startsWith(u8, rest, "===")) return .{ .len = 3, .style = .thick };
+    if (mem.startsWith(u8, rest, "~~~")) return .{ .len = 3, .style = .invisible };
     return null;
 }
 
@@ -297,23 +449,25 @@ fn spacedOp(line: []const u8, at: usize) ?FoundOp {
     while (j < line.len) : (j += 1) {
         if (line[j] != '-' and line[j] != '=') continue;
         const rest = line[j..];
-        if (matchToken(rest)) |t| return spacedAt(line, at, j, t.len, t.style, t.arrow);
-        if (line[j] == '-' and rest.len > 1 and rest[1] == '>' and line[j - 1] == '.')
-            return spacedAt(line, at, j - 1, 3, .dotted, true);
+        if (matchToken(rest)) |token| return spacedAt(line, at, j, token);
+        if (line[j] == '-' and rest.len > 1 and rest[1] == '>' and line[j - 1] == '.') {
+            if (mem.trim(u8, line[at + 2 .. j - 1], " \t\r").len == 0) return null;
+            return spacedAt(line, at, j - 1, .{ .len = 3, .style = .dotted, .dst_marker = .arrow });
+        }
     }
     return null;
 }
 
-fn spacedAt(line: []const u8, at: usize, close: usize, len: usize, style: EdgeStyle, arrow: bool) FoundOp {
+fn spacedAt(line: []const u8, at: usize, close: usize, token: Token) FoundOp {
     const raw = mem.trim(u8, line[at + 2 .. close], " \t\r");
-    var found = opAt(line, close, len, style, arrow);
+    var found = opAt(line, close, token);
     found.at = at;
     if (found.op.label == null and raw.len > 0) found.op.label = raw;
     return found;
 }
 
-fn opAt(line: []const u8, at: usize, len: usize, style: EdgeStyle, arrow: bool) FoundOp {
-    var after = at + len;
+fn opAt(line: []const u8, at: usize, token: Token) FoundOp {
+    var after = at + token.len;
     var label: ?[]const u8 = null;
     if (after < line.len and line[after] == '|') {
         if (mem.indexOfScalarPos(u8, line, after + 1, '|')) |close| {
@@ -321,7 +475,16 @@ fn opAt(line: []const u8, at: usize, len: usize, style: EdgeStyle, arrow: bool) 
             after = close + 1;
         }
     }
-    return .{ .at = at, .after = after, .op = .{ .style = style, .arrow = arrow, .label = label } };
+    return .{
+        .at = at,
+        .after = after,
+        .op = .{
+            .style = token.style,
+            .src_marker = token.src_marker,
+            .dst_marker = token.dst_marker,
+            .label = label,
+        },
+    };
 }
 
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -345,7 +508,7 @@ pub const Participant = struct {
 };
 
 pub const MsgStyle = enum { solid, dotted };
-pub const MsgKind = enum { plain, arrow, cross, open };
+pub const MsgKind = enum { plain, arrow, bidirectional, cross, open };
 
 pub const Message = struct {
     src: []const u8,
@@ -366,7 +529,7 @@ pub const Note = struct {
     pos: usize,
 };
 
-pub const FragmentOp = enum { loop, alt, opt, par };
+pub const FragmentOp = enum { loop, alt, opt, par, critical, @"break", rect };
 
 pub const Divider = struct {
     pos: usize,
@@ -601,6 +764,9 @@ const SeqParser = struct {
             .{ .kw = "alt", .op = .alt },
             .{ .kw = "opt", .op = .opt },
             .{ .kw = "par", .op = .par },
+            .{ .kw = "critical", .op = .critical },
+            .{ .kw = "break", .op = .@"break" },
+            .{ .kw = "rect", .op = .rect },
         };
         for (blocks) |b| {
             if (stripKeyword(line, b.kw)) |label| {
@@ -608,11 +774,9 @@ const SeqParser = struct {
                 return true;
             }
         }
-        for ([_][]const u8{ "rect", "critical", "break", "box" }) |kw| {
-            if (stripKeyword(line, kw) != null) {
-                self.supported = false;
-                return true;
-            }
+        if (stripKeyword(line, "box") != null) {
+            self.supported = false;
+            return true;
         }
         if (stripKeyword(line, "and")) |label| {
             if (!self.topIs(.par)) self.supported = false else self.div("and", label);
@@ -620,6 +784,10 @@ const SeqParser = struct {
         }
         if (stripKeyword(line, "else")) |label| {
             if (!self.topIs(.alt)) self.supported = false else self.div("else", label);
+            return true;
+        }
+        if (stripKeyword(line, "option")) |label| {
+            if (!self.topIs(.critical)) self.supported = false else self.div("option", label);
             return true;
         }
         if (stripKeyword(line, "end")) |tail| {
@@ -752,30 +920,24 @@ const MsgToken = struct {
     len: usize,
 };
 
+fn matchMsgToken(rest: []const u8) ?MsgToken {
+    if (mem.startsWith(u8, rest, "<<-->>")) return .{ .style = .dotted, .kind = .bidirectional, .len = 6 };
+    if (mem.startsWith(u8, rest, "<<->>")) return .{ .style = .solid, .kind = .bidirectional, .len = 5 };
+    if (mem.startsWith(u8, rest, "-->>")) return .{ .style = .dotted, .kind = .arrow, .len = 4 };
+    if (mem.startsWith(u8, rest, "->>")) return .{ .style = .solid, .kind = .arrow, .len = 3 };
+    if (mem.startsWith(u8, rest, "-->")) return .{ .style = .dotted, .kind = .plain, .len = 3 };
+    if (mem.startsWith(u8, rest, "->")) return .{ .style = .solid, .kind = .plain, .len = 2 };
+    if (mem.startsWith(u8, rest, "--x")) return .{ .style = .dotted, .kind = .cross, .len = 3 };
+    if (mem.startsWith(u8, rest, "-x")) return .{ .style = .solid, .kind = .cross, .len = 2 };
+    if (mem.startsWith(u8, rest, "--)")) return .{ .style = .dotted, .kind = .open, .len = 3 };
+    if (mem.startsWith(u8, rest, "-)")) return .{ .style = .solid, .kind = .open, .len = 2 };
+    return null;
+}
+
 fn parseMessageLine(line: []const u8) ?ParsedMessage {
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
-        if (line[i] != '-') continue;
-        const rest = line[i..];
-        // Longest match first: ->> precedes ->, -->> precedes -->.
-        const arrow: MsgToken = if (mem.startsWith(u8, rest, "-->>"))
-            .{ .style = .dotted, .kind = .arrow, .len = 4 }
-        else if (mem.startsWith(u8, rest, "->>"))
-            .{ .style = .solid, .kind = .arrow, .len = 3 }
-        else if (mem.startsWith(u8, rest, "-->"))
-            .{ .style = .dotted, .kind = .plain, .len = 3 }
-        else if (mem.startsWith(u8, rest, "->"))
-            .{ .style = .solid, .kind = .plain, .len = 2 }
-        else if (mem.startsWith(u8, rest, "--x"))
-            .{ .style = .dotted, .kind = .cross, .len = 3 }
-        else if (mem.startsWith(u8, rest, "-x"))
-            .{ .style = .solid, .kind = .cross, .len = 2 }
-        else if (mem.startsWith(u8, rest, "--)"))
-            .{ .style = .dotted, .kind = .open, .len = 3 }
-        else if (mem.startsWith(u8, rest, "-)"))
-            .{ .style = .solid, .kind = .open, .len = 2 }
-        else
-            continue;
+        const arrow = matchMsgToken(line[i..]) orelse continue;
         const src = parseId(mem.trim(u8, line[0..i], " \t")) orelse return null;
         var j = i + arrow.len;
         while (j < line.len and (line[j] == ' ' or line[j] == '\t')) j += 1;
@@ -853,10 +1015,44 @@ test "node shapes and labels" {
     try testing.expectEqualStrings("I", nodes[8].label);
 }
 
-test "first node definition wins" {
-    const flow = parseText("graph TD\nA[first]\nA[second]\n").?;
+test "additional classic node shapes and quoted labels" {
+    const flow = parseText(
+        "graph TD\n" ++
+            "A[(Database)]\n" ++
+            "B>Odd]\n" ++
+            "C[/Trapezoid\\]\n" ++
+            "D(((Stop)))\n" ++
+            "E[\"Quoted label\"]\n",
+    ).?;
+    const nodes = flow.nodeList();
+    try testing.expectEqual(@as(usize, 5), nodes.len);
+    try testing.expect(nodes[0].shape == .cylinder);
+    try testing.expectEqualStrings("Database", nodes[0].label);
+    try testing.expect(nodes[1].shape == .asymmetric);
+    try testing.expect(nodes[2].shape == .trapezoid);
+    try testing.expect(nodes[3].shape == .double_circle);
+    try testing.expectEqualStrings("Stop", nodes[3].label);
+    try testing.expectEqualStrings("Quoted label", nodes[4].label);
+}
+
+test "node shape metadata" {
+    const flow = parseText(
+        "graph TD\n" ++
+            "A@{ shape: cyl, label: \"Database\" }\n" ++
+            "B@{ label: \"Decision, now\", shape: diamond }\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 2), flow.node_count);
+    try testing.expect(flow.nodes[0].shape == .cylinder);
+    try testing.expectEqualStrings("Database", flow.nodes[0].label);
+    try testing.expect(flow.nodes[1].shape == .diamond);
+    try testing.expectEqualStrings("Decision, now", flow.nodes[1].label);
+    try testing.expect(parseText("graph TD\nA@{ shape: unknown }\n") == null);
+}
+
+test "last explicit node definition wins" {
+    const flow = parseText("graph TD\nA[first]\nA\nA[second]\n").?;
     try testing.expectEqual(@as(usize, 1), flow.node_count);
-    try testing.expectEqualStrings("first", flow.nodeList()[0].label);
+    try testing.expectEqualStrings("second", flow.nodeList()[0].label);
 }
 
 test "edges carry style and labels across chains" {
@@ -870,10 +1066,10 @@ test "edges carry style and labels across chains" {
     ).?;
     const edges = flow.edgeList();
     try testing.expectEqual(@as(usize, 6), edges.len);
-    try testing.expect(edges[0].style == .solid and edges[0].arrow);
-    try testing.expect(edges[1].style == .solid and !edges[1].arrow);
-    try testing.expect(edges[2].style == .dotted and edges[2].arrow);
-    try testing.expect(edges[3].style == .thick and edges[3].arrow);
+    try testing.expect(edges[0].style == .solid and edges[0].dst_marker == .arrow);
+    try testing.expect(edges[1].style == .solid and edges[1].dst_marker == .none);
+    try testing.expect(edges[2].style == .dotted and edges[2].dst_marker == .arrow);
+    try testing.expect(edges[3].style == .thick and edges[3].dst_marker == .arrow);
     try testing.expectEqualStrings("take", edges[4].label.?);
     try testing.expectEqualStrings("leave", edges[5].label.?);
     try testing.expectEqualStrings("A", edges[4].src);
@@ -892,15 +1088,59 @@ test "spaced edge labels" {
     const edges = flow.edgeList();
     try testing.expectEqual(@as(usize, 6), edges.len);
     try testing.expectEqualStrings("Link text", edges[0].label.?);
-    try testing.expect(edges[0].style == .solid and edges[0].arrow);
+    try testing.expect(edges[0].style == .solid and edges[0].dst_marker == .arrow);
     try testing.expectEqualStrings("plain", edges[1].label.?);
-    try testing.expect(edges[1].style == .solid and !edges[1].arrow);
+    try testing.expect(edges[1].style == .solid and edges[1].dst_marker == .none);
     try testing.expectEqualStrings("dotted", edges[2].label.?);
-    try testing.expect(edges[2].style == .dotted and edges[2].arrow);
+    try testing.expect(edges[2].style == .dotted and edges[2].dst_marker == .arrow);
     try testing.expectEqualStrings("thick", edges[3].label.?);
-    try testing.expect(edges[3].style == .thick and edges[3].arrow);
+    try testing.expect(edges[3].style == .thick and edges[3].dst_marker == .arrow);
     try testing.expectEqualStrings("one", edges[4].label.?);
     try testing.expectEqualStrings("two", edges[5].label.?);
+}
+
+test "multi-node links expand into edges" {
+    const flow = parseText(
+        "graph TD\n" ++
+            "A & B --> C & D\n" ++
+            "C --> E & F --> G\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 7), flow.node_count);
+    try testing.expectEqual(@as(usize, 8), flow.edge_count);
+    try testing.expectEqualStrings("A", flow.edges[0].src);
+    try testing.expectEqualStrings("C", flow.edges[0].dst);
+    try testing.expectEqualStrings("D", flow.edges[1].dst);
+    try testing.expectEqualStrings("B", flow.edges[2].src);
+    try testing.expectEqualStrings("E", flow.edges[6].src);
+    try testing.expectEqualStrings("G", flow.edges[7].dst);
+}
+
+test "flowchart endpoint markers and invisible links" {
+    const flow = parseText(
+        "graph LR\n" ++
+            "A--oB\n" ++
+            "B--xC\n" ++
+            "C<-->D\n" ++
+            "D o--o E\n" ++
+            "E x--x F\n" ++
+            "F~~~G\n",
+    ).?;
+    const edges = flow.edgeList();
+    try testing.expectEqual(@as(usize, 6), edges.len);
+    try testing.expect(edges[0].dst_marker == .circle);
+    try testing.expect(edges[1].dst_marker == .cross);
+    try testing.expect(edges[2].src_marker == .arrow and edges[2].dst_marker == .arrow);
+    try testing.expect(edges[3].src_marker == .circle and edges[3].dst_marker == .circle);
+    try testing.expect(edges[4].src_marker == .cross and edges[4].dst_marker == .cross);
+    try testing.expect(edges[5].style == .invisible);
+
+    const suffix = parseText("graph LR\nfoo--oB\nA---oC\n").?;
+    try testing.expectEqualStrings("foo", suffix.edges[0].src);
+    try testing.expect(suffix.edges[0].src_marker == .none);
+    try testing.expect(suffix.edges[0].dst_marker == .circle);
+    try testing.expectEqualStrings("A", suffix.edges[1].src);
+    try testing.expectEqualStrings("C", suffix.edges[1].dst);
+    try testing.expect(suffix.edges[1].dst_marker == .circle);
 }
 
 test "spaces around arrows" {
@@ -956,6 +1196,8 @@ test "unsupported flowchart statements are rejected" {
         "graph TD\nA-->B\nsubgraph inner\nB-->C\nend\n",
         "graph TD\nA-->B\nstyle A fill:red\n",
         "graph TD\nA-->B\nnot a node !!!\n",
+        "graph TD\nA[\"`Markdown`\"]\n",
+        "graph TD\nA-..->B\n",
         "%%{init: {'theme': 'dark'}}%%\ngraph TD\nA-->B\n",
     }) |text| {
         try testing.expect(parseText(text) == null);
@@ -965,6 +1207,9 @@ test "unsupported flowchart statements are rejected" {
 test "over-cap diagrams degrade" {
     const many_edges = parseText("graph TD\n" ++ ("A-->B\n" ** 200)).?;
     try testing.expect(many_edges.degraded);
+
+    const many_group = parseText("graph TD\n" ++ ("A & " ** 64) ++ "A\n").?;
+    try testing.expect(many_group.degraded);
 
     var buf: [8192]u8 = undefined;
     @memcpy(buf[0..9], "graph TD\n");
@@ -1049,6 +1294,19 @@ test "sequence arrows" {
     try testing.expectEqual(@as(usize, 8), messages[8].pos);
 }
 
+test "sequence bidirectional arrows" {
+    const seq = parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "A<<->>B: solid\n" ++
+            "B<<-->>A: dotted\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 2), seq.message_count);
+    try testing.expect(seq.messages[0].kind == .bidirectional);
+    try testing.expect(seq.messages[0].style == .solid);
+    try testing.expect(seq.messages[1].kind == .bidirectional);
+    try testing.expect(seq.messages[1].style == .dotted);
+}
+
 test "sequence message text splits on first colon" {
     const seq = parseSequenceBlockText("sequenceDiagram\nA->>B: see http://x\n").?;
     try testing.expectEqualStrings("see http://x", seq.messages[0].text);
@@ -1106,9 +1364,31 @@ test "sequence fragments" {
     try testing.expectEqual(@as(usize, 4), seq.fragments[2].end);
 }
 
+test "critical break and rect sequence fragments" {
+    const seq = parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "critical Connect\n" ++
+            "A->>B: try\n" ++
+            "option Timeout\n" ++
+            "A->>B: retry\n" ++
+            "end\n" ++
+            "break Failed\n" ++
+            "A->>B: stop\n" ++
+            "end\n" ++
+            "rect rgb(10, 20, 30)\n" ++
+            "B->>A: done\n" ++
+            "end\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 3), seq.fragment_count);
+    try testing.expect(seq.fragments[0].op == .critical);
+    try testing.expectEqual(@as(usize, 1), seq.fragments[0].div_count);
+    try testing.expectEqualStrings("option", seq.fragments[0].divs[0].head);
+    try testing.expect(seq.fragments[1].op == .@"break");
+    try testing.expect(seq.fragments[2].op == .rect);
+}
+
 test "unsupported sequence statements are rejected" {
     for ([_][]const u8{
-        "sequenceDiagram\nA->>B: before\ncritical important\nB->>A: inside\nend\n",
         "sequenceDiagram\nA->>B: before\nbox Group\nparticipant C\nend\n",
         "sequenceDiagram\nA->>B: before\nnot sequence syntax\n",
         "sequenceDiagram\nloop forever\nA->>B: again\n",
