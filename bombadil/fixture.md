@@ -45,12 +45,16 @@ pub fn main() void {
 ## Diagram
 
 ```mermaid
-graph TD
+flowchart LR
 subgraph process [Process]
-A["x"] --> B[(database)]
+direction TB
+A["x"] e1@---> B["`**database**`"]
 end
-B --> C{choice}
-C <--> D(((done)))
+subgraph result [Result]
+C{choice} <--> D(((done))):::terminal
+end
+process --> result
+classDef terminal fill:red
 ```
 
 ```mermaid

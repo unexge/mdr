@@ -199,7 +199,7 @@ test "mermaid flowcharts render as diagrams" {
 test "unsupported mermaid syntax falls back to the card" {
     const diagram: Document.Element.CodeBlock = .{
         .info = .{ .mermaid = "mermaid" },
-        .content = "graph TD\nsubgraph inner\ndirection LR\nA-->B\nend\n",
+        .content = "graph TD\nA-->B\nclick A callback\nB-->C\nC-->D\n",
     };
     try testing.expectEqual(@as(usize, 6), layout(null, diagram, 0, 0, 40));
 

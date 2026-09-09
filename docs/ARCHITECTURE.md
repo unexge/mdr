@@ -55,8 +55,9 @@ Mermaid fences dispatch twice: `Mermaid.parseBlock` (flowcharts) then
 with bounded tables. They reject the whole diagram when a statement is
 unsupported instead of rendering a partial result. Anything unsupported,
 over capacity, cyclic, or wider than the viewport degrades back to the code
-card instead of failing. Flowchart subgraphs are bounded cluster overlays;
-layouts with ambiguous or overlapping clusters also fall back. Sequence
+card instead of failing. Ordinary flowcharts use ranked layout, while local
+subgraph directions and group edges use a bounded recursive hierarchy layout.
+Ambiguous flat cluster overlays still fall back. Sequence
 participant groups, lifecycle positions, and activation stacks are fixed
 parser state from which header and lifeline rows are derived. Sequence numbers
 use bounded fixed-point hundredths. Message endpoints and central connections

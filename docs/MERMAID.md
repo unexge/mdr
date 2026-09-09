@@ -13,22 +13,22 @@ Supported:
 - Plain and quoted node labels
 - Rectangle, rounded, stadium, subroutine, cylinder, circle, asymmetric,
   diamond, hexagon, parallelogram, trapezoid, and double-circle nodes
-- `@{ shape: ..., label: ... }` for `rect`, `rounded`, `stadium`, `subproc`,
-  `subroutine`, `cyl`, `cylinder`, `circle`, `odd`, `diamond`, `diam`, `hex`,
-  `hexagon`, `lean-r`, `lean-l`, `trap-b`, `trap-t`, and `dbl-circ`
+- Built-in non-media `@{ shape: ..., label: ... }` shapes mapped to the
+  nearest terminal geometry
 - Solid, dotted, thick, invisible, circle, cross, and bidirectional links
-- Link labels, chained links, and `A & B --> C & D` multi-node links
-- Labeled and nested subgraphs whose direction matches the parent flowchart
+- Link labels, edge IDs, requested minimum lengths, chained links, and
+  `A & B --> C & D` multi-node links
+- Labeled and nested subgraphs with local directions and edges to subgraph IDs
+- Single-line Markdown labels, class assignments, style declarations, and
+  semicolon-separated statements; terminal rendering uses the active theme
 - `%%` comments
 
 Falls back:
 
-- Subgraph direction overrides and edges targeting a subgraph ID
-- Subgraph layouts whose boundaries would overlap unrelated nodes or groups
-- Unlisted expanded shapes, icons, and image nodes
-- Edge IDs, animation, and requested minimum link lengths
-- Styles, classes, click actions, and configuration directives
-- Markdown strings and semicolon-separated statements
+- Flat cluster layouts whose boundaries would overlap unrelated nodes or groups
+- Icons and image nodes
+- Edge animation, click actions, and configuration directives
+- Multiline Markdown labels
 
 ## Sequence diagrams
 

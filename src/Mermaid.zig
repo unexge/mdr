@@ -35,6 +35,7 @@ pub const Node = struct {
     label: []const u8,
     shape: Shape,
     subgraph: ?usize = null,
+    order: usize = 0,
 };
 
 pub const Subgraph = struct {
@@ -42,16 +43,19 @@ pub const Subgraph = struct {
     label: []const u8,
     parent: ?usize,
     level: usize,
+    order: usize,
     direction: ?Direction = null,
 };
 
 pub const Edge = struct {
+    id: ?[]const u8,
     src: []const u8,
     dst: []const u8,
     label: ?[]const u8,
     style: EdgeStyle,
     src_marker: EdgeMarker,
     dst_marker: EdgeMarker,
+    min_length: usize,
 };
 
 pub const Flowchart = struct {
@@ -74,6 +78,25 @@ pub const Flowchart = struct {
 
     pub fn subgraphList(self: *const Flowchart) []const Subgraph {
         return self.subgraphs[0..self.subgraph_count];
+    }
+
+    pub fn subgraphIndex(self: *const Flowchart, id: []const u8) ?usize {
+        for (self.subgraphList(), 0..) |subgraph, index| {
+            if (mem.eql(u8, subgraph.id, id)) return index;
+        }
+        return null;
+    }
+
+    pub fn needsHierarchicalLayout(self: *const Flowchart) bool {
+        for (self.subgraphList()) |subgraph| {
+            if (subgraph.direction) |direction| {
+                if (direction != self.direction) return true;
+            }
+        }
+        for (self.edgeList()) |edge| {
+            if (self.subgraphIndex(edge.src) != null or self.subgraphIndex(edge.dst) != null) return true;
+        }
+        return false;
     }
 
     pub fn nodeInSubgraph(self: *const Flowchart, node: *const Node, subgraph: usize) bool {
@@ -126,8 +149,44 @@ const Parser = struct {
     supported: bool = true,
     subgraph_stack: [max_subgraph_depth]usize = undefined,
     subgraph_stack_len: usize = 0,
+    next_order: usize = 0,
 
     fn feed(self: *Parser, raw: []const u8) void {
+        const trimmed = mem.trim(u8, raw, " \t\r");
+        if (isComment(trimmed)) {
+            self.feedStatement(trimmed);
+            return;
+        }
+        var start: usize = 0;
+        var depth: usize = 0;
+        var quoted = false;
+        var piped = false;
+        var i: usize = 0;
+        while (i <= raw.len) : (i += 1) {
+            const at_end = i == raw.len;
+            if (!at_end) {
+                switch (raw[i]) {
+                    '"' => quoted = !quoted,
+                    '[', '(', '{' => if (!quoted) {
+                        depth += 1;
+                    },
+                    ']', ')', '}' => if (!quoted) {
+                        depth -|= 1;
+                    },
+                    '|' => if (!quoted and depth == 0) {
+                        piped = !piped;
+                    },
+                    else => {},
+                }
+            }
+            if (!at_end and (raw[i] != ';' or quoted or piped or depth > 0)) continue;
+            self.feedStatement(raw[start..i]);
+            if (!self.supported or self.flow.degraded) return;
+            start = i + 1;
+        }
+    }
+
+    fn feedStatement(self: *Parser, raw: []const u8) void {
         if (!self.supported or self.flow.degraded) return;
         const line = mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or isComment(line)) return;
@@ -155,11 +214,12 @@ const Parser = struct {
             self.setSubgraphDirection(line["direction".len..]);
             return;
         }
-        for ([_][]const u8{ "style", "classDef", "class", "click", "linkStyle" }) |keyword| {
-            if (isKeywordLine(line, keyword)) {
-                self.supported = false;
-                return;
-            }
+        for ([_][]const u8{ "style", "classDef", "class", "linkStyle" }) |keyword| {
+            if (isKeywordLine(line, keyword)) return;
+        }
+        if (isKeywordLine(line, "click")) {
+            self.supported = false;
+            return;
         }
         if (!self.feedBody(line)) self.supported = false;
     }
@@ -170,13 +230,7 @@ const Parser = struct {
             self.supported = false;
             return;
         }
-        for (self.flow.subgraphList(), 0..) |subgraph, index| {
-            if (subgraph.direction) |direction| {
-                if (direction != self.flow.direction) {
-                    self.supported = false;
-                    return;
-                }
-            }
+        for (self.flow.subgraphList(), 0..) |_, index| {
             var has_node = false;
             for (self.flow.nodeList()) |*node| {
                 if (self.flow.nodeInSubgraph(node, index)) {
@@ -187,12 +241,6 @@ const Parser = struct {
             if (!has_node) {
                 self.supported = false;
                 return;
-            }
-            for (self.flow.edgeList()) |edge| {
-                if (mem.eql(u8, edge.src, subgraph.id) or mem.eql(u8, edge.dst, subgraph.id)) {
-                    self.supported = false;
-                    return;
-                }
             }
         }
     }
@@ -206,11 +254,24 @@ const Parser = struct {
             self.supported = false;
             return;
         };
-        for (self.flow.subgraphList()) |subgraph| {
-            if (mem.eql(u8, subgraph.id, declaration.id)) {
+        if (self.flow.subgraphIndex(declaration.id) != null) {
+            self.supported = false;
+            return;
+        }
+        var recovered_order: ?usize = null;
+        var node_index: usize = 0;
+        while (node_index < self.flow.node_count) : (node_index += 1) {
+            const node = self.flow.nodes[node_index];
+            if (!mem.eql(u8, node.id, declaration.id)) continue;
+            if (node.shape != .rect or node.label.ptr != node.id.ptr or node.label.len != node.id.len) {
                 self.supported = false;
                 return;
             }
+            recovered_order = node.order;
+            var shift = node_index;
+            while (shift + 1 < self.flow.node_count) : (shift += 1) self.flow.nodes[shift] = self.flow.nodes[shift + 1];
+            self.flow.node_count -= 1;
+            break;
         }
         const index = self.flow.subgraph_count;
         self.flow.subgraphs[index] = .{
@@ -218,7 +279,9 @@ const Parser = struct {
             .label = declaration.label,
             .parent = self.currentSubgraph(),
             .level = self.subgraph_stack_len,
+            .order = recovered_order orelse self.next_order,
         };
+        if (recovered_order == null) self.next_order += 1;
         self.flow.subgraph_count += 1;
         self.subgraph_stack[self.subgraph_stack_len] = index;
         self.subgraph_stack_len += 1;
@@ -302,6 +365,7 @@ const Parser = struct {
 
     fn intern(self: *Parser, parsed: Node) ?[]const u8 {
         var node = parsed;
+        if (self.flow.subgraphIndex(node.id) != null) return node.id;
         const current_subgraph = self.currentSubgraph();
         const explicit = node.shape != .rect or node.label.ptr != node.id.ptr or node.label.len != node.id.len;
         for (self.flow.nodes[0..self.flow.node_count]) |*existing| {
@@ -310,7 +374,11 @@ const Parser = struct {
                 current_subgraph
             else
                 existing.subgraph orelse current_subgraph;
-            if (explicit) existing.* = node;
+            if (explicit) {
+                const order = existing.order;
+                existing.* = node;
+                existing.order = order;
+            }
             existing.subgraph = subgraph;
             return existing.id;
         }
@@ -319,6 +387,8 @@ const Parser = struct {
             return null;
         }
         node.subgraph = current_subgraph;
+        node.order = self.next_order;
+        self.next_order += 1;
         self.flow.nodes[self.flow.node_count] = node;
         self.flow.node_count += 1;
         return node.id;
@@ -326,17 +396,33 @@ const Parser = struct {
 
     fn addEdge(self: *Parser, src: []const u8, dst: []const u8, op: Op) void {
         if (self.flow.degraded) return;
+        if (op.min_length >= max_nodes) {
+            self.flow.degraded = true;
+            return;
+        }
         if (self.flow.edge_count >= max_edges) {
             self.flow.degraded = true;
             return;
         }
+        if (op.id) |id| {
+            for (self.flow.edgeList()) |edge| {
+                if (edge.id) |existing| {
+                    if (mem.eql(u8, id, existing)) {
+                        self.supported = false;
+                        return;
+                    }
+                }
+            }
+        }
         self.flow.edges[self.flow.edge_count] = .{
+            .id = op.id,
             .src = src,
             .dst = dst,
             .label = op.label,
             .style = op.style,
             .src_marker = op.src_marker,
             .dst_marker = op.dst_marker,
+            .min_length = op.min_length,
         };
         self.flow.edge_count += 1;
     }
@@ -382,25 +468,51 @@ fn parseSubgraphDeclaration(raw: []const u8) ?SubgraphDeclaration {
     const declaration = mem.trim(u8, raw, " \t\r");
     if (declaration.len == 0) return null;
     var id_end: usize = 0;
-    while (id_end < declaration.len and isIdChar(declaration[id_end])) : (id_end += 1) {}
+    while (id_end < declaration.len and isFlowIdChar(declaration[id_end])) : (id_end += 1) {}
     if (id_end > 0) {
         const tail = mem.trim(u8, declaration[id_end..], " \t\r");
         if (tail.len >= 2 and tail[0] == '[' and tail[tail.len - 1] == ']') {
-            const label = metadataValue(tail[1 .. tail.len - 1]) orelse return null;
-            if (isMarkdownLabel(label)) return null;
+            const label = normalizeLabel(metadataValue(tail[1 .. tail.len - 1]) orelse return null);
             return .{ .id = declaration[0..id_end], .label = label };
         }
         if (tail.len > 0 and (tail[0] == '[' or tail[tail.len - 1] == ']')) return null;
     }
-    const label = metadataValue(declaration) orelse return null;
-    if (isMarkdownLabel(label)) return null;
+    const label = normalizeLabel(metadataValue(declaration) orelse return null);
     return .{ .id = label, .label = label };
 }
 
-fn parseNode(seg: []const u8) ?Node {
+fn stripNodeClass(seg: []const u8) ?[]const u8 {
+    var depth: usize = 0;
+    var quoted = false;
+    var i: usize = 0;
+    while (i + 2 < seg.len) : (i += 1) {
+        switch (seg[i]) {
+            '"' => quoted = !quoted,
+            '[', '(', '{' => if (!quoted) {
+                depth += 1;
+            },
+            ']', ')', '}' => if (!quoted) {
+                depth -|= 1;
+            },
+            else => {},
+        }
+        if (!quoted and depth == 0 and mem.eql(u8, seg[i .. i + 3], ":::")) {
+            const class = mem.trim(u8, seg[i + 3 ..], " \t\r");
+            if (class.len == 0) return null;
+            for (class) |char| {
+                if (!isIdChar(char) and char != '-') return null;
+            }
+            return mem.trim(u8, seg[0..i], " \t\r");
+        }
+    }
+    return seg;
+}
+
+fn parseNode(raw: []const u8) ?Node {
+    const seg = stripNodeClass(raw) orelse return null;
     if (seg.len == 0) return null;
     var id_len: usize = 0;
-    while (id_len < seg.len and isIdChar(seg[id_len])) : (id_len += 1) {}
+    while (id_len < seg.len and isFlowIdChar(seg[id_len])) : (id_len += 1) {}
     if (id_len == 0) return null;
     const id = seg[0..id_len];
     const rest = mem.trim(u8, seg[id_len..], " \t\r");
@@ -466,8 +578,7 @@ fn parseNodeMetadata(id: []const u8, raw: []const u8) ?Node {
         start = i + 1;
     }
     const node_shape = shape orelse return null;
-    const node_label = label orelse id;
-    if (isMarkdownLabel(node_label)) return null;
+    const node_label = normalizeLabel(label orelse id);
     return .{ .id = id, .label = if (node_label.len == 0) id else node_label, .shape = node_shape };
 }
 
@@ -499,6 +610,128 @@ fn parseShapeName(name: []const u8) ?Shape {
         .{ .name = "trap-b", .shape = .trapezoid },
         .{ .name = "trap-t", .shape = .trapezoid },
         .{ .name = "dbl-circ", .shape = .double_circle },
+        .{ .name = "datastore", .shape = .rect },
+        .{ .name = "text", .shape = .rect },
+        .{ .name = "notch-rect", .shape = .rect },
+        .{ .name = "lin-rect", .shape = .rect },
+        .{ .name = "sm-circ", .shape = .circle },
+        .{ .name = "framed-circle", .shape = .double_circle },
+        .{ .name = "fork", .shape = .rect },
+        .{ .name = "hourglass", .shape = .diamond },
+        .{ .name = "comment", .shape = .rect },
+        .{ .name = "brace-r", .shape = .rect },
+        .{ .name = "braces", .shape = .rect },
+        .{ .name = "bolt", .shape = .rect },
+        .{ .name = "doc", .shape = .rect },
+        .{ .name = "delay", .shape = .rounded },
+        .{ .name = "das", .shape = .cylinder },
+        .{ .name = "lin-cyl", .shape = .cylinder },
+        .{ .name = "curv-trap", .shape = .trapezoid },
+        .{ .name = "div-rect", .shape = .rect },
+        .{ .name = "tri", .shape = .diamond },
+        .{ .name = "win-pane", .shape = .rect },
+        .{ .name = "f-circ", .shape = .circle },
+        .{ .name = "lin-doc", .shape = .rect },
+        .{ .name = "notch-pent", .shape = .hexagon },
+        .{ .name = "flip-tri", .shape = .diamond },
+        .{ .name = "sl-rect", .shape = .parallelogram },
+        .{ .name = "docs", .shape = .rect },
+        .{ .name = "processes", .shape = .rect },
+        .{ .name = "procs", .shape = .rect },
+        .{ .name = "flag", .shape = .rect },
+        .{ .name = "bow-rect", .shape = .rect },
+        .{ .name = "cross-circ", .shape = .circle },
+        .{ .name = "tag-doc", .shape = .rect },
+        .{ .name = "tag-rect", .shape = .rect },
+        .{ .name = "proc", .shape = .rect },
+        .{ .name = "process", .shape = .rect },
+        .{ .name = "rectangle", .shape = .rect },
+        .{ .name = "event", .shape = .rounded },
+        .{ .name = "terminal", .shape = .stadium },
+        .{ .name = "pill", .shape = .stadium },
+        .{ .name = "fr-rect", .shape = .subroutine },
+        .{ .name = "subprocess", .shape = .subroutine },
+        .{ .name = "framed-rectangle", .shape = .subroutine },
+        .{ .name = "db", .shape = .cylinder },
+        .{ .name = "database", .shape = .cylinder },
+        .{ .name = "data-store", .shape = .rect },
+        .{ .name = "folder", .shape = .rect },
+        .{ .name = "directory", .shape = .rect },
+        .{ .name = "bucket", .shape = .cylinder },
+        .{ .name = "console", .shape = .rect },
+        .{ .name = "browser", .shape = .rect },
+        .{ .name = "person", .shape = .rounded },
+        .{ .name = "bang", .shape = .circle },
+        .{ .name = "cloud", .shape = .rounded },
+        .{ .name = "circ", .shape = .circle },
+        .{ .name = "decision", .shape = .diamond },
+        .{ .name = "question", .shape = .diamond },
+        .{ .name = "prepare", .shape = .hexagon },
+        .{ .name = "lean-right", .shape = .parallelogram },
+        .{ .name = "in-out", .shape = .parallelogram },
+        .{ .name = "lean-left", .shape = .parallelogram },
+        .{ .name = "out-in", .shape = .parallelogram },
+        .{ .name = "priority", .shape = .trapezoid },
+        .{ .name = "trapezoid-bottom", .shape = .trapezoid },
+        .{ .name = "trapezoid", .shape = .trapezoid },
+        .{ .name = "manual", .shape = .trapezoid },
+        .{ .name = "trapezoid-top", .shape = .trapezoid },
+        .{ .name = "inv-trapezoid", .shape = .trapezoid },
+        .{ .name = "double-circle", .shape = .double_circle },
+        .{ .name = "card", .shape = .rect },
+        .{ .name = "notched-rectangle", .shape = .rect },
+        .{ .name = "lined-rectangle", .shape = .rect },
+        .{ .name = "lined-process", .shape = .rect },
+        .{ .name = "lin-proc", .shape = .rect },
+        .{ .name = "shaded-process", .shape = .rect },
+        .{ .name = "start", .shape = .circle },
+        .{ .name = "small-circle", .shape = .circle },
+        .{ .name = "fr-circ", .shape = .double_circle },
+        .{ .name = "stop", .shape = .double_circle },
+        .{ .name = "join", .shape = .rect },
+        .{ .name = "collate", .shape = .diamond },
+        .{ .name = "brace", .shape = .rect },
+        .{ .name = "brace-l", .shape = .rect },
+        .{ .name = "com-link", .shape = .rect },
+        .{ .name = "lightning-bolt", .shape = .rect },
+        .{ .name = "document", .shape = .rect },
+        .{ .name = "half-rounded-rectangle", .shape = .rounded },
+        .{ .name = "h-cyl", .shape = .cylinder },
+        .{ .name = "horizontal-cylinder", .shape = .cylinder },
+        .{ .name = "disk", .shape = .cylinder },
+        .{ .name = "lined-cylinder", .shape = .cylinder },
+        .{ .name = "curved-trapezoid", .shape = .trapezoid },
+        .{ .name = "display", .shape = .trapezoid },
+        .{ .name = "div-proc", .shape = .rect },
+        .{ .name = "divided-rectangle", .shape = .rect },
+        .{ .name = "divided-process", .shape = .rect },
+        .{ .name = "extract", .shape = .diamond },
+        .{ .name = "triangle", .shape = .diamond },
+        .{ .name = "internal-storage", .shape = .rect },
+        .{ .name = "window-pane", .shape = .rect },
+        .{ .name = "junction", .shape = .circle },
+        .{ .name = "filled-circle", .shape = .circle },
+        .{ .name = "loop-limit", .shape = .hexagon },
+        .{ .name = "notched-pentagon", .shape = .hexagon },
+        .{ .name = "manual-file", .shape = .diamond },
+        .{ .name = "flipped-triangle", .shape = .diamond },
+        .{ .name = "manual-input", .shape = .parallelogram },
+        .{ .name = "sloped-rectangle", .shape = .parallelogram },
+        .{ .name = "documents", .shape = .rect },
+        .{ .name = "st-doc", .shape = .rect },
+        .{ .name = "stacked-document", .shape = .rect },
+        .{ .name = "st-rect", .shape = .rect },
+        .{ .name = "stacked-rectangle", .shape = .rect },
+        .{ .name = "stored-data", .shape = .rect },
+        .{ .name = "bow-tie-rectangle", .shape = .rect },
+        .{ .name = "summary", .shape = .circle },
+        .{ .name = "crossed-circle", .shape = .circle },
+        .{ .name = "tagged-document", .shape = .rect },
+        .{ .name = "tagged-rectangle", .shape = .rect },
+        .{ .name = "tag-proc", .shape = .rect },
+        .{ .name = "tagged-process", .shape = .rect },
+        .{ .name = "paper-tape", .shape = .rect },
+        .{ .name = "lined-document", .shape = .rect },
     };
     for (shapes) |entry| {
         if (mem.eql(u8, name, entry.name)) return entry.shape;
@@ -507,17 +740,19 @@ fn parseShapeName(name: []const u8) ?Shape {
 }
 
 fn shaped(id: []const u8, raw_label: []const u8, shape: Shape) ?Node {
-    const trimmed = mem.trim(u8, raw_label, " \t\r");
-    const label = if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
-        trimmed[1 .. trimmed.len - 1]
-    else
-        trimmed;
-    if (isMarkdownLabel(label)) return null;
+    const label = normalizeLabel(raw_label);
     return .{ .id = id, .label = if (label.len == 0) id else label, .shape = shape };
 }
 
-fn isMarkdownLabel(label: []const u8) bool {
-    return label.len >= 2 and label[0] == '`' and label[label.len - 1] == '`';
+fn normalizeLabel(raw: []const u8) []const u8 {
+    var label = mem.trim(u8, raw, " \t\r");
+    if (label.len >= 2 and label[0] == '"' and label[label.len - 1] == '"') label = label[1 .. label.len - 1];
+    if (label.len >= 2 and label[0] == '`' and label[label.len - 1] == '`') label = label[1 .. label.len - 1];
+    return label;
+}
+
+fn isFlowIdChar(c: u8) bool {
+    return isIdChar(c) or c == '-';
 }
 
 fn isIdChar(c: u8) bool {
@@ -525,9 +760,11 @@ fn isIdChar(c: u8) bool {
 }
 
 const Op = struct {
+    id: ?[]const u8 = null,
     style: EdgeStyle,
     src_marker: EdgeMarker,
     dst_marker: EdgeMarker,
+    min_length: usize = 1,
     label: ?[]const u8,
 };
 
@@ -564,15 +801,33 @@ fn findOp(line: []const u8, from: usize) ?FoundOp {
 
 fn matchOp(line: []const u8, i: usize) ?FoundOp {
     const rest = line[i..];
-    if (matchToken(rest)) |token| return opAt(line, i, token);
-    if (rest.len <= 2) return null;
-    if (line[i] == '-') {
-        if (rest[1] == '-' and rest[2] == '|') return opAt(line, i, .{ .len = 2, .style = .solid, .dst_marker = .arrow });
-        if (rest[1] == '-' or rest[1] == '.') return spacedOp(line, i);
-    } else if (line[i] == '=' and rest[1] == '=') {
-        return spacedOp(line, i);
-    }
-    return null;
+    var found: ?FoundOp = if (matchToken(rest)) |token|
+        opAt(line, i, token)
+    else if (rest.len <= 2)
+        null
+    else if (line[i] == '-')
+        if (rest[1] == '-' and rest[2] == '|')
+            opAt(line, i, .{ .len = 2, .style = .solid, .dst_marker = .arrow })
+        else if (rest[1] == '-' or rest[1] == '.')
+            spacedOp(line, i)
+        else
+            null
+    else if (line[i] == '=' and rest[1] == '=')
+        spacedOp(line, i)
+    else
+        null;
+    if (found) |*operator| attachEdgeId(line, i, operator);
+    return found;
+}
+
+fn attachEdgeId(line: []const u8, operator_at: usize, found: *FoundOp) void {
+    if (operator_at == 0 or line[operator_at - 1] != '@') return;
+    const end = operator_at - 1;
+    var start = end;
+    while (start > 0 and isFlowIdChar(line[start - 1])) start -= 1;
+    if (start == end or (start > 0 and line[start - 1] != ' ' and line[start - 1] != '\t')) return;
+    found.at = start;
+    found.op.id = line[start..end];
 }
 
 const Token = struct {
@@ -580,24 +835,65 @@ const Token = struct {
     style: EdgeStyle,
     src_marker: EdgeMarker = .none,
     dst_marker: EdgeMarker = .none,
+    min_length: usize = 1,
 };
 
 fn matchToken(rest: []const u8) ?Token {
     if (mem.startsWith(u8, rest, "<-->")) return .{ .len = 4, .style = .solid, .src_marker = .arrow, .dst_marker = .arrow };
     if (mem.startsWith(u8, rest, "o--o")) return .{ .len = 4, .style = .solid, .src_marker = .circle, .dst_marker = .circle };
     if (mem.startsWith(u8, rest, "x--x")) return .{ .len = 4, .style = .solid, .src_marker = .cross, .dst_marker = .cross };
-    if (mem.startsWith(u8, rest, "-.->")) return .{ .len = 4, .style = .dotted, .dst_marker = .arrow };
-    if (mem.startsWith(u8, rest, "-->")) return .{ .len = 3, .style = .solid, .dst_marker = .arrow };
-    if (mem.startsWith(u8, rest, "---o")) return .{ .len = 4, .style = .solid, .dst_marker = .circle };
-    if (mem.startsWith(u8, rest, "---x")) return .{ .len = 4, .style = .solid, .dst_marker = .cross };
-    if (mem.startsWith(u8, rest, "--o")) return .{ .len = 3, .style = .solid, .dst_marker = .circle };
-    if (mem.startsWith(u8, rest, "--x")) return .{ .len = 3, .style = .solid, .dst_marker = .cross };
-    if (mem.startsWith(u8, rest, "---")) return .{ .len = 3, .style = .solid };
-    if (mem.startsWith(u8, rest, "-.-")) return .{ .len = 3, .style = .dotted };
-    if (mem.startsWith(u8, rest, "==>")) return .{ .len = 3, .style = .thick, .dst_marker = .arrow };
-    if (mem.startsWith(u8, rest, "===")) return .{ .len = 3, .style = .thick };
-    if (mem.startsWith(u8, rest, "~~~")) return .{ .len = 3, .style = .invisible };
+    if (rest.len == 0) return null;
+    return switch (rest[0]) {
+        '-' => matchDashToken(rest),
+        '=' => matchThickToken(rest),
+        '~' => matchInvisibleToken(rest),
+        else => null,
+    };
+}
+
+fn matchDashToken(rest: []const u8) ?Token {
+    if (rest.len > 2 and rest[1] == '.') {
+        var dots: usize = 1;
+        while (1 + dots < rest.len and rest[1 + dots] == '.') dots += 1;
+        const close = 1 + dots;
+        if (close >= rest.len or rest[close] != '-') return null;
+        const arrow = close + 1 < rest.len and rest[close + 1] == '>';
+        return .{
+            .len = close + 1 + @intFromBool(arrow),
+            .style = .dotted,
+            .dst_marker = if (arrow) .arrow else .none,
+            .min_length = dots,
+        };
+    }
+    var count: usize = 0;
+    while (count < rest.len and rest[count] == '-') count += 1;
+    if (count >= 2 and count < rest.len and rest[count] == '>')
+        return .{ .len = count + 1, .style = .solid, .dst_marker = .arrow, .min_length = count - 1 };
+    if (count >= 2 and count < rest.len and (rest[count] == 'o' or rest[count] == 'x'))
+        return .{
+            .len = count + 1,
+            .style = .solid,
+            .dst_marker = if (rest[count] == 'o') .circle else .cross,
+            .min_length = count - 1,
+        };
+    if (count >= 3) return .{ .len = count, .style = .solid, .min_length = count - 2 };
     return null;
+}
+
+fn matchThickToken(rest: []const u8) ?Token {
+    var count: usize = 0;
+    while (count < rest.len and rest[count] == '=') count += 1;
+    if (count >= 2 and count < rest.len and rest[count] == '>')
+        return .{ .len = count + 1, .style = .thick, .dst_marker = .arrow, .min_length = count - 1 };
+    if (count >= 3) return .{ .len = count, .style = .thick, .min_length = count - 2 };
+    return null;
+}
+
+fn matchInvisibleToken(rest: []const u8) ?Token {
+    var count: usize = 0;
+    while (count < rest.len and rest[count] == '~') count += 1;
+    if (count < 3) return null;
+    return .{ .len = count, .style = .invisible, .min_length = count - 2 };
 }
 
 fn spacedOp(line: []const u8, at: usize) ?FoundOp {
@@ -615,7 +911,7 @@ fn spacedOp(line: []const u8, at: usize) ?FoundOp {
 }
 
 fn spacedAt(line: []const u8, at: usize, close: usize, token: Token) FoundOp {
-    const raw = mem.trim(u8, line[at + 2 .. close], " \t\r");
+    const raw = normalizeLabel(line[at + 2 .. close]);
     var found = opAt(line, close, token);
     found.at = at;
     if (found.op.label == null and raw.len > 0) found.op.label = raw;
@@ -627,7 +923,7 @@ fn opAt(line: []const u8, at: usize, token: Token) FoundOp {
     var label: ?[]const u8 = null;
     if (after < line.len and line[after] == '|') {
         if (mem.indexOfScalarPos(u8, line, after + 1, '|')) |close| {
-            label = mem.trim(u8, line[after + 1 .. close], " \t\r");
+            label = normalizeLabel(line[after + 1 .. close]);
             after = close + 1;
         }
     }
@@ -638,6 +934,7 @@ fn opAt(line: []const u8, at: usize, token: Token) FoundOp {
             .style = token.style,
             .src_marker = token.src_marker,
             .dst_marker = token.dst_marker,
+            .min_length = token.min_length,
             .label = label,
         },
     };
@@ -1743,10 +2040,26 @@ test "nested flowchart subgraphs" {
     try testing.expectEqual(@as(?usize, 1), flow.nodes[3].subgraph);
 }
 
+test "hierarchical subgraph syntax" {
+    const flow = parseText(
+        "graph LR\n" ++
+            "one-->two\n" ++
+            "subgraph one [One]\n" ++
+            "direction TB\n" ++
+            "A-->B\n" ++
+            "end\n" ++
+            "subgraph two [Two]\n" ++
+            "C-->D\n" ++
+            "end\n",
+    ).?;
+    try testing.expect(flow.needsHierarchicalLayout());
+    try testing.expectEqual(@as(usize, 4), flow.node_count);
+    try testing.expectEqualStrings("one", flow.edges[0].src);
+    try testing.expectEqualStrings("two", flow.edges[0].dst);
+}
+
 test "unsupported subgraph semantics are rejected" {
     for ([_][]const u8{
-        "graph LR\nsubgraph g\ndirection TB\nA-->B\nend\n",
-        "graph LR\nsubgraph g\nA-->B\nend\ng-->C\n",
         "graph LR\nsubgraph empty\nend\n",
         "graph LR\nsubgraph open\nA-->B\n",
         "graph LR\nsubgraph bad [label] trailing\nA\nend\n",
@@ -1755,18 +2068,34 @@ test "unsupported subgraph semantics are rejected" {
     }
 }
 
+test "flowchart syntax extensions" {
+    const flow = parseText(
+        "flowchart LR; " ++
+            "node-a@{ shape: doc, label: \"Document\" } edge-1@---> node-b[\"`**Done**`\"]:::done; " ++
+            "classDef done fill:red; class node-b done; linkStyle 0 stroke:blue; " ++
+            "node-b-->|x;y|node-c; node-c-..->node-d\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 4), flow.node_count);
+    try testing.expectEqualStrings("Document", flow.nodes[0].label);
+    try testing.expectEqualStrings("**Done**", flow.nodes[1].label);
+    try testing.expectEqualStrings("edge-1", flow.edges[0].id.?);
+    try testing.expectEqual(@as(usize, 2), flow.edges[0].min_length);
+    try testing.expectEqualStrings("x;y", flow.edges[1].label.?);
+    try testing.expect(flow.edges[2].style == .dotted);
+    try testing.expectEqual(@as(usize, 2), flow.edges[2].min_length);
+}
+
 test "flowchart comments are skipped" {
-    const flow = parseText("%% a comment\ngraph TD\nA-->B\n").?;
+    const flow = parseText("%% a comment; not syntax\ngraph TD\nA-->B\n").?;
     try testing.expectEqual(@as(usize, 2), flow.node_count);
     try testing.expectEqual(@as(usize, 1), flow.edge_count);
 }
 
 test "unsupported flowchart statements are rejected" {
     for ([_][]const u8{
-        "graph TD\nA-->B\nstyle A fill:red\n",
         "graph TD\nA-->B\nnot a node !!!\n",
-        "graph TD\nA[\"`Markdown`\"]\n",
-        "graph TD\nA-..->B\n",
+        "graph TD\nA-->B\nclick A callback\n",
+        "graph TD\nA edge@-->B\nC edge@-->D\n",
         "%%{init: {'theme': 'dark'}}%%\ngraph TD\nA-->B\n",
     }) |text| {
         try testing.expect(parseText(text) == null);

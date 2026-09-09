@@ -16,14 +16,334 @@ const Bounds = struct {
     y1: usize,
     x2: usize,
     y2: usize,
+
+    fn width(self: Bounds) usize {
+        return self.x2 - self.x1 + 1;
+    }
+
+    fn height(self: Bounds) usize {
+        return self.y2 - self.y1 + 1;
+    }
 };
 
 pub fn layout(win: ?vaxis.Window, flow: *const Mermaid.Flowchart, start_row: usize, skip: usize, width: usize) ?usize {
+    if (flow.needsHierarchicalLayout()) {
+        var hierarchy = Hierarchy.compute(flow, width) orelse return null;
+        if (win == null) return start_row + hierarchy.rows;
+        const w = win.?;
+        hierarchy.draw(w, start_row, skip);
+        return start_row + @min(hierarchy.rows -| skip, w.height -| start_row);
+    }
     var grid = Grid.compute(flow, width) orelse return null;
     if (win == null) return start_row + grid.rows;
     const w = win.?;
     grid.draw(w, start_row, skip);
     return start_row + @min(grid.rows -| skip, w.height -| start_row);
+}
+
+const max_hierarchy_items = Mermaid.max_nodes + Mermaid.max_subgraphs;
+
+const Size = struct { width: usize, height: usize };
+
+const HierarchyItem = union(enum) {
+    node: usize,
+    subgraph: usize,
+};
+
+const HierarchyEndpoint = struct {
+    bounds: Bounds,
+    node: ?usize = null,
+};
+
+const HierarchySegment = struct {
+    r1: usize,
+    c1: usize,
+    r2: usize,
+    c2: usize,
+    glyph: []const u8,
+};
+
+const HierarchyPath = struct {
+    segments: [3]HierarchySegment = undefined,
+    count: usize = 0,
+    src_at: CellPos,
+    dst_at: CellPos,
+    src_arrow: []const u8,
+    dst_arrow: []const u8,
+    src_line: []const u8,
+    dst_line: []const u8,
+    label: ?LabelAt = null,
+
+    fn add(self: *HierarchyPath, segment: HierarchySegment) void {
+        if ((segment.r1 > segment.r2 and segment.c1 == segment.c2) or
+            (segment.c1 > segment.c2 and segment.r1 == segment.r2)) return;
+        self.segments[self.count] = segment;
+        self.count += 1;
+    }
+};
+
+fn hierarchyGap(flow: *const Mermaid.Flowchart) usize {
+    var min_length: usize = 1;
+    for (flow.edgeList()) |edge| min_length = @max(min_length, edge.min_length);
+    return 3 + 2 * (min_length - 1);
+}
+
+const Hierarchy = struct {
+    flow: *const Mermaid.Flowchart,
+    node_widths: [Mermaid.max_nodes]usize,
+    node_bounds: [Mermaid.max_nodes]Bounds,
+    subgraph_sizes: [Mermaid.max_subgraphs]Size,
+    subgraph_bounds: [Mermaid.max_subgraphs]Bounds,
+    subgraph_directions: [Mermaid.max_subgraphs]Mermaid.Direction,
+    gap: usize,
+    rows: usize,
+    cols: usize,
+
+    fn compute(flow: *const Mermaid.Flowchart, width: usize) ?Hierarchy {
+        if (flow.degraded or flow.node_count == 0) return null;
+        var hierarchy: Hierarchy = .{
+            .flow = flow,
+            .node_widths = [_]usize{0} ** Mermaid.max_nodes,
+            .node_bounds = undefined,
+            .subgraph_sizes = undefined,
+            .subgraph_bounds = undefined,
+            .subgraph_directions = undefined,
+            .gap = hierarchyGap(flow),
+            .rows = 0,
+            .cols = 0,
+        };
+        for (flow.nodeList(), 0..) |node, index| hierarchy.node_widths[index] = cells.labelWidth(node.label) + 4;
+        const root_size = hierarchy.measureItems(null, flow.direction) orelse return null;
+        hierarchy.rows = root_size.height + 2;
+        hierarchy.cols = root_size.width + 2;
+        if (hierarchy.rows > max_rows or hierarchy.cols > width) return null;
+        hierarchy.placeItems(null, flow.direction, .{ .x1 = 1, .y1 = 1, .x2 = root_size.width, .y2 = root_size.height });
+        for (flow.edgeList()) |*edge| _ = hierarchy.route(edge) orelse return null;
+        return hierarchy;
+    }
+
+    fn collectItems(self: *const Hierarchy, parent: ?usize, items: *[max_hierarchy_items]HierarchyItem) usize {
+        var count: usize = 0;
+        for (self.flow.nodeList(), 0..) |node, index| {
+            if (node.subgraph == parent) {
+                items[count] = .{ .node = index };
+                count += 1;
+            }
+        }
+        for (self.flow.subgraphList(), 0..) |subgraph, index| {
+            if (subgraph.parent == parent) {
+                items[count] = .{ .subgraph = index };
+                count += 1;
+            }
+        }
+        var i: usize = 1;
+        while (i < count) : (i += 1) {
+            const item = items[i];
+            const order = self.itemOrder(item);
+            var j = i;
+            while (j > 0 and self.itemOrder(items[j - 1]) > order) : (j -= 1) items[j] = items[j - 1];
+            items[j] = item;
+        }
+        return count;
+    }
+
+    fn itemOrder(self: *const Hierarchy, item: HierarchyItem) usize {
+        return switch (item) {
+            .node => |index| self.flow.nodes[index].order,
+            .subgraph => |index| self.flow.subgraphs[index].order,
+        };
+    }
+
+    fn measureItems(self: *Hierarchy, parent: ?usize, direction: Mermaid.Direction) ?Size {
+        var items: [max_hierarchy_items]HierarchyItem = undefined;
+        const count = self.collectItems(parent, &items);
+        if (count == 0) return null;
+        const horizontal = direction == .lr or direction == .rl;
+        var primary: usize = 0;
+        var cross: usize = 0;
+        for (items[0..count]) |item| {
+            const size = self.measureItem(item, direction) orelse return null;
+            primary += if (horizontal) size.width else size.height;
+            cross = @max(cross, if (horizontal) size.height else size.width);
+        }
+        primary += self.gap * (count - 1);
+        return if (horizontal)
+            .{ .width = primary, .height = cross }
+        else
+            .{ .width = cross, .height = primary };
+    }
+
+    fn measureItem(self: *Hierarchy, item: HierarchyItem, parent_direction: Mermaid.Direction) ?Size {
+        return switch (item) {
+            .node => |index| .{ .width = self.node_widths[index], .height = 3 },
+            .subgraph => |index| blk: {
+                const subgraph = self.flow.subgraphs[index];
+                const direction = subgraph.direction orelse parent_direction;
+                self.subgraph_directions[index] = direction;
+                const content = self.measureItems(index, direction) orelse return null;
+                const size: Size = .{
+                    .width = @max(content.width + 2, cells.labelWidth(subgraph.label) + 4),
+                    .height = content.height + 3,
+                };
+                self.subgraph_sizes[index] = size;
+                break :blk size;
+            },
+        };
+    }
+
+    fn itemSize(self: *const Hierarchy, item: HierarchyItem) Size {
+        return switch (item) {
+            .node => |index| .{ .width = self.node_widths[index], .height = 3 },
+            .subgraph => |index| self.subgraph_sizes[index],
+        };
+    }
+
+    fn placeItems(self: *Hierarchy, parent: ?usize, direction: Mermaid.Direction, area: Bounds) void {
+        var items: [max_hierarchy_items]HierarchyItem = undefined;
+        const count = self.collectItems(parent, &items);
+        const horizontal = direction == .lr or direction == .rl;
+        var primary: usize = 0;
+        for (items[0..count]) |item| {
+            const size = self.itemSize(item);
+            primary += if (horizontal) size.width else size.height;
+        }
+        primary += self.gap * (count - 1);
+        const forward = direction == .lr or direction == .tb;
+        var cursor = if (horizontal)
+            area.x1 + (area.width() - primary) / 2
+        else
+            area.y1 + (area.height() - primary) / 2;
+        if (!forward) cursor += primary;
+        for (items[0..count]) |item| {
+            const size = self.itemSize(item);
+            const item_primary = if (horizontal) size.width else size.height;
+            const position = if (forward) cursor else cursor - item_primary;
+            const x = if (horizontal) position else area.x1 + (area.width() - size.width) / 2;
+            const y = if (horizontal) area.y1 + (area.height() - size.height) / 2 else position;
+            self.placeItem(item, x, y);
+            if (forward) cursor += item_primary + self.gap else cursor = position -| self.gap;
+        }
+    }
+
+    fn placeItem(self: *Hierarchy, item: HierarchyItem, x: usize, y: usize) void {
+        switch (item) {
+            .node => |index| {
+                self.node_bounds[index] = .{ .x1 = x, .y1 = y, .x2 = x + self.node_widths[index] - 1, .y2 = y + 2 };
+            },
+            .subgraph => |index| {
+                const size = self.subgraph_sizes[index];
+                self.subgraph_bounds[index] = .{ .x1 = x, .y1 = y, .x2 = x + size.width - 1, .y2 = y + size.height - 1 };
+                self.placeItems(index, self.subgraph_directions[index], .{
+                    .x1 = x + 1,
+                    .y1 = y + 2,
+                    .x2 = x + size.width - 2,
+                    .y2 = y + size.height - 2,
+                });
+            },
+        }
+    }
+
+    fn endpoint(self: *const Hierarchy, id: []const u8) ?HierarchyEndpoint {
+        if (nodeIndex(self.flow, id)) |index| return .{ .bounds = self.node_bounds[index], .node = index };
+        if (self.flow.subgraphIndex(id)) |index| return .{ .bounds = self.subgraph_bounds[index] };
+        return null;
+    }
+
+    fn route(self: *const Hierarchy, edge: *const Mermaid.Edge) ?HierarchyPath {
+        const source = self.endpoint(edge.src) orelse return null;
+        const destination = self.endpoint(edge.dst) orelse return null;
+        if (source.bounds.x1 == destination.bounds.x1 and source.bounds.y1 == destination.bounds.y1 and
+            source.bounds.x2 == destination.bounds.x2 and source.bounds.y2 == destination.bounds.y2) return null;
+        const source_center = CellPos{ .r = (source.bounds.y1 + source.bounds.y2) / 2, .c = (source.bounds.x1 + source.bounds.x2) / 2 };
+        const destination_center = CellPos{ .r = (destination.bounds.y1 + destination.bounds.y2) / 2, .c = (destination.bounds.x1 + destination.bounds.x2) / 2 };
+        const dx = if (source_center.c > destination_center.c) source_center.c - destination_center.c else destination_center.c - source_center.c;
+        const dy = if (source_center.r > destination_center.r) source_center.r - destination_center.r else destination_center.r - source_center.r;
+        var path: HierarchyPath = undefined;
+        path.count = 0;
+        path.label = null;
+        if (dx >= dy) {
+            const right = destination_center.c > source_center.c;
+            const src_at = CellPos{ .r = source_center.r, .c = if (right) source.bounds.x2 + 1 else source.bounds.x1 - 1 };
+            const dst_at = CellPos{ .r = destination_center.r, .c = if (right) destination.bounds.x1 - 1 else destination.bounds.x2 + 1 };
+            const mid = (src_at.c + dst_at.c) / 2;
+            path.src_at = src_at;
+            path.dst_at = dst_at;
+            path.src_arrow = if (right) "◄" else "►";
+            path.dst_arrow = if (right) "►" else "◄";
+            path.src_line = "─";
+            path.dst_line = "─";
+            path.add(.{ .r1 = src_at.r, .c1 = @min(src_at.c, mid), .r2 = src_at.r, .c2 = @max(src_at.c, mid), .glyph = "─" });
+            path.add(.{ .r1 = @min(src_at.r, dst_at.r), .c1 = mid, .r2 = @max(src_at.r, dst_at.r), .c2 = mid, .glyph = "│" });
+            path.add(.{ .r1 = dst_at.r, .c1 = @min(mid, dst_at.c), .r2 = dst_at.r, .c2 = @max(mid, dst_at.c), .glyph = "─" });
+            if (edge.label) |label| {
+                const label_width = cells.labelWidth(label);
+                const start = @min(src_at.c, dst_at.c);
+                const span = if (@max(src_at.c, dst_at.c) > start) @max(src_at.c, dst_at.c) - start else 0;
+                if (label_width > span) return null;
+                path.label = .{ .r = src_at.r, .c = start + (span - label_width) / 2, .text = label };
+            }
+        } else {
+            const down = destination_center.r > source_center.r;
+            const src_at = CellPos{ .r = if (down) source.bounds.y2 + 1 else source.bounds.y1 - 1, .c = source_center.c };
+            const dst_at = CellPos{ .r = if (down) destination.bounds.y1 - 1 else destination.bounds.y2 + 1, .c = destination_center.c };
+            const mid = (src_at.r + dst_at.r) / 2;
+            path.src_at = src_at;
+            path.dst_at = dst_at;
+            path.src_arrow = if (down) "▲" else "▼";
+            path.dst_arrow = if (down) "▼" else "▲";
+            path.src_line = "│";
+            path.dst_line = "│";
+            path.add(.{ .r1 = @min(src_at.r, mid), .c1 = src_at.c, .r2 = @max(src_at.r, mid), .c2 = src_at.c, .glyph = "│" });
+            path.add(.{ .r1 = mid, .c1 = @min(src_at.c, dst_at.c), .r2 = mid, .c2 = @max(src_at.c, dst_at.c), .glyph = "─" });
+            path.add(.{ .r1 = @min(mid, dst_at.r), .c1 = dst_at.c, .r2 = @max(mid, dst_at.r), .c2 = dst_at.c, .glyph = "│" });
+            if (edge.label) |label| {
+                const label_width = cells.labelWidth(label);
+                if (dst_at.c + 2 + label_width > self.cols) return null;
+                path.label = .{ .r = mid, .c = dst_at.c + 2, .text = label };
+            }
+        }
+        for (path.segments[0..path.count]) |segment| {
+            for (self.flow.nodeList(), 0..) |_, index| {
+                if (source.node == index or destination.node == index) continue;
+                if (segmentIntersectsBounds(segment, self.node_bounds[index])) return null;
+            }
+        }
+        return path;
+    }
+
+    fn draw(self: *const Hierarchy, win: vaxis.Window, start_row: usize, skip: usize) void {
+        for (self.flow.subgraphList(), 0..) |subgraph, index| drawFrame(win, self.subgraph_bounds[index], subgraph.label, start_row, skip);
+        for (self.flow.nodeList(), 0..) |*node, index| drawNodeBox(win, node, self.node_bounds[index], start_row, skip);
+        for (self.flow.edgeList()) |*edge| {
+            if (edge.style == .invisible) continue;
+            const path = self.route(edge) orelse continue;
+            for (path.segments[0..path.count]) |segment| drawHierarchySegment(win, segment, start_row, skip);
+            drawMarker(win, path.src_at, edge.src_marker, path.src_arrow, path.src_line, start_row, skip);
+            drawMarker(win, path.dst_at, edge.dst_marker, path.dst_arrow, path.dst_line, start_row, skip);
+        }
+        for (self.flow.edgeList()) |*edge| {
+            if (edge.style == .invisible) continue;
+            const path = self.route(edge) orelse continue;
+            if (path.label) |label| cells.putText(win, label.r, label.c, start_row, skip, label.text, self.cols, .{});
+        }
+    }
+};
+
+fn segmentIntersectsBounds(segment: HierarchySegment, bounds: Bounds) bool {
+    if (segment.r1 == segment.r2) {
+        return segment.r1 >= bounds.y1 and segment.r1 <= bounds.y2 and segment.c1 <= bounds.x2 and segment.c2 >= bounds.x1;
+    }
+    return segment.c1 >= bounds.x1 and segment.c1 <= bounds.x2 and segment.r1 <= bounds.y2 and segment.r2 >= bounds.y1;
+}
+
+fn drawHierarchySegment(win: vaxis.Window, segment: HierarchySegment, start_row: usize, skip: usize) void {
+    if (segment.r1 == segment.r2) {
+        var col = segment.c1;
+        while (col <= segment.c2) : (col += 1) cells.putLine(win, segment.r1, col, start_row, skip, segment.glyph, .{});
+    } else {
+        var row = segment.r1;
+        while (row <= segment.r2) : (row += 1) cells.putLine(win, row, segment.c1, start_row, skip, segment.glyph, .{});
+    }
 }
 
 fn subgraphPadding(flow: *const Mermaid.Flowchart) usize {
@@ -125,13 +445,13 @@ const Grid = struct {
     }
 
     fn computeRanks(self: *Grid) void {
-        const cap = self.count -| 1;
+        const cap = Mermaid.max_nodes - 1;
         for (0..self.count) |_| {
             for (self.flow.edgeList()) |*edge| {
                 const s = nodeIndex(self.flow, edge.src) orelse continue;
                 const d = nodeIndex(self.flow, edge.dst) orelse continue;
                 if (s == d) continue;
-                const r = @min(self.rank[s] + 1, cap);
+                const r = @min(self.rank[s] + edge.min_length, cap);
                 if (r > self.rank[d]) self.rank[d] = r;
             }
         }
@@ -567,10 +887,15 @@ const Grid = struct {
 
     fn draw(self: *const Grid, win: vaxis.Window, start_row: usize, skip: usize) void {
         for (self.flow.subgraphList(), 0..) |subgraph, index| {
-            drawSubgraph(win, self.subgraphs[index], subgraph.label, start_row, skip);
+            drawFrame(win, self.subgraphs[index], subgraph.label, start_row, skip);
         }
         for (self.flow.nodeList(), 0..) |*node, i| {
-            drawBox(win, node, self.x[i], self.y[i], self.w[i], start_row, skip);
+            drawNodeBox(win, node, .{
+                .x1 = self.x[i],
+                .y1 = self.y[i],
+                .x2 = self.x[i] + self.w[i] - 1,
+                .y2 = self.y[i] + 2,
+            }, start_row, skip);
         }
         for (self.flow.edgeList()) |*edge| {
             if (edge.style == .invisible) continue;
@@ -599,25 +924,6 @@ const Grid = struct {
         }
     }
 
-    fn drawSubgraph(win: vaxis.Window, bounds: Bounds, label: []const u8, start_row: usize, skip: usize) void {
-        const style: vaxis.Style = .{ .dim = true };
-        cells.putLine(win, bounds.y1, bounds.x1, start_row, skip, "┌", style);
-        cells.putLine(win, bounds.y1, bounds.x2, start_row, skip, "┐", style);
-        cells.putLine(win, bounds.y2, bounds.x1, start_row, skip, "└", style);
-        cells.putLine(win, bounds.y2, bounds.x2, start_row, skip, "┘", style);
-        var col = bounds.x1 + 1;
-        while (col < bounds.x2) : (col += 1) {
-            cells.putLine(win, bounds.y1, col, start_row, skip, "─", style);
-            cells.putLine(win, bounds.y2, col, start_row, skip, "─", style);
-        }
-        var row = bounds.y1 + 1;
-        while (row < bounds.y2) : (row += 1) {
-            cells.putLine(win, row, bounds.x1, start_row, skip, "│", style);
-            cells.putLine(win, row, bounds.x2, start_row, skip, "│", style);
-        }
-        cells.putText(win, bounds.y1, bounds.x1 + 2, start_row, skip, label, bounds.x2 - 1, style);
-    }
-
     fn sourceMarkerAt(self: *const Grid, edge: *const Mermaid.Edge) ?CellPos {
         const source = nodeIndex(self.flow, edge.src) orelse return null;
         if (self.vertical) {
@@ -635,16 +941,35 @@ const Grid = struct {
     fn terminalLine(self: *const Grid) []const u8 {
         return if (self.vertical) "│" else "─";
     }
-
-    fn drawBox(win: vaxis.Window, node: *const Mermaid.Node, x: usize, y: usize, bw: usize, start_row: usize, skip: usize) void {
-        const corners = switch (node.shape) {
-            .rounded, .stadium, .circle, .cylinder, .double_circle => cells.round,
-            .diamond => cells.diamond,
-            else => cells.square,
-        };
-        cells.box(win, x, y, bw, node.label, corners, start_row, skip, .{});
-    }
 };
+
+fn drawFrame(win: vaxis.Window, bounds: Bounds, label: []const u8, start_row: usize, skip: usize) void {
+    const style: vaxis.Style = .{ .dim = true };
+    cells.putLine(win, bounds.y1, bounds.x1, start_row, skip, "┌", style);
+    cells.putLine(win, bounds.y1, bounds.x2, start_row, skip, "┐", style);
+    cells.putLine(win, bounds.y2, bounds.x1, start_row, skip, "└", style);
+    cells.putLine(win, bounds.y2, bounds.x2, start_row, skip, "┘", style);
+    var col = bounds.x1 + 1;
+    while (col < bounds.x2) : (col += 1) {
+        cells.putLine(win, bounds.y1, col, start_row, skip, "─", style);
+        cells.putLine(win, bounds.y2, col, start_row, skip, "─", style);
+    }
+    var row = bounds.y1 + 1;
+    while (row < bounds.y2) : (row += 1) {
+        cells.putLine(win, row, bounds.x1, start_row, skip, "│", style);
+        cells.putLine(win, row, bounds.x2, start_row, skip, "│", style);
+    }
+    cells.putText(win, bounds.y1, bounds.x1 + 2, start_row, skip, label, bounds.x2 - 1, style);
+}
+
+fn drawNodeBox(win: vaxis.Window, node: *const Mermaid.Node, bounds: Bounds, start_row: usize, skip: usize) void {
+    const corners = switch (node.shape) {
+        .rounded, .stadium, .circle, .cylinder, .double_circle => cells.round,
+        .diamond => cells.diamond,
+        else => cells.square,
+    };
+    cells.box(win, bounds.x1, bounds.y1, bounds.width(), node.label, corners, start_row, skip, .{});
+}
 
 fn drawMarker(win: vaxis.Window, pos: CellPos, marker: Mermaid.EdgeMarker, arrow: []const u8, line: []const u8, start_row: usize, skip: usize) void {
     switch (marker) {
@@ -781,6 +1106,32 @@ test "subgraphs render labeled boundaries" {
         }
     }
     try testing.expect(found_group and found_inner and found_border);
+}
+
+test "hierarchical subgraph directions and group edges render" {
+    var flow = Mermaid.parseText(
+        "flowchart LR\n" ++
+            "one-->two\n" ++
+            "subgraph one [One]\n" ++
+            "direction TB\n" ++
+            "A-->B\n" ++
+            "end\n" ++
+            "subgraph two [Two]\n" ++
+            "direction RL\n" ++
+            "C-->D\n" ++
+            "end\n",
+    ).?;
+    const rows = layout(null, &flow, 0, 0, 80).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(rows), .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &flow, 0, 0, 80).?;
+    const a = findGlyph(win, "A").?;
+    const b = findGlyph(win, "B").?;
+    const c = findGlyph(win, "C").?;
+    const d = findGlyph(win, "D").?;
+    try testing.expect(a.c == b.c and a.r < b.r);
+    try testing.expect(c.r == d.r and c.c > d.c);
 }
 
 test "interleaved subgraph members fall back" {
@@ -925,6 +1276,11 @@ test "left to right skip edges use the wire row" {
     try expectGlyph(win, 17, 1, "►");
 }
 
+test "minimum link lengths add layers" {
+    var flow = Mermaid.parseText("graph TD\nA---->B\n").?;
+    try testing.expectEqual(@as(usize, 18), layout(null, &flow, 0, 0, 40).?);
+}
+
 test "bottom up points arrows upward" {
     var flow = Mermaid.parseText("graph BT\nA-->B\n").?;
     var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 8, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
@@ -1044,6 +1400,16 @@ fn window(screen: *vaxis.Screen) vaxis.Window {
         .height = screen.height,
         .screen = screen,
     };
+}
+
+fn findGlyph(win: vaxis.Window, glyph: []const u8) ?CellPos {
+    for (0..win.height) |row| {
+        for (0..win.width) |col| {
+            const cell = win.readCell(@intCast(col), @intCast(row)) orelse continue;
+            if (mem.eql(u8, cell.char.grapheme, glyph)) return .{ .r = row, .c = col };
+        }
+    }
+    return null;
 }
 
 fn expectGlyph(win: vaxis.Window, col: u16, row: u16, expected: []const u8) !void {
