@@ -332,8 +332,8 @@ const Layout = struct {
         const d = partIndex(self.seq, m.dst) orelse return;
         const base = self.rowOf(m.pos);
         const wire = base + @intFromBool(self.seq.autonumber != null or m.text.len > 0);
-        const scx = self.lifelineCol(s, wire);
-        const dcx = self.lifelineCol(d, wire);
+        var scx = self.lifelineCol(s, wire);
+        var dcx = self.lifelineCol(d, wire);
         if (mem.eql(u8, m.src, m.dst)) {
             wireCell(m.style, win, wire, scx + 1, start_row, skip);
             wireCell(m.style, win, wire, scx + 2, start_row, skip);
@@ -343,26 +343,25 @@ const Layout = struct {
             wireCell(m.style, win, wire + 1, scx + 2, start_row, skip);
             wireCell(m.style, win, wire + 1, scx + 3, start_row, skip);
             cells.putLine(win, wire + 1, scx + 4, start_row, skip, "┘", .{});
-            switch (m.kind) {
-                .arrow, .bidirectional => cells.putRaw(win, wire + 1, scx + 1, start_row, skip, "◄", .{}),
-                .cross => cells.putRaw(win, wire + 1, scx + 1, start_row, skip, "×", .{}),
-                .open => cells.putRaw(win, wire + 1, scx + 1, start_row, skip, "<", .{}),
-                .plain => {},
-            }
-            if (m.kind == .bidirectional) cells.putRaw(win, wire, scx + 1, start_row, skip, "►", .{});
+            drawEndpoint(win, wire + 1, scx + 1, m.dst_endpoint, false, start_row, skip);
+            drawEndpoint(win, wire, scx + 1, m.src_endpoint, true, start_row, skip);
             return;
         }
+        const source_lifeline = scx;
+        const destination_lifeline = dcx;
+        const points_right = destination_lifeline > source_lifeline;
+        if (m.central == .source or m.central == .both) scx = if (points_right) scx + 1 else scx - 1;
+        if (m.central == .destination or m.central == .both) dcx = if (points_right) dcx - 1 else dcx + 1;
         const lo = @min(scx, dcx);
         const hi = @max(scx, dcx);
         var c = lo;
         while (c <= hi) : (c += 1) wireCell(m.style, win, wire, c, start_row, skip);
-        switch (m.kind) {
-            .arrow, .bidirectional => cells.putRaw(win, wire, dcx, start_row, skip, if (dcx > scx) "►" else "◄", .{}),
-            .cross => cells.putRaw(win, wire, dcx, start_row, skip, "×", .{}),
-            .open => cells.putRaw(win, wire, dcx, start_row, skip, if (dcx > scx) ">" else "<", .{}),
-            .plain => {},
-        }
-        if (m.kind == .bidirectional) cells.putRaw(win, wire, scx, start_row, skip, if (dcx > scx) "◄" else "►", .{});
+        drawEndpoint(win, wire, dcx, m.dst_endpoint, points_right, start_row, skip);
+        drawEndpoint(win, wire, scx, m.src_endpoint, !points_right, start_row, skip);
+        if (m.central == .source or m.central == .both)
+            cells.putRaw(win, wire, source_lifeline, start_row, skip, "○", .{});
+        if (m.central == .destination or m.central == .both)
+            cells.putRaw(win, wire, destination_lifeline, start_row, skip, "○", .{});
     }
 
     fn drawLabel(self: *const Layout, win: vaxis.Window, m: *const Mermaid.Message, index: usize, start_row: usize, skip: usize) void {
@@ -422,6 +421,24 @@ const Layout = struct {
         }
     }
 };
+
+fn drawEndpoint(win: vaxis.Window, row: usize, col: usize, endpoint: Mermaid.MsgEndpoint, points_right: bool, start_row: usize, skip: usize) void {
+    const glyph = endpointGlyph(endpoint, points_right) orelse return;
+    cells.putRaw(win, row, col, start_row, skip, glyph, .{});
+}
+
+fn endpointGlyph(endpoint: Mermaid.MsgEndpoint, points_right: bool) ?[]const u8 {
+    return switch (endpoint) {
+        .none => null,
+        .arrow => if (points_right) "►" else "◄",
+        .cross => "×",
+        .open => if (points_right) ">" else "<",
+        .half_top => if (points_right) "↗" else "↖",
+        .half_bottom => if (points_right) "↘" else "↙",
+        .stick_top => if (points_right) "╲" else "╱",
+        .stick_bottom => if (points_right) "╱" else "╲",
+    };
+}
 
 const ActiveSpan = struct {
     p: usize,
@@ -609,6 +626,36 @@ test "bidirectional arrows mark both participants" {
     _ = layout(win, &seq, 0, 0, 40).?;
     try expectGlyph(win, 2, 4, "◄");
     try expectGlyph(win, 10, 4, "►");
+}
+
+test "half arrows render at either endpoint" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "A-|\\B: forward\n" ++
+            "B/|-A: reverse\n",
+    ).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 7, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 10, 4, "↗");
+    try expectGlyph(win, 10, 6, "↗");
+}
+
+test "central connections render circles beside endpoints" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "A->>()B: d\n" ++
+            "A()->>B: s\n",
+    ).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 7, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 9, 4, "►");
+    try expectGlyph(win, 10, 4, "○");
+    try expectGlyph(win, 2, 6, "○");
+    try expectGlyph(win, 10, 6, "►");
 }
 
 test "self messages bump east" {

@@ -71,6 +71,8 @@ sequenceDiagram
     Bob-->>Alice: Hi
     deactivate Bob
     deactivate Bob
+    Bob/|-Alice: Reverse half
+    Alice()->>()Bob: Central
     create actor Carol
     Alice->>Carol: Welcome
     destroy Carol

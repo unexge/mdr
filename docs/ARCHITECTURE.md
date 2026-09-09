@@ -59,6 +59,7 @@ card instead of failing. Flowchart subgraphs are bounded cluster overlays;
 layouts with ambiguous or overlapping clusters also fall back. Sequence
 participant groups, lifecycle positions, and activation stacks are fixed
 parser state from which header and lifeline rows are derived. Sequence numbers
-use bounded fixed-point hundredths. The supported grammar is listed in
-[`MERMAID.md`](MERMAID.md). Shared cell drawing (junction merging, clipping,
+use bounded fixed-point hundredths. Message endpoints and central connections
+are explicit enums, keeping rendering exhaustive. The supported grammar is
+listed in [`MERMAID.md`](MERMAID.md). Shared cell drawing (junction merging, clipping,
 display widths) lives in `renderer/cells.zig`.

@@ -39,7 +39,9 @@ Supported:
 - Participant `box` groups declared before messages; color descriptors are
   accepted but terminal rendering uses the active theme
 - Actor and participant creation and destruction outside fragments
-- Solid and dotted plain, arrow, cross, open, and bidirectional messages
+- Solid and dotted plain, arrow, cross, open, bidirectional, and half-arrow
+  messages
+- Source, destination, and dual `()` central connections between participants
 - Notes over, left of, and right of participants
 - `loop`, `alt`/`else`, `opt`, `par`/`and`, `critical`/`option`, `break`, and
   `rect` fragments
@@ -51,7 +53,7 @@ Falls back:
 
 - Participant boxes declared after messages or containing non-participant lines
 - Actor creation and destruction inside fragments or without a matching message
-- Half arrows and central connections
+- Central self-connections
 - Actor links, styling, configuration directives, and semicolon-separated
   statements
 

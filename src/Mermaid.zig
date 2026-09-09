@@ -685,13 +685,16 @@ pub const ParticipantBox = struct {
 };
 
 pub const MsgStyle = enum { solid, dotted };
-pub const MsgKind = enum { plain, arrow, bidirectional, cross, open };
+pub const MsgEndpoint = enum { none, arrow, cross, open, half_top, half_bottom, stick_top, stick_bottom };
+pub const CentralConnection = enum { none, source, destination, both };
 
 pub const Message = struct {
     src: []const u8,
     dst: []const u8,
     style: MsgStyle,
-    kind: MsgKind,
+    src_endpoint: MsgEndpoint,
+    dst_endpoint: MsgEndpoint,
+    central: CentralConnection,
     text: []const u8,
     pos: usize,
 };
@@ -906,6 +909,10 @@ const SeqParser = struct {
     }
 
     fn addMessage(self: *SeqParser, m: ParsedMessage) void {
+        if (m.central != .none and mem.eql(u8, m.src, m.dst)) {
+            self.supported = false;
+            return;
+        }
         const s = self.intern(m.src) orelse return;
         const d = self.intern(m.dst) orelse return;
         if (self.seq.participants[s].destroyed_at != null or self.seq.participants[d].destroyed_at != null) {
@@ -932,7 +939,9 @@ const SeqParser = struct {
             .src = m.src,
             .dst = m.dst,
             .style = m.style,
-            .kind = m.kind,
+            .src_endpoint = m.src_endpoint,
+            .dst_endpoint = m.dst_endpoint,
+            .central = m.central,
             .text = m.text,
             .pos = self.pos,
         };
@@ -1389,7 +1398,9 @@ const ParsedMessage = struct {
     src: []const u8,
     dst: []const u8,
     style: MsgStyle,
-    kind: MsgKind,
+    src_endpoint: MsgEndpoint,
+    dst_endpoint: MsgEndpoint,
+    central: CentralConnection,
     text: []const u8,
     plus: bool,
     minus: bool,
@@ -1397,21 +1408,41 @@ const ParsedMessage = struct {
 
 const MsgToken = struct {
     style: MsgStyle,
-    kind: MsgKind,
     len: usize,
+    src_endpoint: MsgEndpoint = .none,
+    dst_endpoint: MsgEndpoint = .none,
 };
 
 fn matchMsgToken(rest: []const u8) ?MsgToken {
-    if (mem.startsWith(u8, rest, "<<-->>")) return .{ .style = .dotted, .kind = .bidirectional, .len = 6 };
-    if (mem.startsWith(u8, rest, "<<->>")) return .{ .style = .solid, .kind = .bidirectional, .len = 5 };
-    if (mem.startsWith(u8, rest, "-->>")) return .{ .style = .dotted, .kind = .arrow, .len = 4 };
-    if (mem.startsWith(u8, rest, "->>")) return .{ .style = .solid, .kind = .arrow, .len = 3 };
-    if (mem.startsWith(u8, rest, "-->")) return .{ .style = .dotted, .kind = .plain, .len = 3 };
-    if (mem.startsWith(u8, rest, "->")) return .{ .style = .solid, .kind = .plain, .len = 2 };
-    if (mem.startsWith(u8, rest, "--x")) return .{ .style = .dotted, .kind = .cross, .len = 3 };
-    if (mem.startsWith(u8, rest, "-x")) return .{ .style = .solid, .kind = .cross, .len = 2 };
-    if (mem.startsWith(u8, rest, "--)")) return .{ .style = .dotted, .kind = .open, .len = 3 };
-    if (mem.startsWith(u8, rest, "-)")) return .{ .style = .solid, .kind = .open, .len = 2 };
+    if (mem.startsWith(u8, rest, "<<-->>")) return .{ .style = .dotted, .len = 6, .src_endpoint = .arrow, .dst_endpoint = .arrow };
+    if (mem.startsWith(u8, rest, "<<->>")) return .{ .style = .solid, .len = 5, .src_endpoint = .arrow, .dst_endpoint = .arrow };
+
+    if (mem.startsWith(u8, rest, "--|\\")) return .{ .style = .dotted, .len = 4, .dst_endpoint = .half_top };
+    if (mem.startsWith(u8, rest, "--|/")) return .{ .style = .dotted, .len = 4, .dst_endpoint = .half_bottom };
+    if (mem.startsWith(u8, rest, "--\\\\")) return .{ .style = .dotted, .len = 4, .dst_endpoint = .stick_top };
+    if (mem.startsWith(u8, rest, "--//")) return .{ .style = .dotted, .len = 4, .dst_endpoint = .stick_bottom };
+    if (mem.startsWith(u8, rest, "/|--")) return .{ .style = .dotted, .len = 4, .src_endpoint = .half_top };
+    if (mem.startsWith(u8, rest, "\\|--")) return .{ .style = .dotted, .len = 4, .src_endpoint = .half_bottom };
+    if (mem.startsWith(u8, rest, "//--")) return .{ .style = .dotted, .len = 4, .src_endpoint = .stick_top };
+    if (mem.startsWith(u8, rest, "\\\\--")) return .{ .style = .dotted, .len = 4, .src_endpoint = .stick_bottom };
+
+    if (mem.startsWith(u8, rest, "-|\\")) return .{ .style = .solid, .len = 3, .dst_endpoint = .half_top };
+    if (mem.startsWith(u8, rest, "-|/")) return .{ .style = .solid, .len = 3, .dst_endpoint = .half_bottom };
+    if (mem.startsWith(u8, rest, "-\\\\")) return .{ .style = .solid, .len = 3, .dst_endpoint = .stick_top };
+    if (mem.startsWith(u8, rest, "-//")) return .{ .style = .solid, .len = 3, .dst_endpoint = .stick_bottom };
+    if (mem.startsWith(u8, rest, "/|-")) return .{ .style = .solid, .len = 3, .src_endpoint = .half_top };
+    if (mem.startsWith(u8, rest, "\\|-")) return .{ .style = .solid, .len = 3, .src_endpoint = .half_bottom };
+    if (mem.startsWith(u8, rest, "//-")) return .{ .style = .solid, .len = 3, .src_endpoint = .stick_top };
+    if (mem.startsWith(u8, rest, "\\\\-")) return .{ .style = .solid, .len = 3, .src_endpoint = .stick_bottom };
+
+    if (mem.startsWith(u8, rest, "-->>")) return .{ .style = .dotted, .len = 4, .dst_endpoint = .arrow };
+    if (mem.startsWith(u8, rest, "->>")) return .{ .style = .solid, .len = 3, .dst_endpoint = .arrow };
+    if (mem.startsWith(u8, rest, "-->")) return .{ .style = .dotted, .len = 3 };
+    if (mem.startsWith(u8, rest, "->")) return .{ .style = .solid, .len = 2 };
+    if (mem.startsWith(u8, rest, "--x")) return .{ .style = .dotted, .len = 3, .dst_endpoint = .cross };
+    if (mem.startsWith(u8, rest, "-x")) return .{ .style = .solid, .len = 2, .dst_endpoint = .cross };
+    if (mem.startsWith(u8, rest, "--)")) return .{ .style = .dotted, .len = 3, .dst_endpoint = .open };
+    if (mem.startsWith(u8, rest, "-)")) return .{ .style = .solid, .len = 2, .dst_endpoint = .open };
     return null;
 }
 
@@ -1419,9 +1450,21 @@ fn parseMessageLine(line: []const u8) ?ParsedMessage {
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
         const arrow = matchMsgToken(line[i..]) orelse continue;
-        const src = parseId(mem.trim(u8, line[0..i], " \t")) orelse return null;
+        var raw_src = mem.trim(u8, line[0..i], " \t");
+        var source_central = false;
+        if (mem.endsWith(u8, raw_src, "()")) {
+            source_central = true;
+            raw_src = mem.trim(u8, raw_src[0 .. raw_src.len - 2], " \t");
+        }
+        const src = parseId(raw_src) orelse return null;
         var j = i + arrow.len;
         while (j < line.len and (line[j] == ' ' or line[j] == '\t')) j += 1;
+        var destination_central = false;
+        if (mem.startsWith(u8, line[j..], "()")) {
+            destination_central = true;
+            j += 2;
+            while (j < line.len and (line[j] == ' ' or line[j] == '\t')) j += 1;
+        }
         var plus = false;
         var minus = false;
         if (j < line.len and (line[j] == '+' or line[j] == '-')) {
@@ -1439,11 +1482,21 @@ fn parseMessageLine(line: []const u8) ?ParsedMessage {
             if (after[0] != ':') return null;
             text = mem.trim(u8, after[1..], " \t");
         }
+        const central: CentralConnection = if (source_central and destination_central)
+            .both
+        else if (source_central)
+            .source
+        else if (destination_central)
+            .destination
+        else
+            .none;
         return .{
             .src = src,
             .dst = dst,
             .style = arrow.style,
-            .kind = arrow.kind,
+            .src_endpoint = arrow.src_endpoint,
+            .dst_endpoint = arrow.dst_endpoint,
+            .central = central,
             .text = text,
             .plus = plus,
             .minus = minus,
@@ -1637,7 +1690,7 @@ test "spaces around arrows" {
     try testing.expectEqualStrings("one", seq.messages[0].text);
     try testing.expectEqualStrings("two", seq.messages[1].text);
     try testing.expectEqualStrings("three", seq.messages[2].text);
-    try testing.expect(seq.messages[3].kind == .cross);
+    try testing.expect(seq.messages[3].dst_endpoint == .cross);
     try testing.expectEqual(@as(usize, 1), seq.activation_count);
     try testing.expectEqualStrings("B", seq.activations[0].actor);
 }
@@ -1864,15 +1917,15 @@ test "sequence arrows" {
     ).?;
     const messages = seq.messages[0..seq.message_count];
     try testing.expectEqual(@as(usize, 9), messages.len);
-    try testing.expect(messages[0].style == .solid and messages[0].kind == .plain);
-    try testing.expect(messages[1].style == .dotted and messages[1].kind == .plain);
-    try testing.expect(messages[2].style == .solid and messages[2].kind == .arrow);
-    try testing.expect(messages[3].style == .dotted and messages[3].kind == .arrow);
-    try testing.expect(messages[4].style == .solid and messages[4].kind == .cross);
-    try testing.expect(messages[5].style == .dotted and messages[5].kind == .cross);
+    try testing.expect(messages[0].style == .solid and messages[0].dst_endpoint == .none);
+    try testing.expect(messages[1].style == .dotted and messages[1].dst_endpoint == .none);
+    try testing.expect(messages[2].style == .solid and messages[2].dst_endpoint == .arrow);
+    try testing.expect(messages[3].style == .dotted and messages[3].dst_endpoint == .arrow);
+    try testing.expect(messages[4].style == .solid and messages[4].dst_endpoint == .cross);
+    try testing.expect(messages[5].style == .dotted and messages[5].dst_endpoint == .cross);
     try testing.expectEqualStrings("open", messages[6].text);
-    try testing.expect(messages[6].style == .solid and messages[6].kind == .open);
-    try testing.expect(messages[7].style == .dotted and messages[7].kind == .open);
+    try testing.expect(messages[6].style == .solid and messages[6].dst_endpoint == .open);
+    try testing.expect(messages[7].style == .dotted and messages[7].dst_endpoint == .open);
     try testing.expectEqualStrings("", messages[8].text);
     try testing.expectEqual(@as(usize, 0), messages[0].pos);
     try testing.expectEqual(@as(usize, 8), messages[8].pos);
@@ -1885,10 +1938,60 @@ test "sequence bidirectional arrows" {
             "B<<-->>A: dotted\n",
     ).?;
     try testing.expectEqual(@as(usize, 2), seq.message_count);
-    try testing.expect(seq.messages[0].kind == .bidirectional);
+    try testing.expect(seq.messages[0].src_endpoint == .arrow and seq.messages[0].dst_endpoint == .arrow);
     try testing.expect(seq.messages[0].style == .solid);
-    try testing.expect(seq.messages[1].kind == .bidirectional);
+    try testing.expect(seq.messages[1].src_endpoint == .arrow and seq.messages[1].dst_endpoint == .arrow);
     try testing.expect(seq.messages[1].style == .dotted);
+}
+
+test "sequence half arrows" {
+    const seq = parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "A-|\\B\n" ++
+            "A-|/B\n" ++
+            "A-\\\\B\n" ++
+            "A-//B\n" ++
+            "A--|\\B\n" ++
+            "A--|/B\n" ++
+            "A--\\\\B\n" ++
+            "A--//B\n" ++
+            "B/|-A\n" ++
+            "B\\|-A\n" ++
+            "B//-A\n" ++
+            "B\\\\-A\n" ++
+            "B/|--A\n" ++
+            "B\\|--A\n" ++
+            "B//--A\n" ++
+            "B\\\\--A\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 16), seq.message_count);
+    const endpoints = [_]MsgEndpoint{ .half_top, .half_bottom, .stick_top, .stick_bottom };
+    for (0..8) |index| {
+        const style: MsgStyle = if (index < 4) .solid else .dotted;
+        try testing.expect(seq.messages[index].dst_endpoint == endpoints[index % endpoints.len]);
+        try testing.expect(seq.messages[index].style == style);
+    }
+    for (8..16) |index| {
+        const style: MsgStyle = if (index < 12) .solid else .dotted;
+        try testing.expect(seq.messages[index].src_endpoint == endpoints[index % endpoints.len]);
+        try testing.expect(seq.messages[index].style == style);
+    }
+}
+
+test "sequence central connections" {
+    const seq = parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "A->>()B: destination\n" ++
+            "A()->>B: source\n" ++
+            "A()->>()B: both\n" ++
+            "A()<<-->>()B: bidirectional\n",
+    ).?;
+    try testing.expect(seq.messages[0].central == .destination);
+    try testing.expect(seq.messages[1].central == .source);
+    try testing.expect(seq.messages[2].central == .both);
+    try testing.expect(seq.messages[3].central == .both);
+    try testing.expect(seq.messages[3].src_endpoint == .arrow and seq.messages[3].dst_endpoint == .arrow);
+    try testing.expect(parseSequenceBlockText("sequenceDiagram\nA()->>()A: self\n") == null);
 }
 
 test "sequence message text splits on first colon" {
@@ -2096,9 +2199,9 @@ test "six message conversation" {
     try testing.expectEqualStrings("Bob", seq.participants[1].id);
     try testing.expectEqualStrings("John", seq.participants[2].id);
     try testing.expectEqual(@as(usize, 6), seq.message_count);
-    try testing.expect(seq.messages[0].kind == .arrow);
-    try testing.expect(seq.messages[2].kind == .cross);
-    try testing.expect(seq.messages[3].kind == .cross);
+    try testing.expect(seq.messages[0].dst_endpoint == .arrow);
+    try testing.expect(seq.messages[2].dst_endpoint == .cross);
+    try testing.expect(seq.messages[3].dst_endpoint == .cross);
     try testing.expectEqualStrings("Yes... John, how are you?", seq.messages[5].text);
 }
 
