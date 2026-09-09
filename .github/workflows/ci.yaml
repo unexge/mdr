@@ -21,18 +21,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
-      - name: Install Bombadil
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/bombadil" https://github.com/antithesishq/bombadil/releases/download/v0.7.2/bombadil-x86_64-linux
-          chmod +x "$RUNNER_TEMP/bombadil"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: zig build -Doptimize=ReleaseSafe --summary all
       - name: Bombadil
-        run: |
-          log="$RUNNER_TEMP/bombadil.log"
-          code=0
-          zig build bombadil -Doptimize=ReleaseSafe --summary all >"$log" 2>&1 || code=$?
-          tail -n 20 "$log"
-          exit "$code"
+        uses: antithesishq/bombadil-action@v2
+        with:
+          version: 0.7.3
+          driver: terminal
+          command: ./zig-out/bin/mdr ./bombadil/fixture.md
+          specification: ./bombadil/mdr.ts
+          time-limit: 5m
+          exit-on-violation: true
+          columns: 120
+          rows: 24
+          output-path: zig-out/bombadil
+          output-path-overwrite: true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
