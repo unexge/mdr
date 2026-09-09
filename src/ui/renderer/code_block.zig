@@ -196,11 +196,20 @@ test "mermaid flowcharts render as diagrams" {
     try testing.expectEqualStrings("▼", win.readCell(2, 4).?.char.grapheme);
 }
 
-test "unrenderable mermaid falls back to the card" {
-    const diagram: Document.Element.CodeBlock = .{ .info = .{ .mermaid = "mermaid" }, .content = "sequenceDiagram\nnot a diagram !!!\n" };
-    try testing.expectEqual(@as(usize, 3), layout(null, diagram, 0, 0, 40));
+test "unsupported mermaid syntax falls back to the card" {
+    const diagram: Document.Element.CodeBlock = .{
+        .info = .{ .mermaid = "mermaid" },
+        .content = "graph TD\nA-->B\nsubgraph inner\nB-->C\nend\n",
+    };
+    try testing.expectEqual(@as(usize, 6), layout(null, diagram, 0, 0, 40));
 
-    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    const sequence_diagram: Document.Element.CodeBlock = .{
+        .info = .{ .mermaid = "mermaid" },
+        .content = "sequenceDiagram\nA->>B: before\ncritical important\nB->>A: inside\nend\n",
+    };
+    try testing.expectEqual(@as(usize, 6), layout(null, sequence_diagram, 0, 0, 40));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 6, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(testing.allocator);
     const win: vaxis.Window = .{
         .x_off = 0,
@@ -208,7 +217,7 @@ test "unrenderable mermaid falls back to the card" {
         .parent_x_off = 0,
         .parent_y_off = 0,
         .width = 40,
-        .height = 3,
+        .height = 6,
         .screen = &screen,
     };
     _ = layout(win, diagram, 0, 0, 40);

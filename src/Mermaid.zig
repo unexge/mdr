@@ -1,9 +1,9 @@
-//! Zero-copy Mermaid flowchart parser (graph/flowchart only).
+//! Zero-copy Mermaid flowchart and sequence diagram parsers.
 //!
 //! parseBlock borrows a fenced code block; every slice in the returned
-//! Flowchart points into the block content. There is no allocation and no
-//! failure: unknown lines are skipped, over-cap input sets degraded, and
-//! non-flowchart blocks return null so callers fall back to the code card.
+//! Flowchart points into the block content. There is no allocation. Unsupported
+//! syntax returns null, while over-cap input sets degraded, so callers can fall
+//! back to the code card.
 
 pub const max_nodes = 64;
 pub const max_edges = 128;
@@ -60,14 +60,14 @@ pub fn parseBlock(cb: Document.Element.CodeBlock) ?Flowchart {
     var parser: Parser = .{};
     var lines = cb.lines();
     while (lines.next()) |line| parser.feed(line);
-    if (!parser.seen_header) return null;
+    if (!parser.seen_header or !parser.supported) return null;
     return parser.flow;
 }
 
 pub fn parseText(text: []const u8) ?Flowchart {
     var parser: Parser = .{};
     feedLines(&parser, text);
-    if (!parser.seen_header) return null;
+    if (!parser.seen_header or !parser.supported) return null;
     return parser.flow;
 }
 
@@ -80,45 +80,56 @@ fn feedLines(parser: anytype, text: []const u8) void {
     }
 }
 
+fn isComment(line: []const u8) bool {
+    return mem.startsWith(u8, line, "%%") and !mem.startsWith(u8, line, "%%{");
+}
+
 const Parser = struct {
     flow: Flowchart = .{},
     seen_header: bool = false,
+    supported: bool = true,
 
     fn feed(self: *Parser, raw: []const u8) void {
+        if (!self.supported) return;
         const line = mem.trim(u8, raw, " \t\r");
-        if (line.len == 0) return;
-        if (mem.startsWith(u8, line, "%%")) return;
+        if (line.len == 0 or isComment(line)) return;
         if (!self.seen_header) {
-            self.flow.direction = parseHeader(line) orelse return;
+            self.flow.direction = parseHeader(line) orelse {
+                self.supported = false;
+                return;
+            };
             self.seen_header = true;
             return;
         }
-        if (mem.eql(u8, line, "end")) return;
-        for ([_][]const u8{ "subgraph", "style", "classDef", "class", "click", "linkStyle" }) |keyword| {
-            if (isKeywordLine(line, keyword)) return;
+        for ([_][]const u8{ "end", "subgraph", "direction", "style", "classDef", "class", "click", "linkStyle" }) |keyword| {
+            if (isKeywordLine(line, keyword)) {
+                self.supported = false;
+                return;
+            }
         }
-        self.feedBody(line);
+        if (!self.feedBody(line)) self.supported = false;
     }
 
-    fn feedBody(self: *Parser, line: []const u8) void {
-        if (self.flow.degraded) return;
+    fn feedBody(self: *Parser, line: []const u8) bool {
+        if (self.flow.degraded) return true;
         var pos: usize = 0;
         var prev_id: ?[]const u8 = null;
         var pending: ?Op = null;
         while (pos <= line.len) {
             const found = findOp(line, pos);
             const end = if (found) |f| f.at else line.len;
-            const node = parseNode(mem.trim(u8, line[pos..end], " \t\r")) orelse return;
-            const id = self.intern(node) orelse return;
+            const node = parseNode(mem.trim(u8, line[pos..end], " \t\r")) orelse return false;
+            const id = self.intern(node) orelse return self.flow.degraded;
             if (pending) |op| {
                 self.addEdge(prev_id.?, id, op);
-                if (self.flow.degraded) return;
+                if (self.flow.degraded) return true;
             }
-            const f = found orelse return;
+            const f = found orelse return true;
             prev_id = id;
             pending = f.op;
             pos = f.after;
         }
+        return true;
     }
 
     fn intern(self: *Parser, node: Node) ?[]const u8 {
@@ -161,11 +172,19 @@ fn parseHeader(line: []const u8) ?Direction {
     var end: usize = 0;
     while (end < rest.len and rest[end] != ' ' and rest[end] != '\t' and rest[end] != ';') : (end += 1) {}
     const dir = rest[0..end];
-    if (eqlIgnoreCase(dir, "TD") or eqlIgnoreCase(dir, "TB")) return .tb;
-    if (eqlIgnoreCase(dir, "BT")) return .bt;
-    if (eqlIgnoreCase(dir, "LR")) return .lr;
-    if (eqlIgnoreCase(dir, "RL")) return .rl;
-    return null;
+    const direction: Direction = if (eqlIgnoreCase(dir, "TD") or eqlIgnoreCase(dir, "TB"))
+        .tb
+    else if (eqlIgnoreCase(dir, "BT"))
+        .bt
+    else if (eqlIgnoreCase(dir, "LR"))
+        .lr
+    else if (eqlIgnoreCase(dir, "RL"))
+        .rl
+    else
+        return null;
+    const tail = mem.trim(u8, rest[end..], " \t\r");
+    if (tail.len > 0 and !mem.eql(u8, tail, ";")) return null;
+    return direction;
 }
 
 fn isKeywordLine(line: []const u8, keyword: []const u8) bool {
@@ -347,7 +366,7 @@ pub const Note = struct {
     pos: usize,
 };
 
-pub const FragmentOp = enum { loop, alt, opt, par, @"opaque" };
+pub const FragmentOp = enum { loop, alt, opt, par };
 
 pub const Divider = struct {
     pos: usize,
@@ -389,8 +408,9 @@ pub const Sequence = struct {
 pub fn parseSequenceBlockText(text: []const u8) ?Sequence {
     var parser: SeqParser = .{};
     feedLines(&parser, text);
-    if (!parser.seen_header) return null;
+    if (!parser.seen_header or !parser.supported) return null;
     parser.finish();
+    if (!parser.supported) return null;
     return parser.seq;
 }
 
@@ -400,25 +420,35 @@ pub fn parseSequenceBlock(cb: Document.Element.CodeBlock) ?Sequence {
     var parser: SeqParser = .{};
     var lines = cb.lines();
     while (lines.next()) |line| parser.feed(line);
-    if (!parser.seen_header) return null;
+    if (!parser.seen_header or !parser.supported) return null;
     parser.finish();
+    if (!parser.supported) return null;
     return parser.seq;
 }
 
 const SeqParser = struct {
     seq: Sequence = .{},
     seen_header: bool = false,
+    supported: bool = true,
     pos: usize = 0,
     stack: [max_fragment_depth]usize = undefined,
     stack_len: usize = 0,
     active_from: [max_participants]?usize = [_]?usize{null} ** max_participants,
 
     fn feed(self: *SeqParser, raw: []const u8) void {
-        if (self.seq.degraded) return;
+        if (self.seq.degraded or !self.supported) return;
         const line = mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or mem.startsWith(u8, line, "%%")) return;
+        if (line.len == 0 or isComment(line)) return;
         if (!self.seen_header) {
-            if (mem.eql(u8, line, "sequenceDiagram")) self.seen_header = true;
+            if (!mem.eql(u8, line, "sequenceDiagram")) {
+                self.supported = false;
+                return;
+            }
+            self.seen_header = true;
+            return;
+        }
+        if (mem.indexOfScalar(u8, line, ';') != null) {
+            self.supported = false;
             return;
         }
         if (parseParticipantLine(line)) |p| {
@@ -434,12 +464,14 @@ const SeqParser = struct {
             self.addMessage(m);
             return;
         }
+        self.supported = false;
     }
 
     fn finish(self: *SeqParser) void {
-        while (self.stack_len > 0) {
-            self.stack_len -= 1;
-            self.seq.fragments[self.stack[self.stack_len]].end = self.pos;
+        if (self.seq.degraded) return;
+        if (self.stack_len > 0) {
+            self.supported = false;
+            return;
         }
         for (self.active_from[0..self.seq.participant_count], 0..) |from, i| {
             const start = from orelse continue;
@@ -518,12 +550,18 @@ const SeqParser = struct {
     }
 
     fn startActivation(self: *SeqParser, idx: usize, at: usize) void {
-        if (self.active_from[idx] != null) return;
+        if (self.active_from[idx] != null) {
+            self.supported = false;
+            return;
+        }
         self.active_from[idx] = at;
     }
 
     fn endActivation(self: *SeqParser, idx: usize, at: usize) void {
-        const start = self.active_from[idx] orelse return;
+        const start = self.active_from[idx] orelse {
+            self.supported = false;
+            return;
+        };
         if (self.seq.activation_count >= max_activations) {
             self.seq.degraded = true;
             return;
@@ -538,15 +576,23 @@ const SeqParser = struct {
     }
 
     fn feedControl(self: *SeqParser, line: []const u8) bool {
-        if (stripKeyword(line, "autonumber") != null) {
-            self.seq.autonumber = true;
+        if (stripKeyword(line, "autonumber")) |options| {
+            if (options.len > 0) self.supported = false else self.seq.autonumber = true;
             return true;
         }
-        if (prefixId(line, "activate")) |id| {
+        if (stripKeyword(line, "activate")) |raw_id| {
+            const id = parseId(raw_id) orelse {
+                self.supported = false;
+                return true;
+            };
             if (self.intern(id)) |idx| self.startActivation(idx, self.pos);
             return true;
         }
-        if (prefixId(line, "deactivate")) |id| {
+        if (stripKeyword(line, "deactivate")) |raw_id| {
+            const id = parseId(raw_id) orelse {
+                self.supported = false;
+                return true;
+            };
             if (self.intern(id)) |idx| self.endActivation(idx, self.pos);
             return true;
         }
@@ -563,24 +609,29 @@ const SeqParser = struct {
             }
         }
         for ([_][]const u8{ "rect", "critical", "break", "box" }) |kw| {
-            if (stripKeyword(line, kw)) |label| {
-                self.push(.@"opaque", label);
+            if (stripKeyword(line, kw) != null) {
+                self.supported = false;
                 return true;
             }
         }
         if (stripKeyword(line, "and")) |label| {
-            self.div("and", label);
+            if (!self.topIs(.par)) self.supported = false else self.div("and", label);
             return true;
         }
         if (stripKeyword(line, "else")) |label| {
-            self.div("else", label);
+            if (!self.topIs(.alt)) self.supported = false else self.div("else", label);
             return true;
         }
-        if (stripKeyword(line, "end") != null) {
-            self.close();
+        if (stripKeyword(line, "end")) |tail| {
+            if (tail.len > 0 or self.stack_len == 0) self.supported = false else self.close();
             return true;
         }
         return false;
+    }
+
+    fn topIs(self: *const SeqParser, op: FragmentOp) bool {
+        if (self.stack_len == 0) return false;
+        return self.seq.fragments[self.stack[self.stack_len - 1]].op == op;
     }
 
     fn push(self: *SeqParser, op: FragmentOp, label: []const u8) void {
@@ -608,9 +659,11 @@ const SeqParser = struct {
     }
 
     fn div(self: *SeqParser, head: []const u8, label: []const u8) void {
-        if (self.stack_len == 0) return;
         const frag = &self.seq.fragments[self.stack[self.stack_len - 1]];
-        if (frag.div_count >= frag.divs.len) return;
+        if (frag.div_count >= frag.divs.len) {
+            self.seq.degraded = true;
+            return;
+        }
         frag.divs[frag.div_count] = .{ .pos = self.pos, .head = head, .text = label };
         frag.div_count += 1;
     }
@@ -623,14 +676,6 @@ fn boundary(s: []const u8, n: usize) bool {
 fn stripKeyword(s: []const u8, kw: []const u8) ?[]const u8 {
     if (!mem.startsWith(u8, s, kw) or !boundary(s, kw.len)) return null;
     return mem.trim(u8, s[kw.len..], " \t");
-}
-
-fn prefixId(s: []const u8, kw: []const u8) ?[]const u8 {
-    const rest = stripKeyword(s, kw) orelse return null;
-    var i: usize = 0;
-    while (i < rest.len and isIdChar(rest[i])) : (i += 1) {}
-    if (i == 0 or i != rest.len) return null;
-    return rest[0..i];
 }
 
 fn parseId(s: []const u8) ?[]const u8 {
@@ -900,22 +945,21 @@ test "dashes inside labels never split" {
     try testing.expectEqual(@as(usize, 2), flow.edge_count);
 }
 
-test "comments and non-graph lines are skipped" {
-    const flow = parseText(
-        "%% a comment\n" ++
-            "graph TD\n" ++
-            "subgraph inner\n" ++
-            "A-->B\n" ++
-            "style A fill:red\n" ++
-            "classDef x fill:blue\n" ++
-            "class A x\n" ++
-            "click A href\n" ++
-            "not a node !!!\n" ++
-            "end\n",
-    ).?;
+test "flowchart comments are skipped" {
+    const flow = parseText("%% a comment\ngraph TD\nA-->B\n").?;
     try testing.expectEqual(@as(usize, 2), flow.node_count);
     try testing.expectEqual(@as(usize, 1), flow.edge_count);
-    try testing.expect(!flow.degraded);
+}
+
+test "unsupported flowchart statements are rejected" {
+    for ([_][]const u8{
+        "graph TD\nA-->B\nsubgraph inner\nB-->C\nend\n",
+        "graph TD\nA-->B\nstyle A fill:red\n",
+        "graph TD\nA-->B\nnot a node !!!\n",
+        "%%{init: {'theme': 'dark'}}%%\ngraph TD\nA-->B\n",
+    }) |text| {
+        try testing.expect(parseText(text) == null);
+    }
 }
 
 test "over-cap diagrams degrade" {
@@ -1039,7 +1083,9 @@ test "sequence fragments" {
             "B->>A: silence\n" ++
             "end\n" ++
             "opt maybe\n" ++
-            "A->>B: again\n",
+            "A->>B: again\n" ++
+            "end\n" ++
+            "end\n",
     ).?;
     try testing.expectEqual(@as(usize, 3), seq.fragment_count);
     try testing.expect(seq.fragments[0].op == .loop);
@@ -1060,20 +1106,18 @@ test "sequence fragments" {
     try testing.expectEqual(@as(usize, 4), seq.fragments[2].end);
 }
 
-test "sequence stray and opaque blocks" {
-    const seq = parseSequenceBlockText(
-        "sequenceDiagram\n" ++
-            "end\n" ++
-            "rect one\n" ++
-            "A->>B: inside\n" ++
-            "end\n" ++
-            "A->>B: outside\n",
-    ).?;
-    try testing.expectEqual(@as(usize, 1), seq.fragment_count);
-    try testing.expect(seq.fragments[0].op == .@"opaque");
-    try testing.expectEqual(@as(usize, 0), seq.fragments[0].start);
-    try testing.expectEqual(@as(usize, 1), seq.fragments[0].end);
-    try testing.expectEqual(@as(usize, 2), seq.message_count);
+test "unsupported sequence statements are rejected" {
+    for ([_][]const u8{
+        "sequenceDiagram\nA->>B: before\ncritical important\nB->>A: inside\nend\n",
+        "sequenceDiagram\nA->>B: before\nbox Group\nparticipant C\nend\n",
+        "sequenceDiagram\nA->>B: before\nnot sequence syntax\n",
+        "sequenceDiagram\nloop forever\nA->>B: again\n",
+        "sequenceDiagram\nactivate A\nactivate A\nA->>B: nested\n",
+        "sequenceDiagram\nA->>B: one; B->>A: two\n",
+        "%%{init: {'theme': 'dark'}}%%\nsequenceDiagram\nA->>B: before\n",
+    }) |text| {
+        try testing.expect(parseSequenceBlockText(text) == null);
+    }
 }
 
 test "par blocks are real fragments" {

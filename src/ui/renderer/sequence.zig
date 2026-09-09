@@ -82,7 +82,6 @@ const Layout = struct {
         if (lay.rows > max_rows) return null;
         var max_depth: usize = 0;
         for (seq.fragments[0..seq.fragment_count]) |*f| {
-            if (f.op == .@"opaque") continue;
             max_depth = @max(max_depth, f.depth);
         }
         if (max_depth * 2 + 4 > lay.cols) return null;
@@ -113,7 +112,6 @@ const Layout = struct {
             }
         }
         for (self.seq.fragments[0..self.seq.fragment_count]) |*f| {
-            if (f.op == .@"opaque") continue;
             if (f.start <= pos) r += 1;
             if (f.end > f.start and f.end <= pos) r += 1;
         }
@@ -180,7 +178,7 @@ const Layout = struct {
         var k: usize = 0;
         var rank: usize = 0;
         for (self.seq.fragments[0..self.seq.fragment_count], 0..) |*g, j| {
-            if (g.op == .@"opaque" or g.start != f.start) continue;
+            if (g.start != f.start) continue;
             k += 1;
             if (g.depth < f.depth or (g.depth == f.depth and j < fi)) rank += 1;
         }
@@ -192,7 +190,7 @@ const Layout = struct {
         var k: usize = 0;
         var rank: usize = 0;
         for (self.seq.fragments[0..self.seq.fragment_count], 0..) |*g, j| {
-            if (g.op == .@"opaque" or g.end != f.end or g.end <= g.start) continue;
+            if (g.end != f.end or g.end <= g.start) continue;
             k += 1;
             if (g.depth > f.depth or (g.depth == f.depth and j < fi)) rank += 1;
         }
@@ -310,7 +308,6 @@ const Layout = struct {
             cells.putText(win, erow, c1 + 3 + dv.head.len, start_row, skip, "]", c2, dim);
             if (dv.text.len > 0) cells.putText(win, erow, c1 + 4 + dv.head.len, start_row, skip, dv.text, c2, dim);
         }
-        if (f.op == .@"opaque") return;
         const top = self.fragTop(fi);
         const op = @tagName(f.op);
         cells.putLine(win, top, c1, start_row, skip, "┌", dim);
@@ -489,7 +486,8 @@ test "loop fragments box messages" {
     var seq = Mermaid.parseSequenceBlockText(
         "sequenceDiagram\n" ++
             "loop Every minute\n" ++
-            "A->>B: ping\n",
+            "A->>B: ping\n" ++
+            "end\n",
     ).?;
     try testing.expectEqual(@as(usize, 7), layout(null, &seq, 0, 0, 40).?);
 
@@ -550,24 +548,6 @@ test "alt else dividers" {
     try expectGlyph(win, 0, 9, "└");
     try testing.expect(win.readCell(2, 6).?.style.dim);
     try testing.expect(win.readCell(0, 6).?.style.dim);
-}
-
-test "opaque fragments draw nothing" {
-    var seq = Mermaid.parseSequenceBlockText(
-        "sequenceDiagram\n" ++
-            "rect one\n" ++
-            "A->>B: inside\n" ++
-            "end\n",
-    ).?;
-    try testing.expectEqual(@as(usize, 5), layout(null, &seq, 0, 0, 40).?);
-
-    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 5, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
-    defer screen.deinit(testing.allocator);
-    const win = window(&screen);
-    _ = layout(win, &seq, 0, 0, 40).?;
-    try expectGlyph(win, 0, 3, " ");
-    try expectGlyph(win, 10, 4, "►");
-    try expectGlyph(win, 2, 4, "┼");
 }
 
 test "activations widen lifelines" {

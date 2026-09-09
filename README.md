@@ -36,8 +36,10 @@ mdr <file.md>
 
 - CommonMark plus GFM strikethrough, task lists, tables, and reference links
 - Fenced code blocks as cards; local images via Kitty graphics
-- Mermaid `graph`/`flowchart` and `sequenceDiagram` rendered as unicode
-  diagrams (anything unrenderable falls back to the code card)
+- A Mermaid subset rendered as unicode diagrams: `graph`/`flowchart` nodes
+  and edges plus `sequenceDiagram` participants, messages, notes,
+  `loop`/`alt`/`opt`/`par` fragments, activations, and autonumber
+- Unsupported Mermaid syntax and unrenderable layouts fall back to the code card
 
 ## Testing
 
