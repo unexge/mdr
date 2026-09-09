@@ -16,9 +16,14 @@ const max_line_cells = 256;
 /// scoped buffer, which must live until the frame has been flushed.
 var frame_buf: [512]u8 = undefined;
 var frame_len: usize = 0;
+var search_query: []const u8 = "";
 
 pub fn beginFrame() void {
     frame_len = 0;
+}
+
+pub fn setSearchQuery(q: []const u8) void {
+    search_query = q;
 }
 
 fn frameCopy(bytes: []const u8) ?[]const u8 {
@@ -56,23 +61,36 @@ pub fn layout(win: ?vaxis.Window, content: []const u8, base: vaxis.Style, start_
     while (spans.next()) |span| {
         if (lay.clipped()) break;
         switch (span) {
-            .text => |t| lay.feedText(t, lay.top()),
+            .text => |t| feedHighlight(&lay, t, lay.top()),
             .code => |t| {
                 lay.flushWord();
                 var format = lay.top();
                 format.style.fg = Theme.code;
                 format.style.bg = Theme.panel;
-                lay.feedText(t, format);
+                feedHighlight(&lay, t, format);
             },
             .entity => |raw| {
                 lay.flushWord();
                 var buf: [4]u8 = undefined;
                 const decoded = Document.decodeEntity(raw, &buf) orelse raw;
-                lay.putText(frameCopy(decoded) orelse raw, lay.top());
+                const text = frameCopy(decoded) orelse raw;
+                if (Search.findFirst(text, search_query) != null) {
+                    var format = lay.top();
+                    format.style = Search.highlight(format.style);
+                    if (lay.win != null) format.search_seq = Search.nextSeq();
+                    lay.putText(text, format);
+                } else {
+                    lay.putText(text, lay.top());
+                }
             },
             .escape => |char| {
                 if (lay.piece_count == max_word_pieces) lay.flushWord();
-                lay.pieces[lay.piece_count] = .{ .text = char, .format = lay.top() };
+                var format = lay.top();
+                if (Search.findFirst(char, search_query) != null) {
+                    format.style = Search.highlight(format.style);
+                    if (lay.win != null) format.search_seq = Search.nextSeq();
+                }
+                lay.pieces[lay.piece_count] = .{ .text = char, .format = format };
                 lay.piece_count += 1;
                 lay.word_width += 1;
             },
@@ -146,6 +164,32 @@ fn gwidth(text: []const u8) usize {
     return vaxis.gwidth.gwidth(text, .unicode);
 }
 
+fn feedHighlight(lay: *Lay, text: []const u8, format: Format) void {
+    if (search_query.len == 0) {
+        lay.feedText(text, format);
+        return;
+    }
+    var pos: usize = 0;
+    while (pos < text.len) {
+        const rel = Search.findFirst(text[pos..], search_query) orelse {
+            lay.feedText(text[pos..], format);
+            break;
+        };
+        if (rel > 0) lay.feedText(text[pos .. pos + rel], format);
+        var hl = format;
+        hl.style = Search.highlight(format.style);
+        if (lay.win != null) hl.search_seq = Search.nextSeq();
+        lay.feedText(text[pos + rel .. pos + rel + search_query.len], hl);
+        pos += rel + search_query.len;
+    }
+}
+
+fn resolveStyle(format: Format) vaxis.Style {
+    if (format.search_seq == 0) return format.style;
+    if (Search.runIsFocus(format.search_seq)) return Search.focus(format.style);
+    return format.style;
+}
+
 const Piece = struct {
     text: []const u8,
     format: Format,
@@ -154,6 +198,7 @@ const Piece = struct {
 const Format = struct {
     style: vaxis.Style,
     link: vaxis.Cell.Hyperlink = .{},
+    search_seq: u32 = 0,
 };
 
 const LineCell = struct {
@@ -230,7 +275,7 @@ const Lay = struct {
         for (self.line[0..self.line_count]) |c| {
             win.writeCell(@intCast(x), @intCast(self.row), .{
                 .char = .{ .grapheme = c.text, .width = @intCast(c.width) },
-                .style = c.format.style,
+                .style = resolveStyle(c.format),
                 .link = c.format.link,
             });
             x += c.width;
@@ -246,7 +291,7 @@ const Lay = struct {
                 for (self.line[0..self.line_count]) |c| {
                     win.writeCell(@intCast(x), @intCast(self.row), .{
                         .char = .{ .grapheme = c.text, .width = @intCast(c.width) },
-                        .style = c.format.style,
+                        .style = resolveStyle(c.format),
                         .link = c.format.link,
                     });
                     x += c.width;
@@ -272,7 +317,7 @@ const Lay = struct {
             if (self.row < win.height) {
                 win.writeCell(@intCast(self.col), @intCast(self.row), .{
                     .char = .{ .grapheme = g, .width = @intCast(w) },
-                    .style = format.style,
+                    .style = resolveStyle(format),
                     .link = format.link,
                 });
             }
@@ -363,6 +408,7 @@ const Lay = struct {
 const std = @import("std");
 const mem = std.mem;
 const Document = @import("../../Document.zig");
+const Search = @import("../Search.zig");
 const Theme = @import("../Theme.zig");
 const vaxis = @import("vaxis");
 
@@ -419,6 +465,78 @@ test "measures with reference links resolved" {
     try testing.expectEqual(layout(null, p.content, .{}, 0, 0, 20, p.chain, .left, p.refs), measure(p.content, 20, p.chain, p.refs));
     try testing.expectEqual(@as(usize, 1), measure("[click][here]", 6, .{}, p.refs));
     try testing.expectEqual(@as(usize, 3), measure("[click][here]", 6, .{}, null));
+}
+
+test "search highlights matches without changing rows" {
+    Search.beginFrame();
+    Search.setEntryFocus(true, 0);
+    setSearchQuery("world");
+    defer setSearchQuery("");
+    try testing.expectEqual(@as(usize, 1), measure("hello world", 20, .{}, null));
+    try testing.expectEqual(@as(usize, 2), measure("hello world", 5, .{}, null));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 1,
+        .screen = &screen,
+    };
+    _ = render(win, "hello world", .{}, 0, 0, .{});
+    try testing.expect(!win.readCell(0, 0).?.style.bg.eql(Theme.gold));
+    for (6..11) |col| {
+        try testing.expect(win.readCell(@intCast(col), 0).?.style.bg.eql(Theme.accent));
+    }
+}
+
+test "focused run takes the focus style" {
+    Search.beginFrame();
+    Search.setEntryFocus(true, 1);
+    setSearchQuery("o");
+    defer setSearchQuery("");
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 1,
+        .screen = &screen,
+    };
+    _ = render(win, "foo boo", .{}, 0, 0, .{});
+    try testing.expect(win.readCell(1, 0).?.style.bg.eql(Theme.gold));
+    try testing.expect(win.readCell(2, 0).?.style.bg.eql(Theme.accent));
+    try testing.expect(win.readCell(5, 0).?.style.bg.eql(Theme.gold));
+    try testing.expect(win.readCell(6, 0).?.style.bg.eql(Theme.gold));
+}
+
+test "search highlight is case-insensitive and keeps emphasis" {
+    Search.beginFrame();
+    Search.setEntryFocus(true, 0);
+    setSearchQuery("HELLO");
+    defer setSearchQuery("");
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 1,
+        .screen = &screen,
+    };
+    _ = render(win, "**hello** there", .{}, 0, 0, .{});
+    const cell = win.readCell(0, 0).?;
+    try testing.expect(cell.style.bg.eql(Theme.accent));
+    try testing.expect(cell.style.bold);
+    try testing.expect(!win.readCell(6, 0).?.style.bg.eql(Theme.accent));
 }
 
 test "renders center and right alignment" {

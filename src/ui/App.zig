@@ -72,6 +72,7 @@ next_stable_placements: [max_images]Kitty.Placement = undefined,
 next_stable_placement_count: usize = 0,
 next_image_id: u32 = 1,
 quit: bool = false,
+search: Search = .{},
 
 pub fn init(gpa: mem.Allocator, doc: *Document) App {
     return .{ .gpa = gpa, .doc = doc };
@@ -114,14 +115,17 @@ pub fn run(self: *App, io: Io, environ: *std.process.Environ.Map) !void {
         self.cancelPendingMedia();
         self.freeImages(tty.writer());
     }
+    var search_tasks: Io.Group = .init;
+    defer search_tasks.cancel(io);
 
     while (!self.quit) {
         try loop.pollEvent();
         while (try loop.tryEvent()) |event| {
             switch (event) {
-                .key_press => |key| try self.handleKey(&vx, key),
+                .key_press => |key| try self.handleKey(io, &vx, key, &loop, &search_tasks),
                 .winsize => |ws| try vx.resize(self.gpa, tty.writer(), ws),
                 .media_loaded => try self.finishMedia(tty.writer()),
+                .search_tick => |generation| try self.handleSearchTick(generation),
             }
             if (self.quit) break;
         }
@@ -133,11 +137,28 @@ const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
     media_loaded,
+    search_tick: u64,
 };
 
-fn handleKey(self: *App, vx: *vaxis.Vaxis, key: vaxis.Key) !void {
-    if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) {
+fn handleKey(self: *App, io: Io, vx: *vaxis.Vaxis, key: vaxis.Key, loop: *vaxis.Loop(Event), search_tasks: *Io.Group) !void {
+    if (key.matches('c', .{ .ctrl = true })) {
         self.quit = true;
+        return;
+    }
+    if (self.search.open) {
+        try self.handleSearchKey(io, key, loop, search_tasks);
+        return;
+    }
+    if (key.matches('q', .{})) {
+        self.quit = true;
+    } else if (key.matches('/', .{})) {
+        self.search.activate();
+    } else if (key.matches(vaxis.Key.escape, .{}) and self.search.len > 0) {
+        self.search.cancel();
+    } else if (key.matches('N', .{}) and self.search.len > 0) {
+        try self.nextMatch(-1);
+    } else if (key.matches('n', .{}) and self.search.len > 0) {
+        try self.nextMatch(1);
     } else if (key.matches('G', .{}) or key.matches(vaxis.Key.end, .{})) {
         try self.ensureVisible(math.maxInt(usize));
         self.scroll = self.maxScroll();
@@ -146,6 +167,154 @@ fn handleKey(self: *App, vx: *vaxis.Vaxis, key: vaxis.Key) !void {
     } else {
         self.scrollKeys(key);
     }
+}
+
+fn handleSearchKey(self: *App, io: Io, key: vaxis.Key, loop: *vaxis.Loop(Event), search_tasks: *Io.Group) !void {
+    if (key.matches(vaxis.Key.escape, .{})) {
+        self.search.cancel();
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{})) {
+        if (self.search.len > 0) try self.commitSearch();
+        self.search.confirm();
+        return;
+    }
+    if (key.matches(vaxis.Key.backspace, .{ .ctrl = true }) or
+        key.matches(vaxis.Key.backspace, .{ .alt = true }))
+    {
+        self.search.clear();
+        return;
+    }
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        if (self.search.backspace()) self.scheduleSearchCommit(io, loop, search_tasks);
+        return;
+    }
+    if (key.matches(vaxis.Key.delete, .{})) {
+        if (self.search.deleteAt()) self.scheduleSearchCommit(io, loop, search_tasks);
+        return;
+    }
+    if (key.matches(vaxis.Key.left, .{})) {
+        self.search.moveLeft();
+        return;
+    }
+    if (key.matches(vaxis.Key.right, .{})) {
+        self.search.moveRight();
+        return;
+    }
+    if (key.matches(vaxis.Key.home, .{})) {
+        self.search.cursor = 0;
+        return;
+    }
+    if (key.matches(vaxis.Key.end, .{})) {
+        self.search.cursor = self.search.len;
+        return;
+    }
+    if (key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.meta) return;
+    if (key.text) |text| {
+        if (text.len > 0 and self.search.insert(text)) {
+            self.scheduleSearchCommit(io, loop, search_tasks);
+        }
+        return;
+    }
+    if (key.codepoint >= 32 and key.codepoint < 127) {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(key.codepoint), &buf) catch return;
+        if (self.search.insert(buf[0..n])) self.scheduleSearchCommit(io, loop, search_tasks);
+    }
+}
+
+fn scheduleSearchCommit(self: *App, io: Io, loop: *vaxis.Loop(Event), search_tasks: *Io.Group) void {
+    search_tasks.concurrent(io, searchDebounce, .{ io, self.search.generation, loop }) catch {};
+}
+
+fn searchDebounce(io: Io, generation: u64, loop: *vaxis.Loop(Event)) Io.Cancelable!void {
+    Io.Timeout.sleep(.{ .duration = .{ .raw = .{ .nanoseconds = Search.debounce_ns }, .clock = .awake } }, io) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+        return;
+    };
+    _ = loop.tryPostEvent(.{ .search_tick = generation }) catch false;
+}
+
+fn handleSearchTick(self: *App, generation: u64) !void {
+    if (generation != self.search.generation) return;
+    if (!self.search.open) return;
+    if (self.search.len == 0) {
+        self.search.no_match = false;
+        return;
+    }
+    try self.commitSearch();
+}
+
+fn commitSearch(self: *App) !void {
+    const q = self.search.query();
+    self.search.total = Search.countMatches(self.doc.text, q);
+    const found = Search.findFirst(self.doc.text, q) orelse {
+        self.search.no_match = true;
+        self.search.offset = null;
+        self.search.index = 0;
+        self.search.focus_entry = null;
+        self.search.focus_local = 0;
+        return;
+    };
+    try self.jumpToMatch(found, 0);
+}
+
+fn jumpToMatch(self: *App, offset: usize, index: usize) !void {
+    self.search.no_match = false;
+    self.search.offset = offset;
+    self.search.index = index;
+    const entry = try self.scrollToOffset(offset);
+    self.search.focus_entry = entry;
+    const region_start = if (entry == 0) 0 else self.entries.items[entry - 1].source_end;
+    const prefix = Search.countMatches(self.doc.text[0..@min(region_start, self.doc.text.len)], self.search.query());
+    self.search.focus_local = index -| prefix;
+}
+
+fn nextMatch(self: *App, dir: i8) !void {
+    const q = self.search.query();
+    if (q.len == 0) return;
+    const cur = self.search.offset orelse {
+        try self.commitSearch();
+        return;
+    };
+    if (dir >= 0) {
+        const start = cur + q.len;
+        if (start < self.doc.text.len) {
+            if (Search.findFirst(self.doc.text[start..], q)) |rel| {
+                try self.jumpToMatch(start + rel, self.search.index + 1);
+                return;
+            }
+        }
+        if (Search.findFirst(self.doc.text, q)) |first| {
+            try self.jumpToMatch(first, 0);
+        }
+    } else {
+        if (Search.findLastBefore(self.doc.text, q, cur)) |prev| {
+            try self.jumpToMatch(prev, Search.indexOf(self.doc.text, q, prev));
+        } else if (Search.findLastBefore(self.doc.text, q, self.doc.text.len)) |last| {
+            try self.jumpToMatch(last, Search.indexOf(self.doc.text, q, last));
+        }
+    }
+}
+
+fn scrollToOffset(self: *App, offset: usize) !usize {
+    var row: usize = 0;
+    var index: usize = 0;
+    while (true) {
+        if (index < self.measured) {
+            if (self.entries.items[index].source_end > offset) break;
+            row += self.entries.items[index].height;
+            index += 1;
+        } else {
+            const before = self.total_height;
+            try self.ensureVisible(before + 1);
+            if (self.total_height == before) break;
+        }
+    }
+    self.scroll = row -| 1;
+    self.clampScroll();
+    if (self.entries.items.len == 0) return 0;
+    return @min(index, self.entries.items.len - 1);
 }
 
 fn scrollKeys(self: *App, key: vaxis.Key) void {
@@ -180,9 +349,11 @@ fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop
         if (self.placement_mode != .unicode) vx.caps.kitty_graphics = false;
     }
     const win = vx.window();
+    const bar_rows: u16 = if (self.search.open) 1 else 0;
     const content = win.child(.{
         .x_off = 0,
         .width = @intCast(contentWidth(win.width)),
+        .height = win.height -| bar_rows,
     });
     const cell_size_changed = self.syncCellSize(content);
     self.syncWidth(content.width);
@@ -194,11 +365,18 @@ fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop
     try self.startVisibleMedia(io, loop, media_tasks);
 
     Renderer.beginFrame();
+    Renderer.setSearchQuery(self.search.query());
     win.clear();
     self.virtual_placement_count = 0;
     self.next_stable_placement_count = 0;
     try self.renderViewport(content);
-    self.drawScrollbar(win);
+    if (bar_rows > 0) {
+        self.drawScrollbar(win.child(.{ .height = win.height -| 1 }));
+        self.drawSearchBar(win);
+    } else {
+        self.drawScrollbar(win);
+    }
+    self.drawSearchCount(win);
     if (self.placement_mode == .unicode and self.virtual_placement_count > 0) {
         try Kitty.defineVirtualPlacements(tty, self.virtual_placements[0..self.virtual_placement_count]);
     }
@@ -238,6 +416,89 @@ fn drawScrollbar(self: *App, win: vaxis.Window) void {
     }
 }
 
+fn drawSearchBar(self: *App, win: vaxis.Window) void {
+    if (win.height == 0 or win.width == 0) return;
+    const row: u16 = win.height - 1;
+    var col: usize = 0;
+    while (col < win.width) : (col += 1) {
+        win.writeCell(@intCast(col), row, .{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = .{ .bg = Theme.panel },
+        });
+    }
+    const prompt_style: vaxis.Style = .{ .fg = Theme.accent, .bg = Theme.panel, .bold = true };
+    const query_style: vaxis.Style = .{ .bg = Theme.panel };
+    const cursor_style: vaxis.Style = .{ .bg = Theme.panel, .reverse = true };
+    win.writeCell(0, row, .{ .char = .{ .grapheme = "/", .width = 1 }, .style = prompt_style });
+    col = 1;
+    const q = self.search.query();
+    var iter = unicode.graphemeIterator(q);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(q);
+        const w = vaxis.gwidth.gwidth(bytes, .unicode);
+        if (w == 0) continue;
+        if (col + w >= win.width) continue;
+        win.writeCell(@intCast(col), row, .{
+            .char = .{ .grapheme = bytes, .width = @intCast(w) },
+            .style = query_style,
+        });
+        col += w;
+    }
+    const cursor_col = 1 + queryCursorWidth(q[0..@min(self.search.cursor, q.len)]);
+    if (cursor_col < win.width) {
+        const under: []const u8 = if (self.search.cursor < q.len) cursorGrapheme(q[self.search.cursor..]) else " ";
+        win.writeCell(@intCast(cursor_col), row, .{
+            .char = .{ .grapheme = under, .width = @intCast(vaxis.gwidth.gwidth(under, .unicode)) },
+            .style = cursor_style,
+        });
+    }
+    if (self.search.no_match) {
+        const msg = " no matches";
+        var miter = unicode.graphemeIterator(msg);
+        var mcol: usize = col + 1;
+        while (miter.next()) |g| {
+            const bytes = g.bytes(msg);
+            if (mcol + 1 >= win.width) break;
+            win.writeCell(@intCast(mcol), row, .{
+                .char = .{ .grapheme = bytes, .width = 1 },
+                .style = .{ .fg = Theme.muted, .bg = Theme.panel },
+            });
+            mcol += 1;
+        }
+    }
+}
+
+fn drawSearchCount(self: *App, win: vaxis.Window) void {
+    if (self.search.len == 0) return;
+    if (win.height == 0 or win.width < 10) return;
+    const text = self.search.countText();
+    if (text.len == 0 or text.len + 2 > win.width) return;
+    var col: usize = win.width - 1 - text.len;
+    var iter = unicode.graphemeIterator(text);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(text);
+        if (col >= win.width) break;
+        win.writeCell(@intCast(col), 0, .{
+            .char = .{ .grapheme = bytes, .width = 1 },
+            .style = .{ .fg = Theme.gold, .bg = Theme.panel, .bold = true },
+        });
+        col += 1;
+    }
+}
+
+fn queryCursorWidth(before: []const u8) usize {
+    var w: usize = 0;
+    var iter = unicode.graphemeIterator(before);
+    while (iter.next()) |g| w += vaxis.gwidth.gwidth(g.bytes(before), .unicode);
+    return w;
+}
+
+fn cursorGrapheme(rest: []const u8) []const u8 {
+    var iter = unicode.graphemeIterator(rest);
+    if (iter.next()) |g| return g.bytes(rest);
+    return " ";
+}
+
 /// Content fills four fifths of the window; narrower windows than this
 /// (about 960px at 8px cells) use the full width instead of side margins.
 const full_width_cols = 120;
@@ -252,13 +513,14 @@ fn contentWidth(full: usize) usize {
 fn renderViewport(self: *App, win: vaxis.Window) !void {
     var row: usize = 0;
     var skip = self.scroll;
-    for (self.entries.items) |*entry| {
+    for (self.entries.items, 0..) |*entry, i| {
         if (row >= win.height) break;
         // Cached heights are footprints: content rows plus the gap after.
         if (skip >= entry.height) {
             skip -= entry.height;
             continue;
         }
+        Search.setEntryFocus(self.search.focus_entry == i, self.search.focus_local);
         row = try self.renderEntry(win, entry, row, skip);
         skip = 0;
         row = @min(win.height, row + 1);
@@ -597,9 +859,11 @@ const path = std.fs.path;
 const vaxis = @import("vaxis");
 const Document = @import("../Document.zig");
 const Renderer = @import("Renderer.zig");
+const Search = @import("Search.zig");
 const Theme = @import("Theme.zig");
 const Media = @import("Media.zig");
 const Kitty = @import("Kitty.zig");
+const unicode = vaxis.unicode;
 const Element = Document.Element;
 const ArrayList = std.ArrayList;
 const max_images = 8;
@@ -1280,6 +1544,248 @@ fn fuzzRender(_: void, smith: *testing.Smith) !void {
 
 test "fuzz rendering safety" {
     try testing.fuzz({}, fuzzRender, .{ .corpus = &Document.fuzz_corpus });
+}
+
+test "search commit jumps to the first match" {
+    var doc = Document.init("first\n\nsecond\n\nthird");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.scroll = 0;
+    app.search.open = true;
+    try testing.expect(app.search.insert("third"));
+    try app.commitSearch();
+    try testing.expect(!app.search.no_match);
+    try testing.expect(app.scroll > 0);
+}
+
+test "search with no match keeps scroll and flags" {
+    var doc = Document.init("first\n\nsecond\n\nthird");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.scroll = 0;
+    app.search.open = true;
+    try testing.expect(app.search.insert("zzz"));
+    try app.commitSearch();
+    try testing.expect(app.search.no_match);
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+}
+
+test "stale search tick is ignored" {
+    var doc = Document.init("first\n\nsecond\n\nthird");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.search.open = true;
+    try testing.expect(app.search.insert("third"));
+    const stale = app.search.generation;
+    try testing.expect(app.search.insert("x"));
+    try app.handleSearchTick(stale);
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+    try testing.expect(!app.search.no_match);
+    try app.handleSearchTick(app.search.generation);
+    try testing.expect(app.search.no_match);
+}
+
+test "escape clears search, enter confirms and keeps highlight" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.search.open = true;
+    try testing.expect(app.search.insert("second"));
+    const io: Io = undefined;
+    var loop: vaxis.Loop(Event) = undefined;
+    var tasks: Io.Group = .init;
+    try app.handleSearchKey(io, .{ .codepoint = vaxis.Key.enter }, &loop, &tasks);
+    try testing.expect(!app.search.open);
+    try testing.expectEqualStrings("second", app.search.query());
+    try testing.expect(app.scroll > 0);
+    app.search.open = true;
+    try app.handleSearchKey(io, .{ .codepoint = vaxis.Key.escape }, &loop, &tasks);
+    try testing.expect(!app.search.open);
+    try testing.expectEqual(@as(usize, 0), app.search.len);
+}
+
+test "n and N cycle matches with wrap" {
+    var doc = Document.init("aa\n\naa\n\naa");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.search.open = true;
+    try testing.expect(app.search.insert("aa"));
+    try app.commitSearch();
+    try testing.expectEqual(@as(usize, 3), app.search.total);
+    try testing.expectEqual(@as(usize, 0), app.search.index);
+    try testing.expectEqual(@as(?usize, 0), app.search.offset);
+    try testing.expectEqualStrings("1/3", app.search.countText());
+
+    try app.nextMatch(1);
+    try testing.expectEqual(@as(?usize, 4), app.search.offset);
+    try testing.expectEqual(@as(usize, 1), app.search.index);
+    try testing.expect(app.scroll > 0);
+    try app.nextMatch(1);
+    try testing.expectEqual(@as(?usize, 8), app.search.offset);
+    try testing.expectEqualStrings("3/3", app.search.countText());
+    try app.nextMatch(1);
+    try testing.expectEqual(@as(?usize, 0), app.search.offset);
+    try testing.expectEqual(@as(usize, 0), app.search.index);
+    try app.nextMatch(-1);
+    try testing.expectEqual(@as(?usize, 8), app.search.offset);
+    try testing.expectEqual(@as(usize, 2), app.search.index);
+    try app.nextMatch(-1);
+    try testing.expectEqual(@as(?usize, 4), app.search.offset);
+    try testing.expectEqualStrings("2/3", app.search.countText());
+}
+
+test "ctrl+backspace clears the query" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+    app.search.open = true;
+    try testing.expect(app.search.insert("second"));
+    try app.commitSearch();
+    try testing.expectEqual(@as(usize, 1), app.search.total);
+    const io: Io = undefined;
+    var loop: vaxis.Loop(Event) = undefined;
+    var tasks: Io.Group = .init;
+    try app.handleSearchKey(io, .{ .codepoint = vaxis.Key.backspace, .mods = .{ .ctrl = true } }, &loop, &tasks);
+    try testing.expectEqual(@as(usize, 0), app.search.len);
+    try testing.expectEqual(@as(usize, 0), app.search.total);
+    try testing.expectEqual(@as(?usize, null), app.search.offset);
+    try testing.expect(!app.search.no_match);
+}
+
+test "navigation keys work after confirming" {
+    var doc = Document.init("aa\n\naa");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.search.open = true;
+    try testing.expect(app.search.insert("aa"));
+    try app.commitSearch();
+    app.search.confirm();
+    const io: Io = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop: vaxis.Loop(Event) = undefined;
+    var tasks: Io.Group = .init;
+    try app.handleKey(io, &vx, .{ .codepoint = 'n' }, &loop, &tasks);
+    try testing.expectEqual(@as(usize, 1), app.search.index);
+    try app.handleKey(io, &vx, .{ .codepoint = 'N' }, &loop, &tasks);
+    try testing.expectEqual(@as(usize, 0), app.search.index);
+    try testing.expectEqualStrings("aa", app.search.query());
+    try app.handleKey(io, &vx, .{ .codepoint = vaxis.Key.escape }, &loop, &tasks);
+    try testing.expectEqual(@as(usize, 0), app.search.len);
+    try app.handleKey(io, &vx, .{ .codepoint = 'n' }, &loop, &tasks);
+    try testing.expectEqual(@as(usize, 0), app.search.total);
+}
+
+test "counter overlay shows index and total" {
+    var doc = Document.init("aa\n\naa\n\naa");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.search.open = true;
+    try testing.expect(app.search.insert("aa"));
+    try app.commitSearch();
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 3,
+        .screen = &screen,
+    };
+    app.drawSearchCount(win);
+    try expectCell(win, 16, 0, '1');
+    try expectCell(win, 17, 0, '/');
+    try expectCell(win, 18, 0, '3');
+    try testing.expect(win.readCell(16, 0).?.style.fg.eql(Theme.gold));
+}
+
+test "viewport marks the jumped-to match" {
+    var doc = Document.init("first\n\nsecond\n\nthird");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.search.open = true;
+    try testing.expect(app.search.insert("second"));
+    try app.commitSearch();
+    Renderer.beginFrame();
+    Renderer.setSearchQuery(app.search.query());
+    defer Renderer.setSearchQuery("");
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 2, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 2,
+        .screen = &screen,
+    };
+    try app.renderViewport(win);
+    try expectCell(win, 0, 1, 's');
+    try testing.expect(win.readCell(0, 1).?.style.bg.eql(Theme.accent));
+}
+
+test "n moves focus within one block" {
+    var doc = Document.init("aa aa");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.search.open = true;
+    try testing.expect(app.search.insert("aa"));
+    try app.commitSearch();
+    try testing.expectEqual(@as(usize, 2), app.search.total);
+    try testing.expectEqual(@as(usize, 0), app.search.focus_local);
+    try app.nextMatch(1);
+    try testing.expectEqual(@as(?usize, 3), app.search.offset);
+    try testing.expectEqual(@as(usize, 1), app.search.index);
+    try testing.expectEqual(@as(usize, 0), app.search.focus_entry.?);
+    try testing.expectEqual(@as(usize, 1), app.search.focus_local);
+    Renderer.beginFrame();
+    Renderer.setSearchQuery(app.search.query());
+    defer Renderer.setSearchQuery("");
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 2, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 2,
+        .screen = &screen,
+    };
+    try app.renderViewport(win);
+    try testing.expect(win.readCell(0, 0).?.style.bg.eql(Theme.gold));
+    try testing.expect(win.readCell(3, 0).?.style.bg.eql(Theme.accent));
 }
 
 const lazy_text = "one two three four five six seven\n\n" ** 12;

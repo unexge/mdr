@@ -5,6 +5,23 @@
 
 const card_style: vaxis.Style = .{ .bg = Theme.panel };
 const info_style: vaxis.Style = .{ .fg = Theme.muted, .bg = Theme.panel };
+const max_hits_per_line = 64;
+var search_query: []const u8 = "";
+
+pub fn setSearchQuery(q: []const u8) void {
+    search_query = q;
+}
+
+fn covers(line: []const u8, off: usize, len: usize) bool {
+    const q = search_query.len;
+    if (q == 0 or q > line.len or len == 0) return false;
+    var s = if (off + 1 > q) off + 1 - q else 0;
+    const last = @min(off + len - 1, line.len - q);
+    while (s <= last) : (s += 1) {
+        if (Search.findFirst(line[s..][0..q], search_query) != null) return true;
+    }
+    return false;
+}
 
 /// One walk measures (null window: no writes, no clipping, no skipping)
 /// and renders, returning the row after the last content row.
@@ -38,6 +55,25 @@ pub fn layout(win: ?vaxis.Window, cb: Document.Element.CodeBlock, start_row: usi
 
     var lines = cb.lines();
     while (lines.next()) |line| {
+        var hit_starts: [max_hits_per_line]usize = undefined;
+        var hit_seqs: [max_hits_per_line]u32 = undefined;
+        var hit_count: usize = 0;
+        var hit_overflow = false;
+        if (search_query.len > 0 and search_query.len <= line.len) {
+            var pos: usize = 0;
+            while (pos + search_query.len <= line.len) {
+                const rel = Search.findFirst(line[pos..], search_query) orelse break;
+                const s = pos + rel;
+                if (hit_count < max_hits_per_line) {
+                    hit_starts[hit_count] = s;
+                    hit_seqs[hit_count] = if (win != null) Search.nextSeq() else 0;
+                    hit_count += 1;
+                } else {
+                    hit_overflow = true;
+                }
+                pos = s + search_query.len;
+            }
+        }
         var col: usize = 0;
         var iter = vaxis.unicode.graphemeIterator(line);
         while (iter.next()) |g| {
@@ -57,9 +93,11 @@ pub fn layout(win: ?vaxis.Window, cb: Document.Element.CodeBlock, start_row: usi
             }
             if (win) |w2| {
                 if (skip_rows == 0 and row < w2.height) {
+                    const bytes = g.bytes(line);
+                    const off = @intFromPtr(bytes.ptr) - @intFromPtr(line.ptr);
                     w2.writeCell(@intCast(col), @intCast(row), .{
-                        .char = .{ .grapheme = g.bytes(line), .width = @intCast(w) },
-                        .style = card_style,
+                        .char = .{ .grapheme = bytes, .width = @intCast(w) },
+                        .style = lineStyle(line, off, bytes.len, hit_starts[0..hit_count], hit_seqs[0..hit_count], hit_overflow),
                     });
                 }
             }
@@ -91,19 +129,38 @@ fn fillRest(w: vaxis.Window, row: usize, from: usize) void {
 }
 
 fn writeInfo(win: vaxis.Window, row: usize, info: []const u8) usize {
+    const line_id: u32 = if (Search.findFirst(info, search_query) != null) Search.nextSeq() else 0;
     var col: usize = 0;
     var iter = vaxis.unicode.graphemeIterator(info);
     while (iter.next()) |g| {
-        const w = gwidth(g.bytes(info));
+        const bytes = g.bytes(info);
+        const w = gwidth(bytes);
         if (w == 0) continue;
         if (col + w > win.width) return col;
+        const off = @intFromPtr(bytes.ptr) - @intFromPtr(info.ptr);
+        var style = info_style;
+        if (line_id != 0 and covers(info, off, bytes.len)) {
+            style = Search.highlight(info_style);
+            if (Search.runIsFocus(line_id)) style = Search.focus(info_style);
+        }
         win.writeCell(@intCast(col), @intCast(row), .{
-            .char = .{ .grapheme = g.bytes(info), .width = @intCast(w) },
-            .style = info_style,
+            .char = .{ .grapheme = bytes, .width = @intCast(w) },
+            .style = style,
         });
         col += w;
     }
     return col;
+}
+
+fn lineStyle(line: []const u8, off: usize, len: usize, starts: []const usize, seqs: []const u32, overflow: bool) vaxis.Style {
+    for (starts, seqs) |s, q| {
+        if (s < off + len and off < s + search_query.len) {
+            if (Search.runIsFocus(q)) return Search.focus(card_style);
+            return Search.highlight(card_style);
+        }
+    }
+    if (overflow and covers(line, off, len)) return Search.highlight(card_style);
+    return card_style;
 }
 
 fn gwidth(g: []const u8) usize {
@@ -113,6 +170,7 @@ fn gwidth(g: []const u8) usize {
 const std = @import("std");
 const Document = @import("../../Document.zig");
 const Mermaid = @import("../../Mermaid.zig");
+const Search = @import("../Search.zig");
 const mermaid = @import("mermaid.zig");
 const sequence = @import("sequence.zig");
 const Theme = @import("../Theme.zig");
@@ -182,6 +240,50 @@ test "counts the info line and wrapped content lines" {
     try testing.expectEqual(@as(usize, 2), layout(null, .{ .info = .{ .other = "zig" }, .content = "short\n" }, 0, 0, 40));
     try testing.expectEqual(@as(usize, 2), layout(null, .{ .info = null, .content = "abcdefgh\n" }, 0, 0, 4));
     try testing.expectEqual(@as(usize, 3), layout(null, .{ .info = null, .content = "ab\n\ncd\n" }, 0, 0, 40));
+}
+
+test "search highlights code matches" {
+    Search.beginFrame();
+    Search.setEntryFocus(true, 0);
+    setSearchQuery("hi");
+    defer setSearchQuery("");
+    try testing.expectEqual(@as(usize, 1), layout(null, .{ .info = null, .content = "hi there\n" }, 0, 0, 40));
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 10, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 10,
+        .height = 1,
+        .screen = &screen,
+    };
+    _ = layout(win, .{ .info = null, .content = "hi there\n" }, 0, 0, win.width);
+    try testing.expect(win.readCell(0, 0).?.style.bg.eql(Theme.accent));
+    try testing.expect(win.readCell(1, 0).?.style.bg.eql(Theme.accent));
+    try testing.expect(win.readCell(3, 0).?.style.bg.eql(Theme.panel));
+}
+
+test "only the targeted code match takes focus" {
+    Search.beginFrame();
+    Search.setEntryFocus(true, 1);
+    setSearchQuery("ab");
+    defer setSearchQuery("");
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 10, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 10,
+        .height = 1,
+        .screen = &screen,
+    };
+    _ = layout(win, .{ .info = null, .content = "ab ab\n" }, 0, 0, win.width);
+    try testing.expect(win.readCell(0, 0).?.style.bg.eql(Theme.gold));
+    try testing.expect(win.readCell(3, 0).?.style.bg.eql(Theme.accent));
 }
 
 test "fills the card background past the text" {

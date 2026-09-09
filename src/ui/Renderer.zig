@@ -17,6 +17,12 @@ const max_container_depth = 24;
 /// the frame within it.
 pub fn beginFrame() void {
     text.beginFrame();
+    Search.beginFrame();
+}
+
+pub fn setSearchQuery(q: []const u8) void {
+    text.setSearchQuery(q);
+    code_block.setSearchQuery(q);
 }
 
 /// Rows used by a block at `width`, including its trailing gap.
@@ -80,6 +86,7 @@ fn layoutDepth(win: ?vaxis.Window, elem: Document.Element, row: usize, skip: usi
 
 const std = @import("std");
 const Document = @import("../Document.zig");
+const Search = @import("Search.zig");
 const vaxis = @import("vaxis");
 const text = @import("renderer/text.zig");
 const code_block = @import("renderer/code_block.zig");
