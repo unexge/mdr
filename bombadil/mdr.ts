@@ -59,7 +59,7 @@ function markerVisible(marker: string): boolean {
 }
 
 function searchOpen(): boolean {
-  return terminal.current.bottomLine.startsWith("/");
+  return terminal.current.lines.slice(-2).some((line) => line.startsWith("/"));
 }
 
 export const remainsRunning = always(() => terminal.current.exitStatus === null);

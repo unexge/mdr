@@ -445,10 +445,11 @@ fn drawSearchBar(self: *App, win: vaxis.Window) void {
         col += w;
     }
     const cursor_col = 1 + queryCursorWidth(q[0..@min(self.search.cursor, q.len)]);
-    if (cursor_col < win.width) {
-        const under: []const u8 = if (self.search.cursor < q.len) cursorGrapheme(q[self.search.cursor..]) else " ";
+    const under: []const u8 = if (self.search.cursor < q.len) cursorGrapheme(q[self.search.cursor..]) else " ";
+    const cursor_width = vaxis.gwidth.gwidth(under, .unicode);
+    if (cursor_col + cursor_width < win.width) {
         win.writeCell(@intCast(cursor_col), row, .{
-            .char = .{ .grapheme = under, .width = @intCast(vaxis.gwidth.gwidth(under, .unicode)) },
+            .char = .{ .grapheme = under, .width = @intCast(cursor_width) },
             .style = cursor_style,
         });
     }
@@ -1693,6 +1694,31 @@ test "navigation keys work after confirming" {
     try testing.expectEqual(@as(usize, 0), app.search.len);
     try app.handleKey(io, &vx, .{ .codepoint = 'n' }, &loop, &tasks);
     try testing.expectEqual(@as(usize, 0), app.search.total);
+}
+
+test "search cursor does not draw a wide grapheme at the right edge" {
+    var doc = Document.init("");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    try testing.expect(app.search.insert("aaaaaaaaaaaaaaaaaa😀"));
+    app.search.moveLeft();
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 21, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 21,
+        .height = 1,
+        .screen = &screen,
+    };
+    app.drawSearchBar(win);
+
+    try expectCell(win, 18, 0, 'a');
+    try expectCell(win, 19, 0, ' ');
+    try expectCell(win, 20, 0, ' ');
 }
 
 test "counter overlay shows index and total" {
