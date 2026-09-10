@@ -48,7 +48,7 @@ pub fn main() void {
 flowchart LR
 subgraph process [Process]
 direction TB
-A["x"] e1@---> B["`**database**`"]
+A["x"] e1@---> B["`**data**<br/>store`"]
 end
 subgraph result [Result]
 C{choice} <--> D(((done))):::terminal
@@ -61,11 +61,13 @@ classDef terminal fill:red
 %%{init: {'theme': 'base'}}%%
 sequenceDiagram
 title: Service exchange
-    box Services
+    box Purple Services
         participant Alice@{ "type": "boundary" }
         participant Bob@{ "type": "database" }
     end
     link Alice: Dashboard @ https://example.com/dashboard
+    properties Alice: role admin
+    details Bob: primary database
     autonumber 2.5 0.25
     critical Greeting
         Alice->>Bob: Hello<br/>Bob #9829;

@@ -982,6 +982,7 @@ pub const Participant = struct {
 
 pub const ParticipantBox = struct {
     label: []const u8,
+    color: ?[]const u8,
     first: usize,
     count: usize,
 };
@@ -1350,7 +1351,10 @@ const SeqParser = struct {
                     self.supported = false;
                     return true;
                 };
-                if (parsed.payload.len == 0) self.supported = false else _ = self.intern(parsed.actor);
+                if (parsed.payload.len == 0)
+                    self.supported = false
+                else
+                    self.addNote(.over, parsed.actor, null, parsed.payload);
                 return true;
             }
         }
@@ -1424,13 +1428,14 @@ const SeqParser = struct {
             self.seq.degraded = true;
             return;
         }
-        const label = participantBoxLabel(descriptor) orelse {
+        const box_data = parseParticipantBox(descriptor) orelse {
             self.supported = false;
             return;
         };
         const index = self.seq.participant_box_count;
         self.seq.participant_boxes[index] = .{
-            .label = label,
+            .label = box_data.label,
+            .color = box_data.color,
             .first = self.seq.participant_count,
             .count = 0,
         };
@@ -1820,13 +1825,21 @@ fn parseParticipantMetadata(body: []const u8) ?ParticipantMetadata {
     return metadata;
 }
 
-fn participantBoxLabel(raw: []const u8) ?[]const u8 {
+const ParticipantBoxData = struct {
+    label: []const u8,
+    color: ?[]const u8,
+};
+
+fn parseParticipantBox(raw: []const u8) ?ParticipantBoxData {
     const descriptor = mem.trim(u8, raw, " \t");
     if (descriptor.len == 0) return null;
     for ([_][]const u8{ "rgb(", "rgba(", "hsl(", "hsla(" }) |prefix| {
         if (!mem.startsWith(u8, descriptor, prefix)) continue;
         const close = mem.indexOfScalar(u8, descriptor, ')') orelse return null;
-        return mem.trim(u8, descriptor[close + 1 ..], " \t");
+        return .{
+            .label = mem.trim(u8, descriptor[close + 1 ..], " \t"),
+            .color = descriptor[0 .. close + 1],
+        };
     }
     var word_end: usize = 0;
     while (word_end < descriptor.len and descriptor[word_end] != ' ' and descriptor[word_end] != '\t') : (word_end += 1) {}
@@ -1835,9 +1848,12 @@ fn participantBoxLabel(raw: []const u8) ?[]const u8 {
         "transparent", "black", "silver", "gray",   "white", "maroon", "red",  "purple", "fuchsia",
         "green",       "lime",  "olive",  "yellow", "navy",  "blue",   "teal", "aqua",   "orange",
     }) |name| {
-        if (eqlIgnoreCase(color, name)) return mem.trim(u8, descriptor[word_end..], " \t");
+        if (eqlIgnoreCase(color, name)) return .{
+            .label = mem.trim(u8, descriptor[word_end..], " \t"),
+            .color = color,
+        };
     }
-    return descriptor;
+    return .{ .label = descriptor, .color = null };
 }
 
 fn parseParticipantKind(value: []const u8) ?ParticipantKind {
@@ -2380,9 +2396,11 @@ test "sequence participant boxes" {
     ).?;
     try testing.expectEqual(@as(usize, 2), seq.participant_box_count);
     try testing.expectEqualStrings("Services", seq.participant_boxes[0].label);
+    try testing.expectEqualStrings("Purple", seq.participant_boxes[0].color.?);
     try testing.expectEqual(@as(usize, 0), seq.participant_boxes[0].first);
     try testing.expectEqual(@as(usize, 2), seq.participant_boxes[0].count);
     try testing.expectEqualStrings("", seq.participant_boxes[1].label);
+    try testing.expectEqualStrings("rgb(10, 20, 30)", seq.participant_boxes[1].color.?);
     try testing.expectEqual(@as(usize, 2), seq.participant_boxes[1].first);
     try testing.expectEqual(@as(usize, 1), seq.participant_boxes[1].count);
 }
@@ -2435,6 +2453,7 @@ test "sequence actor metadata and configuration" {
     ).?;
     try testing.expectEqualStrings("https://example.com/dashboard", seq.participants[0].link.?);
     try testing.expectEqualStrings("https://example.com/wiki", seq.participants[1].link.?);
+    try testing.expectEqual(@as(usize, 2), seq.note_count);
 }
 
 test "sequence title and accessibility metadata" {

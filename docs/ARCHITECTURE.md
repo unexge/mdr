@@ -60,7 +60,9 @@ subgraph directions and group edges use a bounded recursive hierarchy layout.
 Ambiguous flat cluster overlays still fall back. Sequence
 participant groups, lifecycle positions, activation stacks, numbering state,
 and message metadata are fixed parser state from which header and lifeline rows
-are derived. Message endpoints and central connections are explicit enums,
+are derived. Diagram text streams into measured lines without allocating, so
+multiline boxes preserve the measure/render invariant. Message endpoints and
+central connections are explicit enums,
 keeping rendering exhaustive. The supported grammar is
 listed in [`MERMAID.md`](MERMAID.md). Shared cell drawing (junction merging, clipping,
 display widths) lives in `renderer/cells.zig`.

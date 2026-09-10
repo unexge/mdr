@@ -21,8 +21,23 @@ pub fn box(
     skip: usize,
     style: vaxis.Style,
 ) void {
+    boxHeight(win, x, y, bw, 3, label, corners, start_row, skip, style);
+}
+
+pub fn boxHeight(
+    win: vaxis.Window,
+    x: usize,
+    y: usize,
+    bw: usize,
+    height: usize,
+    label: []const u8,
+    corners: [4][]const u8,
+    start_row: usize,
+    skip: usize,
+    style: vaxis.Style,
+) void {
     var fr: usize = 0;
-    while (fr < 3) : (fr += 1) {
+    while (fr < height) : (fr += 1) {
         var fc: usize = 0;
         while (fc < bw) : (fc += 1) putRaw(win, y + fr, x + fc, start_row, skip, " ", style);
     }
@@ -30,13 +45,20 @@ pub fn box(
     var c: usize = 1;
     while (c + 1 < bw) : (c += 1) putRaw(win, y, x + c, start_row, skip, "─", style);
     putRaw(win, y, x + bw - 1, start_row, skip, corners[1], style);
-    putRaw(win, y + 1, x, start_row, skip, "│", style);
-    putText(win, y + 1, x + 2, start_row, skip, label, x + bw - 2, style);
-    putRaw(win, y + 1, x + bw - 1, start_row, skip, "│", style);
-    putRaw(win, y + 2, x, start_row, skip, corners[2], style);
+    for (1..height - 1) |row| {
+        putRaw(win, y + row, x, start_row, skip, "│", style);
+        putRaw(win, y + row, x + bw - 1, start_row, skip, "│", style);
+    }
+    var lines: LineIterator = .{ .remaining = label };
+    var row: usize = 1;
+    while (lines.next()) |line| : (row += 1) {
+        if (row + 1 >= height) break;
+        putText(win, y + row, x + 2, start_row, skip, line, x + bw - 2, style);
+    }
+    putRaw(win, y + height - 1, x, start_row, skip, corners[2], style);
     c = 1;
-    while (c + 1 < bw) : (c += 1) putRaw(win, y + 2, x + c, start_row, skip, "─", style);
-    putRaw(win, y + 2, x + bw - 1, start_row, skip, corners[3], style);
+    while (c + 1 < bw) : (c += 1) putRaw(win, y + height - 1, x + c, start_row, skip, "─", style);
+    putRaw(win, y + height - 1, x + bw - 1, start_row, skip, corners[3], style);
 }
 
 const DiagramTextIterator = struct {
@@ -79,6 +101,40 @@ const DiagramTextIterator = struct {
     }
 };
 
+pub const LineIterator = struct {
+    remaining: []const u8,
+    done: bool = false,
+
+    pub fn next(self: *LineIterator) ?[]const u8 {
+        if (self.done) return null;
+        var index: usize = 0;
+        while (index < self.remaining.len) : (index += 1) {
+            for ([_][]const u8{ "<br>", "<br/>", "<br />" }) |tag| {
+                if (!startsWithIgnoreCase(self.remaining[index..], tag)) continue;
+                const line = self.remaining[0..index];
+                self.remaining = self.remaining[index + tag.len ..];
+                return line;
+            }
+        }
+        self.done = true;
+        return self.remaining;
+    }
+};
+
+pub fn lineCount(text: []const u8) usize {
+    var count: usize = 0;
+    var lines: LineIterator = .{ .remaining = text };
+    while (lines.next() != null) count += 1;
+    return count;
+}
+
+pub fn maxLineWidth(text: []const u8) usize {
+    var width: usize = 0;
+    var lines: LineIterator = .{ .remaining = text };
+    while (lines.next()) |line| width = @max(width, labelWidth(line));
+    return width;
+}
+
 fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
     if (text.len < prefix.len) return false;
     for (text[0..prefix.len], prefix) |actual, expected| {
@@ -120,13 +176,34 @@ pub fn putRaw(win: vaxis.Window, r: usize, c: usize, start_row: usize, skip: usi
 }
 
 pub fn putDotted(win: vaxis.Window, r: usize, c: usize, start_row: usize, skip: usize, style: vaxis.Style) void {
+    putPattern(win, r, c, start_row, skip, "┄", style);
+}
+
+pub fn putDottedVertical(win: vaxis.Window, r: usize, c: usize, start_row: usize, skip: usize, style: vaxis.Style) void {
+    putPattern(win, r, c, start_row, skip, "┊", style);
+}
+
+pub fn putHeavy(win: vaxis.Window, r: usize, c: usize, start_row: usize, skip: usize, horizontal: bool, style: vaxis.Style) void {
+    if (r < skip) return;
+    const rr = start_row + (r - skip);
+    if (rr >= win.height or c >= win.width) return;
+    if (win.readCell(@intCast(c), @intCast(rr))) |cell| {
+        if (!isBlank(cell.char.grapheme)) {
+            putLine(win, r, c, start_row, skip, if (horizontal) "─" else "│", style);
+            return;
+        }
+    }
+    putRaw(win, r, c, start_row, skip, if (horizontal) "━" else "┃", style);
+}
+
+fn putPattern(win: vaxis.Window, r: usize, c: usize, start_row: usize, skip: usize, glyph: []const u8, style: vaxis.Style) void {
     if (r < skip) return;
     const rr = start_row + (r - skip);
     if (rr >= win.height or c >= win.width) return;
     if (win.readCell(@intCast(c), @intCast(rr))) |cell| {
         if (!isBlank(cell.char.grapheme)) return;
     }
-    win.writeCell(@intCast(c), @intCast(rr), .{ .char = .{ .grapheme = "┄", .width = 1 }, .style = style });
+    win.writeCell(@intCast(c), @intCast(rr), .{ .char = .{ .grapheme = glyph, .width = 1 }, .style = style });
 }
 
 pub fn putText(win: vaxis.Window, r: usize, c0: usize, start_row: usize, skip: usize, text: []const u8, max_c: usize, style: vaxis.Style) void {

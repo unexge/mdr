@@ -2,8 +2,8 @@
 
 `mdr` renders a bounded Mermaid subset as Unicode. A Mermaid fence falls back
 to the normal code card when any statement is unsupported, so a diagram is
-never rendered only partially. Shape geometry and line appearance are
-approximated with the Unicode forms available in a terminal.
+never rendered only partially. Shape geometry and line appearance use the
+closest Unicode forms available in a terminal.
 
 ## Flowcharts
 
@@ -15,11 +15,12 @@ Supported:
   diamond, hexagon, parallelogram, trapezoid, and double-circle nodes
 - Built-in non-media `@{ shape: ..., label: ... }` shapes mapped to the
   nearest terminal geometry
-- Solid, dotted, thick, invisible, circle, cross, and bidirectional links
+- Visually distinct solid, dotted, thick, invisible, circle, cross, and
+  bidirectional links
 - Link labels, edge IDs, requested minimum lengths, chained links, and
   `A & B --> C & D` multi-node links
 - Labeled and nested subgraphs with local directions and edges to subgraph IDs
-- Single-line Markdown labels, class assignments, style declarations, and
+- Multiline Markdown node labels, class assignments, style declarations, and
   semicolon-separated statements; terminal rendering uses the active theme
 - `%%` comments
 
@@ -28,7 +29,6 @@ Falls back:
 - Flat cluster layouts whose boundaries would overlap unrelated nodes or groups
 - Icons and image nodes
 - Edge animation, click actions, and configuration directives
-- Multiline Markdown labels
 
 ## Sequence diagrams
 
@@ -36,8 +36,8 @@ Supported:
 
 - `participant` and `actor`, including `as` aliases, IDs containing spaces,
   hyphens, or equals signs, and all participant stereotypes
-- Participant `box` groups wherever Mermaid permits them; color descriptors
-  are accepted but terminal rendering uses the active theme
+- Participant `box` groups wherever Mermaid permits them, with named and RGB
+  colors applied to terminal borders
 - Actor and participant creation and destruction, including inside fragments
 - Solid and dotted plain, arrow, cross, open, bidirectional, and half-arrow
   messages
@@ -49,9 +49,9 @@ Supported:
 - `autonumber`, optional start and increment values, and `autonumber off`
 - Case-insensitive keywords and semicolon-separated statements
 - Titles, accessibility metadata, frontmatter, and configuration directives
-- Actor links as terminal hyperlinks; properties and details are accepted as
-  non-popup metadata
-- `<br/>` flattened to spaces and common Mermaid/HTML entities decoded
+- Actor links as terminal hyperlinks; properties and details render as notes
+- Multiline participant, note, message, and title labels
+- Common Mermaid and HTML entities decoded
 - `%%` and `#` comments
 
 Falls back:

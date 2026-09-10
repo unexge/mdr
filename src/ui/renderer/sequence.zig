@@ -5,6 +5,68 @@
 
 pub const max_rows = 200;
 
+fn equalIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |actual, expected| {
+        if (std.ascii.toLower(actual) != std.ascii.toLower(expected)) return false;
+    }
+    return true;
+}
+
+fn participantBoxStyle(raw: ?[]const u8) vaxis.Style {
+    const color = raw orelse return .{ .dim = true };
+    if (parseRgbColor(color)) |rgb| return .{ .fg = .{ .rgb = rgb }, .dim = true };
+    const colors = [_]struct { name: []const u8, rgb: [3]u8 }{
+        .{ .name = "black", .rgb = .{ 0x00, 0x00, 0x00 } },
+        .{ .name = "silver", .rgb = .{ 0xc0, 0xc0, 0xc0 } },
+        .{ .name = "gray", .rgb = .{ 0x80, 0x80, 0x80 } },
+        .{ .name = "white", .rgb = .{ 0xff, 0xff, 0xff } },
+        .{ .name = "maroon", .rgb = .{ 0x80, 0x00, 0x00 } },
+        .{ .name = "red", .rgb = .{ 0xff, 0x00, 0x00 } },
+        .{ .name = "purple", .rgb = .{ 0x80, 0x00, 0x80 } },
+        .{ .name = "fuchsia", .rgb = .{ 0xff, 0x00, 0xff } },
+        .{ .name = "green", .rgb = .{ 0x00, 0x80, 0x00 } },
+        .{ .name = "lime", .rgb = .{ 0x00, 0xff, 0x00 } },
+        .{ .name = "olive", .rgb = .{ 0x80, 0x80, 0x00 } },
+        .{ .name = "yellow", .rgb = .{ 0xff, 0xff, 0x00 } },
+        .{ .name = "navy", .rgb = .{ 0x00, 0x00, 0x80 } },
+        .{ .name = "blue", .rgb = .{ 0x00, 0x00, 0xff } },
+        .{ .name = "teal", .rgb = .{ 0x00, 0x80, 0x80 } },
+        .{ .name = "aqua", .rgb = .{ 0x00, 0xff, 0xff } },
+        .{ .name = "orange", .rgb = .{ 0xff, 0xa5, 0x00 } },
+    };
+    for (colors) |entry| {
+        if (equalIgnoreCase(color, entry.name)) return .{ .fg = .{ .rgb = entry.rgb }, .dim = true };
+    }
+    return .{ .fg = Theme.muted, .dim = true };
+}
+
+fn parseRgbColor(raw: []const u8) ?[3]u8 {
+    const open = mem.indexOfScalar(u8, raw, '(') orelse return null;
+    const close = mem.indexOfScalar(u8, raw, ')') orelse return null;
+    if (close <= open + 1) return null;
+    var values: [3]u8 = undefined;
+    var parts = mem.splitScalar(u8, raw[open + 1 .. close], ',');
+    for (0..3) |index| {
+        const part = mem.trim(u8, parts.next() orelse return null, " \t");
+        values[index] = std.fmt.parseInt(u8, part, 10) catch return null;
+    }
+    return values;
+}
+
+fn participantPrefix(kind: Mermaid.ParticipantKind) []const u8 {
+    return switch (kind) {
+        .participant => "",
+        .actor => "♙ ",
+        .boundary => "◫ ",
+        .control => "◇ ",
+        .entity => "□ ",
+        .database => "◉ ",
+        .collections => "▣ ",
+        .queue => "⇥ ",
+    };
+}
+
 pub fn layout(win: ?vaxis.Window, seq: *const Mermaid.Sequence, start_row: usize, skip: usize, width: usize) ?usize {
     var lay = Layout.compute(seq, width) orelse return null;
     if (win == null) return start_row + lay.rows;
@@ -20,6 +82,7 @@ const Layout = struct {
     w: [Mermaid.max_participants]usize,
     spans: [Mermaid.max_activations]ActiveSpan = undefined,
     span_count: usize = 0,
+    participant_height: usize,
     rows: usize,
     cols: usize,
 
@@ -31,10 +94,14 @@ const Layout = struct {
             .x = [_]usize{0} ** Mermaid.max_participants,
             .w = [_]usize{0} ** Mermaid.max_participants,
             .span_count = 0,
+            .participant_height = 3,
             .rows = 0,
             .cols = 0,
         };
-        for (seq.participants[0..lay.count], 0..) |*p, i| lay.w[i] = cells.labelWidth(p.label) + 4;
+        for (seq.participants[0..lay.count], 0..) |*participant, index| {
+            lay.participant_height = @max(lay.participant_height, cells.lineCount(participant.label) + 2);
+            lay.w[index] = cells.labelWidth(participantPrefix(participant.kind)) + cells.maxLineWidth(participant.label) + 4;
+        }
         for (seq.activations[0..seq.activation_count]) |*activation| {
             const participant = partIndex(seq, activation.actor) orelse continue;
             lay.spans[lay.span_count] = .{
@@ -56,8 +123,7 @@ const Layout = struct {
             if ((m.number == null and m.text.len == 0) or mem.eql(u8, m.src, m.dst)) continue;
             const s = partIndex(seq, m.src) orelse continue;
             const d = partIndex(seq, m.dst) orelse continue;
-            var lw = cells.labelWidth(m.text);
-            if (m.number) |number| lw += numberWidth(number);
+            const lw = messageLabelWidth(m);
             const row = lay.rowOf(m.pos);
             const scx = lay.lifelineCol(s, row);
             const dcx = lay.lifelineCol(d, row);
@@ -95,11 +161,10 @@ const Layout = struct {
             const s = partIndex(seq, m.src) orelse continue;
             const d = partIndex(seq, m.dst) orelse continue;
             const row = lay.rowOf(m.pos);
-            var end = lay.labelStart(s, d, row) + cells.labelWidth(m.text);
-            if (m.number) |number| end += numberWidth(number);
+            const end = lay.labelStart(s, d, row) + messageLabelWidth(m);
             cols = @max(cols, end + 1);
         }
-        if (seq.title) |title| cols = @max(cols, cells.labelWidth(title));
+        if (seq.title) |title| cols = @max(cols, cells.maxLineWidth(title));
         if (cols > width) return null;
         lay.cols = cols;
         lay.rows = lay.headerRows() + lay.rowsBefore(seq.message_count + seq.note_count);
@@ -126,13 +191,13 @@ const Layout = struct {
                 r += msgHeight(&msgs[mi]);
                 mi += 1;
             } else {
-                r += 3;
+                r += noteHeight(&notes[ni]);
                 ni += 1;
             }
         }
         for (self.seq.participants[0..self.seq.participant_count]) |participant| {
             if (participant.created_at) |created_at| {
-                if (created_at <= pos) r += 3;
+                if (created_at <= pos) r += self.participant_height;
             }
         }
         for (self.seq.fragments[0..self.seq.fragment_count]) |*f| {
@@ -156,11 +221,11 @@ const Layout = struct {
     }
 
     fn titleRows(self: *const Layout) usize {
-        return if (self.seq.title != null) 2 else 0;
+        return if (self.seq.title) |title| cells.lineCount(title) + 1 else 0;
     }
 
     fn headerRows(self: *const Layout) usize {
-        const participant_rows: usize = if (self.seq.participant_box_count > 0) 6 else 3;
+        const participant_rows = self.participant_height + if (self.seq.participant_box_count > 0) @as(usize, 3) else 0;
         return self.titleRows() + participant_rows;
     }
 
@@ -169,10 +234,31 @@ const Layout = struct {
         return self.titleRows() + box_rows;
     }
 
+    fn noteHeight(note: *const Mermaid.Note) usize {
+        return cells.lineCount(note.text) + 2;
+    }
+
+    fn messageTextRows(message: *const Mermaid.Message) usize {
+        if (message.number == null and message.text.len == 0) return 0;
+        return @max(cells.lineCount(message.text), 1);
+    }
+
+    fn messageLabelWidth(message: *const Mermaid.Message) usize {
+        var lines: cells.LineIterator = .{ .remaining = message.text };
+        var width: usize = 0;
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 1) {
+            var line_width = cells.labelWidth(line);
+            if (index == 0) {
+                if (message.number) |number| line_width += numberWidth(number);
+            }
+            width = @max(width, line_width);
+        }
+        return width;
+    }
+
     fn msgHeight(m: *const Mermaid.Message) usize {
-        var r: usize = if (m.number != null or m.text.len > 0) 1 else 0;
-        r += if (mem.eql(u8, m.src, m.dst)) 2 else 1;
-        return r;
+        return messageTextRows(m) + if (mem.eql(u8, m.src, m.dst)) @as(usize, 2) else 1;
     }
 
     fn activeDepth(self: *const Layout, participant: usize, row: usize) usize {
@@ -196,7 +282,7 @@ const Layout = struct {
     fn noteBox(self: *const Layout, n: *const Mermaid.Note) ?NoteBox {
         const a = partIndex(self.seq, n.a) orelse return null;
         const cax = self.x[a] + self.w[a] / 2;
-        const textW = cells.labelWidth(n.text);
+        const textW = cells.maxLineWidth(n.text);
         switch (n.kind) {
             .over => {
                 if (n.b) |bid| {
@@ -223,7 +309,7 @@ const Layout = struct {
     fn creationRowsAt(self: *const Layout, pos: usize) usize {
         var rows: usize = 0;
         for (self.seq.participants[0..self.seq.participant_count]) |participant| {
-            if (participant.created_at == pos) rows += 3;
+            if (participant.created_at == pos) rows += self.participant_height;
         }
         return rows;
     }
@@ -268,13 +354,18 @@ const Layout = struct {
     }
 
     fn draw(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
-        if (self.seq.title) |title| cells.putText(win, 0, 0, start_row, skip, title, self.cols, .{ .bold = true });
+        if (self.seq.title) |title| {
+            var lines: cells.LineIterator = .{ .remaining = title };
+            var row: usize = 0;
+            while (lines.next()) |line| : (row += 1)
+                cells.putText(win, row, 0, start_row, skip, line, self.cols, .{ .bold = true });
+        }
         self.drawParticipantBoxes(win, start_row, skip);
         for (self.seq.participants[0..self.count], 0..) |*participant, index| {
             if (participant.created_at == null) {
                 self.drawParticipant(win, index, self.participantTop(), start_row, skip);
             } else if (participant.created_at) |created_at| {
-                self.drawParticipant(win, index, self.rowOf(created_at) - 3, start_row, skip);
+                self.drawParticipant(win, index, self.rowOf(created_at) - self.participant_height, start_row, skip);
             }
         }
         for (self.seq.participants[0..self.count], 0..) |participant, index| {
@@ -304,7 +395,7 @@ const Layout = struct {
         for (self.seq.notes[0..self.seq.note_count]) |*n| {
             const nb = self.noteBox(n) orelse continue;
             const row = self.rowOf(n.pos);
-            cells.box(win, nb.c1, row, nb.c2 - nb.c1 + 1, n.text, cells.square, start_row, skip, .{ .bg = Theme.panel });
+            cells.boxHeight(win, nb.c1, row, nb.c2 - nb.c1 + 1, noteHeight(n), n.text, cells.square, start_row, skip, .{ .bg = Theme.panel });
         }
         for (self.seq.messages[0..self.seq.message_count]) |*m| {
             self.drawLabel(win, m, start_row, skip);
@@ -312,10 +403,10 @@ const Layout = struct {
     }
 
     fn drawParticipantBoxes(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
-        const style: vaxis.Style = .{ .dim = true };
         const top = self.titleRows();
-        const bottom = top + 5;
+        const bottom = top + self.participant_height + 2;
         for (self.seq.participant_boxes[0..self.seq.participant_box_count]) |box| {
+            const style = participantBoxStyle(box.color);
             const last = box.first + box.count - 1;
             const x1 = self.x[box.first] - 1;
             const x2 = self.x[last] + self.w[last];
@@ -342,9 +433,18 @@ const Layout = struct {
             .actor, .database => cells.round,
             .participant, .boundary, .control, .entity, .collections, .queue => cells.square,
         };
-        cells.box(win, self.x[index], top, self.w[index], participant.label, corners, start_row, skip, .{});
-        if (participant.link) |uri| {
-            cells.putTextLink(win, top + 1, self.x[index] + 2, start_row, skip, participant.label, self.x[index] + self.w[index] - 2, .{}, uri);
+        cells.boxHeight(win, self.x[index], top, self.w[index], self.participant_height, "", corners, start_row, skip, .{});
+        const prefix = participantPrefix(participant.kind);
+        const prefix_width = cells.labelWidth(prefix);
+        cells.putText(win, top + 1, self.x[index] + 2, start_row, skip, prefix, self.x[index] + self.w[index] - 2, .{});
+        var lines: cells.LineIterator = .{ .remaining = participant.label };
+        var row: usize = 0;
+        while (lines.next()) |line| : (row += 1) {
+            const col = self.x[index] + 2 + if (row == 0) prefix_width else 0;
+            if (participant.link) |uri|
+                cells.putTextLink(win, top + 1 + row, col, start_row, skip, line, self.x[index] + self.w[index] - 2, .{}, uri)
+            else
+                cells.putText(win, top + 1 + row, col, start_row, skip, line, self.x[index] + self.w[index] - 2, .{});
         }
     }
 
@@ -352,7 +452,7 @@ const Layout = struct {
         const s = partIndex(self.seq, m.src) orelse return;
         const d = partIndex(self.seq, m.dst) orelse return;
         const base = self.rowOf(m.pos);
-        const wire = base + @intFromBool(m.number != null or m.text.len > 0);
+        const wire = base + messageTextRows(m);
         var scx = self.lifelineCol(s, wire);
         var dcx = self.lifelineCol(d, wire);
         if (mem.eql(u8, m.src, m.dst)) {
@@ -393,13 +493,18 @@ const Layout = struct {
         if (m.number == null and m.text.len == 0) return;
         const s = partIndex(self.seq, m.src) orelse return;
         const d = partIndex(self.seq, m.dst) orelse return;
-        const row = self.rowOf(m.pos);
-        const c = self.labelStart(s, d, row);
-        if (m.number) |number| {
-            const num_width = putNumber(win, row, c, start_row, skip, number, self.cols -| 1);
-            cells.putText(win, row, c + num_width, start_row, skip, m.text, self.cols -| 1, .{});
-        } else {
-            cells.putText(win, row, c, start_row, skip, m.text, self.cols -| 1, .{});
+        const first_row = self.rowOf(m.pos);
+        var lines: cells.LineIterator = .{ .remaining = m.text };
+        var index: usize = 0;
+        while (lines.next()) |line| : (index += 1) {
+            const row = first_row + index;
+            const col = self.labelStart(s, d, row);
+            if (index == 0 and m.number != null) {
+                const num_width = putNumber(win, row, col, start_row, skip, m.number.?, self.cols -| 1);
+                cells.putText(win, row, col + num_width, start_row, skip, line, self.cols -| 1, .{});
+            } else {
+                cells.putText(win, row, col, start_row, skip, line, self.cols -| 1, .{});
+            }
         }
     }
 
@@ -558,6 +663,24 @@ test "sequence titles render above participants" {
     try testing.expect(win.readCell(0, 0).?.style.bold);
 }
 
+test "participant and note labels render multiple lines" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "participant A as Alice<br/>Admin\n" ++
+            "Note over A: first<br/>second\n" ++
+            "A->>B: hi\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 10), layout(null, &seq, 0, 0, 40).?);
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 2, 1, "A");
+    try expectGlyph(win, 2, 2, "A");
+    try expectGlyph(win, 2, 5, "f");
+    try expectGlyph(win, 2, 6, "s");
+}
+
 test "participant links render as terminal hyperlinks" {
     var seq = Mermaid.parseSequenceBlockText(
         "sequenceDiagram\n" ++
@@ -570,6 +693,23 @@ test "participant links render as terminal hyperlinks" {
     const win = window(&screen);
     _ = layout(win, &seq, 0, 0, 40).?;
     try testing.expectEqualStrings("https://example.com/dashboard", win.readCell(2, 1).?.link.uri);
+}
+
+test "participant properties and details render as notes" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "participant A\n" ++
+            "properties A: role admin\n" ++
+            "details A: primary user\n" ++
+            "A->>B: hi\n",
+    ).?;
+    const rows = layout(null, &seq, 0, 0, 40).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(rows), .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 2, 4, "r");
+    try expectGlyph(win, 2, 7, "p");
 }
 
 test "participants render boxes and lifelines" {
@@ -591,7 +731,7 @@ test "participants render boxes and lifelines" {
 test "participant stereotypes and boxes render" {
     var seq = Mermaid.parseSequenceBlockText(
         "sequenceDiagram\n" ++
-            "box Services\n" ++
+            "box Purple Services\n" ++
             "participant A@{ \"type\": \"boundary\" }\n" ++
             "participant DB@{ \"type\": \"database\" }\n" ++
             "end\n" ++
@@ -604,8 +744,11 @@ test "participant stereotypes and boxes render" {
     _ = layout(win, &seq, 0, 0, 40).?;
     try expectGlyph(win, 2, 0, "S");
     try expectGlyph(win, 1, 2, "┌");
-    try expectGlyph(win, 9, 2, "╭");
+    try expectGlyph(win, 3, 3, "◫");
+    try expectGlyph(win, 11, 2, "╭");
+    try expectGlyph(win, 13, 3, "◉");
     try expectGlyph(win, 0, 5, "└");
+    try testing.expect(win.readCell(0, 0).?.style.fg.eql(.{ .rgb = .{ 0x80, 0x00, 0x80 } }));
 }
 
 test "created and destroyed participants render lifecycle" {
@@ -848,7 +991,8 @@ test "lifecycle renders inside par over fragments" {
     const win = window(&screen);
     _ = layout(win, &seq, 0, 0, 40).?;
     try expectGlyph(win, 0, 3, "┌");
-    try expectGlyph(win, 2, 5, "D");
+    try expectGlyph(win, 2, 5, "♙");
+    try expectGlyph(win, 4, 5, "D");
 }
 
 test "activations widen lifelines" {
@@ -939,15 +1083,15 @@ test "autonumber can start and stop" {
 
 test "sequence text normalizes line breaks and entities" {
     var seq = Mermaid.parseSequenceBlockText("sequenceDiagram\nA->>B: hi<br/>there #9829; #infin; &amp;\n").?;
-    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 5, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 6, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(testing.allocator);
     const win = window(&screen);
     _ = layout(win, &seq, 0, 0, 40).?;
-    try expectGlyph(win, 5, 3, " ");
-    try expectGlyph(win, 6, 3, "t");
-    try expectGlyph(win, 12, 3, "♥");
-    try expectGlyph(win, 14, 3, "∞");
-    try expectGlyph(win, 16, 3, "&");
+    try expectGlyph(win, 3, 3, "h");
+    try expectGlyph(win, 3, 4, "t");
+    try expectGlyph(win, 9, 4, "♥");
+    try expectGlyph(win, 11, 4, "∞");
+    try expectGlyph(win, 13, 4, "&");
 }
 
 test "long labels extend the diagram" {

@@ -91,6 +91,7 @@ fn hierarchyGap(flow: *const Mermaid.Flowchart) usize {
 const Hierarchy = struct {
     flow: *const Mermaid.Flowchart,
     node_widths: [Mermaid.max_nodes]usize,
+    node_heights: [Mermaid.max_nodes]usize,
     node_bounds: [Mermaid.max_nodes]Bounds,
     subgraph_sizes: [Mermaid.max_subgraphs]Size,
     subgraph_bounds: [Mermaid.max_subgraphs]Bounds,
@@ -104,6 +105,7 @@ const Hierarchy = struct {
         var hierarchy: Hierarchy = .{
             .flow = flow,
             .node_widths = [_]usize{0} ** Mermaid.max_nodes,
+            .node_heights = [_]usize{0} ** Mermaid.max_nodes,
             .node_bounds = undefined,
             .subgraph_sizes = undefined,
             .subgraph_bounds = undefined,
@@ -112,7 +114,10 @@ const Hierarchy = struct {
             .rows = 0,
             .cols = 0,
         };
-        for (flow.nodeList(), 0..) |node, index| hierarchy.node_widths[index] = cells.labelWidth(node.label) + 4;
+        for (flow.nodeList(), 0..) |node, index| {
+            hierarchy.node_widths[index] = cells.maxLineWidth(node.label) + 4;
+            hierarchy.node_heights[index] = cells.lineCount(node.label) + 2;
+        }
         const root_size = hierarchy.measureItems(null, flow.direction) orelse return null;
         hierarchy.rows = root_size.height + 2;
         hierarchy.cols = root_size.width + 2;
@@ -175,7 +180,7 @@ const Hierarchy = struct {
 
     fn measureItem(self: *Hierarchy, item: HierarchyItem, parent_direction: Mermaid.Direction) ?Size {
         return switch (item) {
-            .node => |index| .{ .width = self.node_widths[index], .height = 3 },
+            .node => |index| .{ .width = self.node_widths[index], .height = self.node_heights[index] },
             .subgraph => |index| blk: {
                 const subgraph = self.flow.subgraphs[index];
                 const direction = subgraph.direction orelse parent_direction;
@@ -193,7 +198,7 @@ const Hierarchy = struct {
 
     fn itemSize(self: *const Hierarchy, item: HierarchyItem) Size {
         return switch (item) {
-            .node => |index| .{ .width = self.node_widths[index], .height = 3 },
+            .node => |index| .{ .width = self.node_widths[index], .height = self.node_heights[index] },
             .subgraph => |index| self.subgraph_sizes[index],
         };
     }
@@ -228,7 +233,12 @@ const Hierarchy = struct {
     fn placeItem(self: *Hierarchy, item: HierarchyItem, x: usize, y: usize) void {
         switch (item) {
             .node => |index| {
-                self.node_bounds[index] = .{ .x1 = x, .y1 = y, .x2 = x + self.node_widths[index] - 1, .y2 = y + 2 };
+                self.node_bounds[index] = .{
+                    .x1 = x,
+                    .y1 = y,
+                    .x2 = x + self.node_widths[index] - 1,
+                    .y2 = y + self.node_heights[index] - 1,
+                };
             },
             .subgraph => |index| {
                 const size = self.subgraph_sizes[index];
@@ -317,9 +327,10 @@ const Hierarchy = struct {
         for (self.flow.edgeList()) |*edge| {
             if (edge.style == .invisible) continue;
             const path = self.route(edge) orelse continue;
-            for (path.segments[0..path.count]) |segment| drawHierarchySegment(win, segment, start_row, skip);
-            drawMarker(win, path.src_at, edge.src_marker, path.src_arrow, path.src_line, start_row, skip);
-            drawMarker(win, path.dst_at, edge.dst_marker, path.dst_arrow, path.dst_line, start_row, skip);
+            for (path.segments[0..path.count]) |segment|
+                drawStyledSegment(win, segment.r1, segment.c1, segment.r2, segment.c2, segment.glyph, edge.style, start_row, skip);
+            drawMarker(win, path.src_at, edge.src_marker, path.src_arrow, path.src_line, edge.style, start_row, skip);
+            drawMarker(win, path.dst_at, edge.dst_marker, path.dst_arrow, path.dst_line, edge.style, start_row, skip);
         }
         for (self.flow.edgeList()) |*edge| {
             if (edge.style == .invisible) continue;
@@ -334,16 +345,6 @@ fn segmentIntersectsBounds(segment: HierarchySegment, bounds: Bounds) bool {
         return segment.r1 >= bounds.y1 and segment.r1 <= bounds.y2 and segment.c1 <= bounds.x2 and segment.c2 >= bounds.x1;
     }
     return segment.c1 >= bounds.x1 and segment.c1 <= bounds.x2 and segment.r1 <= bounds.y2 and segment.r2 >= bounds.y1;
-}
-
-fn drawHierarchySegment(win: vaxis.Window, segment: HierarchySegment, start_row: usize, skip: usize) void {
-    if (segment.r1 == segment.r2) {
-        var col = segment.c1;
-        while (col <= segment.c2) : (col += 1) cells.putLine(win, segment.r1, col, start_row, skip, segment.glyph, .{});
-    } else {
-        var row = segment.r1;
-        while (row <= segment.r2) : (row += 1) cells.putLine(win, row, segment.c1, start_row, skip, segment.glyph, .{});
-    }
 }
 
 fn subgraphPadding(flow: *const Mermaid.Flowchart) usize {
@@ -375,6 +376,9 @@ const Grid = struct {
     n_layers: usize,
     n_cross: usize,
     w: [Mermaid.max_nodes]usize,
+    h: [Mermaid.max_nodes]usize,
+    layer_height: [Mermaid.max_nodes]usize,
+    row_height: [Mermaid.max_nodes]usize,
     x: [Mermaid.max_nodes]usize,
     y: [Mermaid.max_nodes]usize,
     fwd: [Mermaid.max_nodes + 1]usize,
@@ -401,6 +405,9 @@ const Grid = struct {
             .n_layers = 0,
             .n_cross = 0,
             .w = [_]usize{0} ** Mermaid.max_nodes,
+            .h = [_]usize{0} ** Mermaid.max_nodes,
+            .layer_height = [_]usize{0} ** Mermaid.max_nodes,
+            .row_height = [_]usize{0} ** Mermaid.max_nodes,
             .x = [_]usize{0} ** Mermaid.max_nodes,
             .y = [_]usize{0} ** Mermaid.max_nodes,
             .fwd = [_]usize{0} ** (Mermaid.max_nodes + 1),
@@ -415,8 +422,16 @@ const Grid = struct {
             .rows = 0,
             .cols = 0,
         };
-        for (flow.nodeList(), 0..) |node, i| grid.w[i] = cells.labelWidth(node.label) + 4;
+        for (flow.nodeList(), 0..) |node, i| {
+            grid.w[i] = cells.maxLineWidth(node.label) + 4;
+            grid.h[i] = cells.lineCount(node.label) + 2;
+        }
         grid.computeRanks();
+        for (0..grid.count) |i| {
+            grid.layer_height[grid.rank[i]] = @max(grid.layer_height[grid.rank[i]], grid.h[i]);
+            grid.row_height[grid.slot[i]] = @max(grid.row_height[grid.slot[i]], grid.h[i]);
+        }
+        for (grid.layer_height[0..grid.n_layers]) |*height| height.* = @max(height.*, 3);
         if (grid.vertical) {
             grid.layoutVertical(width) orelse return null;
         } else {
@@ -495,10 +510,10 @@ const Grid = struct {
         }
         self.assignLabelRows();
         self.fwd[0] = 0;
-        for (0..self.n_layers) |l| {
-            self.fwd[l + 1] = self.fwd[l] + 3 + 2 + 2 * self.pad + self.glabels[l];
+        for (0..self.n_layers) |layer| {
+            self.fwd[layer + 1] = self.fwd[layer] + self.layer_height[layer] + 2 + 2 * self.pad + self.glabels[layer];
         }
-        self.rows = self.fwd[self.n_layers - 1] + 3;
+        self.rows = self.fwd[self.n_layers - 1] + self.layer_height[self.n_layers - 1];
         if (self.rows > max_rows) return null;
         if (self.hasLongEdge()) {
             self.wire = cols;
@@ -507,8 +522,9 @@ const Grid = struct {
         if (cols > width) return null;
         self.cols = cols;
         for (0..self.count) |i| {
-            const y = self.fwd[self.rank[i]];
-            self.y[i] = if (self.forward) y else self.rows - 3 - y;
+            const layer = self.rank[i];
+            const y = self.fwd[layer] + (self.layer_height[layer] - self.h[i]) / 2;
+            self.y[i] = if (self.forward) y else self.rows - self.h[i] - y;
         }
     }
 
@@ -534,10 +550,10 @@ const Grid = struct {
             self.x[i] = bx + (bw - self.w[i]) / 2;
         }
         self.cpos[0] = 0;
-        for (0..self.n_cross) |t| {
-            self.cpos[t + 1] = self.cpos[t] + 3 + 2 * self.pad;
+        for (0..self.n_cross) |row| {
+            self.cpos[row + 1] = self.cpos[row] + self.row_height[row] + 2 * self.pad;
         }
-        self.rows = self.cpos[self.n_cross - 1] + 3;
+        self.rows = self.cpos[self.n_cross - 1] + self.row_height[self.n_cross - 1];
         if (self.hasLongEdge()) {
             self.wire = self.rows;
             self.rows += 1;
@@ -545,7 +561,10 @@ const Grid = struct {
         if (self.rows > max_rows) return null;
         self.cols = cols;
         if (self.cols > width) return null;
-        for (0..self.count) |i| self.y[i] = self.cpos[self.slot[i]];
+        for (0..self.count) |i| {
+            const row = self.slot[i];
+            self.y[i] = self.cpos[row] + (self.row_height[row] - self.h[i]) / 2;
+        }
     }
 
     fn applySubgraphPadding(self: *Grid, width: usize) ?void {
@@ -575,7 +594,7 @@ const Grid = struct {
                 x1 = @min(x1, self.x[node_index]);
                 y1 = @min(y1, self.y[node_index]);
                 x2 = @max(x2, self.x[node_index] + self.w[node_index] - 1);
-                y2 = @max(y2, self.y[node_index] + 2);
+                y2 = @max(y2, self.y[node_index] + self.h[node_index] - 1);
             }
             if (!found) return null;
             const expansion = self.subgraphExpansion(subgraph_index);
@@ -594,7 +613,7 @@ const Grid = struct {
                     .x1 = self.x[node_index],
                     .y1 = self.y[node_index],
                     .x2 = self.x[node_index] + self.w[node_index] - 1,
-                    .y2 = self.y[node_index] + 2,
+                    .y2 = self.y[node_index] + self.h[node_index] - 1,
                 };
                 if (boundsIntersect(bounds, node_bounds)) return null;
             }
@@ -668,7 +687,7 @@ const Grid = struct {
         const straight = drift <= 2;
         var walk: Walk = .{};
         if (self.forward) {
-            const fan = self.y[s] + 3;
+            const fan = self.y[s] + self.h[s];
             const span = self.y[d] - 1;
             if (straight) {
                 walk.vrun(cx_s, fan, span -| 1, "│");
@@ -690,7 +709,7 @@ const Grid = struct {
             walk.label = self.labelInfo(edge);
         } else {
             const fan = self.y[s] - 1;
-            const span = self.y[d] + 3;
+            const span = self.y[d] + self.h[d];
             if (straight) {
                 walk.vrun(cx_s, span + 1, fan, "│");
                 walk.arrow_at = .{ .r = span, .c = cx_s };
@@ -714,8 +733,8 @@ const Grid = struct {
     }
 
     fn routeAdjacentH(self: *const Grid, edge: *const Mermaid.Edge, s: usize, d: usize) Walk {
-        const mr_s = self.y[s] + 1;
-        const mr_d = self.y[d] + 1;
+        const mr_s = self.y[s] + self.h[s] / 2;
+        const mr_d = self.y[d] + self.h[d] / 2;
         var walk: Walk = .{};
         if (self.forward) {
             const span = self.fwd[self.rank[s]] + self.bandWidth(self.rank[s]) + 1;
@@ -756,7 +775,7 @@ const Grid = struct {
             const cx_s = self.x[s] + self.w[s] / 2;
             const cx_d = self.x[d] + self.w[d] / 2;
             if (self.forward) {
-                const js = self.y[s] + 3;
+                const js = self.y[s] + self.h[s];
                 const jd = self.y[d] - 1;
                 walk.hrun(js, cx_s + 1, wire -| 1, "─");
                 walk.dot(js, cx_s, "└");
@@ -769,7 +788,7 @@ const Grid = struct {
                 walk.label = self.labelInfo(edge);
             } else {
                 const js = self.y[s] - 1;
-                const jd = self.y[d] + 3;
+                const jd = self.y[d] + self.h[d];
                 walk.hrun(js, cx_s + 1, wire -| 1, "─");
                 walk.dot(js, cx_s, "┌");
                 walk.dot(js, wire, "┘");
@@ -781,8 +800,8 @@ const Grid = struct {
                 walk.label = self.labelInfo(edge);
             }
         } else {
-            const mr_s = self.y[s] + 1;
-            const mr_d = self.y[d] + 1;
+            const mr_s = self.y[s] + self.h[s] / 2;
+            const mr_d = self.y[d] + self.h[d] / 2;
             const cs = self.fwd[self.rank[s]] + self.bandWidth(self.rank[s]) + 1;
             const cd = self.fwd[self.rank[d] - 1] + self.bandWidth(self.rank[d] - 1) + 1;
             if (self.forward) {
@@ -824,13 +843,13 @@ const Grid = struct {
             const s = nodeIndex(self.flow, edge.src) orelse return null;
             const d = nodeIndex(self.flow, edge.dst) orelse return null;
             const k = self.lrow[idx];
-            const base = if (self.forward) self.y[s] + 4 else self.y[s] - 2;
+            const base = if (self.forward) self.y[s] + self.h[s] + 1 else self.y[s] - 2;
             return .{ .r = if (self.forward) base + k else base - k, .c = self.x[d] + self.w[d] / 2 + 2, .text = text };
         }
         const d = nodeIndex(self.flow, edge.dst) orelse return null;
         const lw = cells.labelWidth(text);
         if (lw == 0) return null;
-        const r = self.y[d] + 1;
+        const r = self.y[d] + self.h[d] / 2;
         const s = nodeIndex(self.flow, edge.src) orelse return null;
         const bent = self.rank[d] > self.rank[s] + 1 or self.y[s] != self.y[d];
         if (self.forward) {
@@ -894,27 +913,18 @@ const Grid = struct {
                 .x1 = self.x[i],
                 .y1 = self.y[i],
                 .x2 = self.x[i] + self.w[i] - 1,
-                .y2 = self.y[i] + 2,
+                .y2 = self.y[i] + self.h[i] - 1,
             }, start_row, skip);
         }
         for (self.flow.edgeList()) |*edge| {
             if (edge.style == .invisible) continue;
             const path = self.route(edge) orelse continue;
-            for (path.segs[0..path.n]) |*seg| {
-                if (seg.r1 == seg.r2 and seg.c1 == seg.c2) {
-                    cells.putLine(win, seg.r1, seg.c1, start_row, skip, seg.glyph, .{});
-                } else if (seg.r1 == seg.r2) {
-                    var c = seg.c1;
-                    while (c <= seg.c2) : (c += 1) cells.putLine(win, seg.r1, c, start_row, skip, seg.glyph, .{});
-                } else {
-                    var r = seg.r1;
-                    while (r <= seg.r2) : (r += 1) cells.putLine(win, r, seg.c1, start_row, skip, seg.glyph, .{});
-                }
-            }
-            drawMarker(win, path.arrow_at, edge.dst_marker, path.arrow, self.terminalLine(), start_row, skip);
+            for (path.segs[0..path.n]) |*seg|
+                drawStyledSegment(win, seg.r1, seg.c1, seg.r2, seg.c2, seg.glyph, edge.style, start_row, skip);
+            drawMarker(win, path.arrow_at, edge.dst_marker, path.arrow, self.terminalLine(), edge.style, start_row, skip);
             if (edge.src_marker != .none) {
                 const source = self.sourceMarkerAt(edge) orelse continue;
-                drawMarker(win, source, edge.src_marker, reverseArrow(path.arrow), self.terminalLine(), start_row, skip);
+                drawMarker(win, source, edge.src_marker, reverseArrow(path.arrow), self.terminalLine(), edge.style, start_row, skip);
             }
         }
         for (self.flow.edgeList()) |*edge| {
@@ -928,12 +938,12 @@ const Grid = struct {
         const source = nodeIndex(self.flow, edge.src) orelse return null;
         if (self.vertical) {
             return .{
-                .r = if (self.forward) self.y[source] + 3 else self.y[source] - 1,
+                .r = if (self.forward) self.y[source] + self.h[source] else self.y[source] - 1,
                 .c = self.x[source] + self.w[source] / 2,
             };
         }
         return .{
-            .r = self.y[source] + 1,
+            .r = self.y[source] + self.h[source] / 2,
             .c = if (self.forward) self.x[source] + self.w[source] else self.x[source] - 1,
         };
     }
@@ -962,18 +972,90 @@ fn drawFrame(win: vaxis.Window, bounds: Bounds, label: []const u8, start_row: us
     cells.putText(win, bounds.y1, bounds.x1 + 2, start_row, skip, label, bounds.x2 - 1, style);
 }
 
+const NodeFrame = struct {
+    top_left: []const u8,
+    top_right: []const u8,
+    bottom_left: []const u8,
+    bottom_right: []const u8,
+    horizontal: []const u8 = "─",
+    left: []const u8 = "│",
+    right: []const u8 = "│",
+};
+
 fn drawNodeBox(win: vaxis.Window, node: *const Mermaid.Node, bounds: Bounds, start_row: usize, skip: usize) void {
-    const corners = switch (node.shape) {
-        .rounded, .stadium, .circle, .cylinder, .double_circle => cells.round,
-        .diamond => cells.diamond,
-        else => cells.square,
+    const frame: NodeFrame = switch (node.shape) {
+        .rect => .{ .top_left = "┌", .top_right = "┐", .bottom_left = "└", .bottom_right = "┘" },
+        .rounded, .stadium, .circle => .{ .top_left = "╭", .top_right = "╮", .bottom_left = "╰", .bottom_right = "╯" },
+        .diamond => .{ .top_left = "◇", .top_right = "◇", .bottom_left = "◇", .bottom_right = "◇" },
+        .subroutine => .{ .top_left = "┌", .top_right = "┐", .bottom_left = "└", .bottom_right = "┘" },
+        .parallelogram => .{ .top_left = "╱", .top_right = "╲", .bottom_left = "╲", .bottom_right = "╱", .left = "╱", .right = "╲" },
+        .hexagon => .{ .top_left = "◢", .top_right = "◣", .bottom_left = "◥", .bottom_right = "◤" },
+        .cylinder => .{ .top_left = "╭", .top_right = "╮", .bottom_left = "╰", .bottom_right = "╯", .left = "(", .right = ")" },
+        .asymmetric => .{ .top_left = "◢", .top_right = "┐", .bottom_left = "◥", .bottom_right = "┘", .left = ">" },
+        .trapezoid => .{ .top_left = "╱", .top_right = "╲", .bottom_left = "└", .bottom_right = "┘", .left = "╱", .right = "╲" },
+        .double_circle => .{ .top_left = "╔", .top_right = "╗", .bottom_left = "╚", .bottom_right = "╝", .horizontal = "═", .left = "║", .right = "║" },
     };
-    cells.box(win, bounds.x1, bounds.y1, bounds.width(), node.label, corners, start_row, skip, .{});
+    const width = bounds.width();
+    for (0..bounds.height()) |row| {
+        for (0..width) |col| cells.putRaw(win, bounds.y1 + row, bounds.x1 + col, start_row, skip, " ", .{});
+    }
+    cells.putRaw(win, bounds.y1, bounds.x1, start_row, skip, frame.top_left, .{});
+    cells.putRaw(win, bounds.y1, bounds.x2, start_row, skip, frame.top_right, .{});
+    cells.putRaw(win, bounds.y2, bounds.x1, start_row, skip, frame.bottom_left, .{});
+    cells.putRaw(win, bounds.y2, bounds.x2, start_row, skip, frame.bottom_right, .{});
+    for (bounds.x1 + 1..bounds.x2) |col| {
+        cells.putRaw(win, bounds.y1, col, start_row, skip, frame.horizontal, .{});
+        cells.putRaw(win, bounds.y2, col, start_row, skip, frame.horizontal, .{});
+    }
+    for (bounds.y1 + 1..bounds.y2) |row| {
+        cells.putRaw(win, row, bounds.x1, start_row, skip, frame.left, .{});
+        cells.putRaw(win, row, bounds.x2, start_row, skip, frame.right, .{});
+        if (node.shape == .subroutine) {
+            cells.putRaw(win, row, bounds.x1 + 1, start_row, skip, "│", .{});
+            cells.putRaw(win, row, bounds.x2 - 1, start_row, skip, "│", .{});
+        }
+    }
+    var lines: cells.LineIterator = .{ .remaining = node.label };
+    var row = bounds.y1 + 1;
+    while (lines.next()) |line| : (row += 1)
+        cells.putText(win, row, bounds.x1 + 2, start_row, skip, line, bounds.x2 - 1, .{});
 }
 
-fn drawMarker(win: vaxis.Window, pos: CellPos, marker: Mermaid.EdgeMarker, arrow: []const u8, line: []const u8, start_row: usize, skip: usize) void {
+fn drawStyledSegment(
+    win: vaxis.Window,
+    r1: usize,
+    c1: usize,
+    r2: usize,
+    c2: usize,
+    glyph: []const u8,
+    edge_style: Mermaid.EdgeStyle,
+    start_row: usize,
+    skip: usize,
+) void {
+    if (edge_style == .invisible) return;
+    const horizontal = r1 == r2;
+    const straight = (horizontal and mem.eql(u8, glyph, "─")) or (!horizontal and mem.eql(u8, glyph, "│"));
+    var row = r1;
+    var col = c1;
+    while (true) {
+        if (!straight or edge_style == .solid) {
+            cells.putLine(win, row, col, start_row, skip, glyph, .{});
+        } else if (edge_style == .dotted) {
+            if (horizontal)
+                cells.putDotted(win, row, col, start_row, skip, .{})
+            else
+                cells.putDottedVertical(win, row, col, start_row, skip, .{});
+        } else {
+            cells.putHeavy(win, row, col, start_row, skip, horizontal, .{});
+        }
+        if (row == r2 and col == c2) break;
+        if (horizontal) col += 1 else row += 1;
+    }
+}
+
+fn drawMarker(win: vaxis.Window, pos: CellPos, marker: Mermaid.EdgeMarker, arrow: []const u8, line: []const u8, edge_style: Mermaid.EdgeStyle, start_row: usize, skip: usize) void {
     switch (marker) {
-        .none => cells.putLine(win, pos.r, pos.c, start_row, skip, line, .{}),
+        .none => drawStyledSegment(win, pos.r, pos.c, pos.r, pos.c, line, edge_style, start_row, skip),
         .arrow => cells.putRaw(win, pos.r, pos.c, start_row, skip, arrow, .{}),
         .circle => cells.putRaw(win, pos.r, pos.c, start_row, skip, "○", .{}),
         .cross => cells.putRaw(win, pos.r, pos.c, start_row, skip, "×", .{}),
@@ -1057,6 +1139,43 @@ test "chain renders boxes joined by arrows" {
     try expectGlyph(win, 2, 8, "│");
     try expectGlyph(win, 2, 9, "▼");
     try expectGlyph(win, 0, 10, "┌");
+}
+
+test "flowchart node shapes render distinct frames" {
+    var flow = Mermaid.parseText("graph TD\nA[(db)]\n").?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &flow, 0, 0, 20).?;
+    try expectGlyph(win, 0, 1, "(");
+
+    win.clear();
+    flow = Mermaid.parseText("graph TD\nA[[sub]]\n").?;
+    _ = layout(win, &flow, 0, 0, 20).?;
+    try expectGlyph(win, 1, 1, "│");
+
+    win.clear();
+    flow = Mermaid.parseText("graph TD\nA[/data/]\n").?;
+    _ = layout(win, &flow, 0, 0, 20).?;
+    try expectGlyph(win, 0, 0, "╱");
+
+    win.clear();
+    flow = Mermaid.parseText("graph TD\nA(((stop)))\n").?;
+    _ = layout(win, &flow, 0, 0, 20).?;
+    try expectGlyph(win, 0, 0, "╔");
+}
+
+test "flowchart node labels render multiple lines" {
+    var flow = Mermaid.parseText("graph TD\nA[\"one<br/>two\"]-->B\n").?;
+    try testing.expectEqual(@as(usize, 9), layout(null, &flow, 0, 0, 40).?);
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 9, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &flow, 0, 0, 40).?;
+    try expectGlyph(win, 2, 1, "o");
+    try expectGlyph(win, 2, 2, "t");
+    try expectGlyph(win, 3, 5, "▼");
+    try expectGlyph(win, 1, 6, "┌");
 }
 
 test "branch lays out siblings side by side" {
@@ -1188,6 +1307,20 @@ test "flowchart endpoint markers render" {
     flow = Mermaid.parseText("flowchart LR\nA~~~B\n").?;
     _ = layout(win, &flow, 0, 0, 40).?;
     try testing.expect(!mem.eql(u8, win.readCell(6, 1).?.char.grapheme, "─"));
+}
+
+test "flowchart edge styles render distinctly" {
+    var flow = Mermaid.parseText("flowchart LR\nA-.->B\n").?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &flow, 0, 0, 40).?;
+    try expectGlyph(win, 6, 1, "┄");
+
+    win.clear();
+    flow = Mermaid.parseText("flowchart LR\nA==>B\n").?;
+    _ = layout(win, &flow, 0, 0, 40).?;
+    try expectGlyph(win, 6, 1, "━");
 }
 
 test "left to right branch bends inside the gap" {
