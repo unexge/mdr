@@ -58,14 +58,17 @@ classDef terminal fill:red
 ```
 
 ```mermaid
+%%{init: {'theme': 'base'}}%%
 sequenceDiagram
+title: Service exchange
     box Services
         participant Alice@{ "type": "boundary" }
         participant Bob@{ "type": "database" }
     end
+    link Alice: Dashboard @ https://example.com/dashboard
     autonumber 2.5 0.25
     critical Greeting
-        Alice->>Bob: Hello
+        Alice->>Bob: Hello<br/>Bob #9829;
     option Retry
         Alice->>Bob: Hello again
     end
@@ -77,10 +80,13 @@ sequenceDiagram
     deactivate Bob
     Bob/|-Alice: Reverse half
     Alice()->>()Bob: Central
-    create actor Carol
-    Alice->>Carol: Welcome
-    destroy Carol
-    Carol--xAlice: Bye
+    par_over Onboarding
+        create actor Carol
+        Alice->>Carol: Welcome
+    and Cleanup
+        destroy Carol
+        Carol--xAlice: Bye
+    end
 ```
 
 ---

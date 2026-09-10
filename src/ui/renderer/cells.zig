@@ -39,10 +39,58 @@ pub fn box(
     putRaw(win, y + 2, x + bw - 1, start_row, skip, corners[3], style);
 }
 
+const DiagramTextIterator = struct {
+    remaining: []const u8,
+
+    fn next(self: *DiagramTextIterator) ?[]const u8 {
+        if (self.remaining.len == 0) return null;
+        for ([_][]const u8{ "<br>", "<br/>", "<br />" }) |tag| {
+            if (startsWithIgnoreCase(self.remaining, tag)) {
+                self.remaining = self.remaining[tag.len..];
+                return " ";
+            }
+        }
+        if (self.remaining[0] == '#' or self.remaining[0] == '&') {
+            if (mem.indexOfScalar(u8, self.remaining, ';')) |end| {
+                const entity = self.remaining[1..end];
+                const entities = [_]struct { name: []const u8, value: []const u8 }{
+                    .{ .name = "9829", .value = "♥" },
+                    .{ .name = "infin", .value = "∞" },
+                    .{ .name = "quot", .value = "\"" },
+                    .{ .name = "35", .value = "#" },
+                    .{ .name = "59", .value = ";" },
+                    .{ .name = "amp", .value = "&" },
+                    .{ .name = "lt", .value = "<" },
+                    .{ .name = "gt", .value = ">" },
+                    .{ .name = "nbsp", .value = " " },
+                };
+                for (entities) |entry| {
+                    if (!mem.eql(u8, entity, entry.name)) continue;
+                    self.remaining = self.remaining[end + 1 ..];
+                    return entry.value;
+                }
+            }
+        }
+        var graphemes = vaxis.unicode.graphemeIterator(self.remaining);
+        const grapheme = graphemes.next() orelse return null;
+        const bytes = grapheme.bytes(self.remaining);
+        self.remaining = self.remaining[bytes.len..];
+        return bytes;
+    }
+};
+
+fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    if (text.len < prefix.len) return false;
+    for (text[0..prefix.len], prefix) |actual, expected| {
+        if (std.ascii.toLower(actual) != std.ascii.toLower(expected)) return false;
+    }
+    return true;
+}
+
 pub fn labelWidth(label: []const u8) usize {
     var width: usize = 0;
-    var iter = vaxis.unicode.graphemeIterator(label);
-    while (iter.next()) |g| width += vaxis.gwidth.gwidth(g.bytes(label), .unicode);
+    var iter: DiagramTextIterator = .{ .remaining = label };
+    while (iter.next()) |grapheme| width += vaxis.gwidth.gwidth(grapheme, .unicode);
     return width;
 }
 
@@ -86,14 +134,32 @@ pub fn putText(win: vaxis.Window, r: usize, c0: usize, start_row: usize, skip: u
     const rr = start_row + (r - skip);
     if (rr >= win.height) return;
     var c = c0;
-    var iter = vaxis.unicode.graphemeIterator(text);
-    while (iter.next()) |g| {
-        const bytes = g.bytes(text);
+    var iter: DiagramTextIterator = .{ .remaining = text };
+    while (iter.next()) |bytes| {
         const gw = vaxis.gwidth.gwidth(bytes, .unicode);
         if (gw == 0) continue;
         if (c + gw > max_c or c + gw > win.width) break;
         win.writeCell(@intCast(c), @intCast(rr), .{ .char = .{ .grapheme = bytes, .width = @intCast(gw) }, .style = style });
         c += gw;
+    }
+}
+
+pub fn putTextLink(win: vaxis.Window, r: usize, c0: usize, start_row: usize, skip: usize, text: []const u8, max_c: usize, style: vaxis.Style, uri: []const u8) void {
+    if (r < skip) return;
+    const rr = start_row + (r - skip);
+    if (rr >= win.height) return;
+    var col = c0;
+    var iter: DiagramTextIterator = .{ .remaining = text };
+    while (iter.next()) |bytes| {
+        const width = vaxis.gwidth.gwidth(bytes, .unicode);
+        if (width == 0) continue;
+        if (col + width > max_c or col + width > win.width) break;
+        win.writeCell(@intCast(col), @intCast(rr), .{
+            .char = .{ .grapheme = bytes, .width = @intCast(width) },
+            .style = style,
+            .link = .{ .uri = uri },
+        });
+        col += width;
     }
 }
 

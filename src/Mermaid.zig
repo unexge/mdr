@@ -143,6 +143,10 @@ fn isComment(line: []const u8) bool {
     return mem.startsWith(u8, line, "%%") and !mem.startsWith(u8, line, "%%{");
 }
 
+fn isConfigDirective(line: []const u8) bool {
+    return mem.startsWith(u8, line, "%%{") and mem.endsWith(u8, line, "}%%");
+}
+
 const Parser = struct {
     flow: Flowchart = .{},
     seen_header: bool = false,
@@ -973,6 +977,7 @@ pub const Participant = struct {
     kind: ParticipantKind = .participant,
     created_at: ?usize = null,
     destroyed_at: ?usize = null,
+    link: ?[]const u8 = null,
 };
 
 pub const ParticipantBox = struct {
@@ -992,6 +997,7 @@ pub const Message = struct {
     src_endpoint: MsgEndpoint,
     dst_endpoint: MsgEndpoint,
     central: CentralConnection,
+    number: ?u64,
     text: []const u8,
     pos: usize,
 };
@@ -1006,7 +1012,7 @@ pub const Note = struct {
     pos: usize,
 };
 
-pub const FragmentOp = enum { loop, alt, opt, par, critical, @"break", rect };
+pub const FragmentOp = enum { loop, alt, opt, par, par_over, critical, @"break", rect };
 
 pub const Divider = struct {
     pos: usize,
@@ -1037,6 +1043,7 @@ pub const Autonumber = struct {
 };
 
 pub const Sequence = struct {
+    title: ?[]const u8 = null,
     participants: [max_participants]Participant = undefined,
     participant_count: usize = 0,
     messages: [max_messages]Message = undefined,
@@ -1096,23 +1103,69 @@ const SeqParser = struct {
     pending_activation_count: usize = 0,
     open_participant_box: ?usize = null,
     pending_lifecycle: ?PendingLifecycle = null,
+    next_sequence_number: u64 = 0,
+    reading_accessibility_description: bool = false,
+    reading_frontmatter: bool = false,
 
     fn feed(self: *SeqParser, raw: []const u8) void {
+        const raw_trimmed = mem.trim(u8, raw, " \t\r");
+        if (isConfigDirective(raw_trimmed)) {
+            self.feedStatement(raw_trimmed);
+            return;
+        }
+        const source = stripSequenceComment(raw);
+        const trimmed = mem.trim(u8, source, " \t\r");
+        if (isComment(trimmed)) {
+            self.feedStatement(trimmed);
+            return;
+        }
+        var start: usize = 0;
+        var quoted = false;
+        var depth: usize = 0;
+        var i: usize = 0;
+        while (i <= source.len) : (i += 1) {
+            const at_end = i == source.len;
+            if (!at_end) {
+                switch (source[i]) {
+                    '"' => quoted = !quoted,
+                    '{' => if (!quoted) {
+                        depth += 1;
+                    },
+                    '}' => if (!quoted) {
+                        depth -|= 1;
+                    },
+                    else => {},
+                }
+            }
+            if (!at_end and (source[i] != ';' or quoted or depth > 0 or isEntitySemicolon(source, i))) continue;
+            self.feedStatement(source[start..i]);
+            if (self.seq.degraded or !self.supported) return;
+            start = i + 1;
+        }
+    }
+
+    fn feedStatement(self: *SeqParser, raw: []const u8) void {
         if (self.seq.degraded or !self.supported) return;
         const line = mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or isComment(line)) return;
+        if (mem.eql(u8, line, "---")) {
+            self.reading_frontmatter = !self.reading_frontmatter;
+            return;
+        }
+        if (self.reading_frontmatter or isConfigDirective(line)) return;
         if (!self.seen_header) {
-            if (!mem.eql(u8, line, "sequenceDiagram")) {
+            if (!eqlIgnoreCase(line, "sequenceDiagram")) {
                 self.supported = false;
                 return;
             }
             self.seen_header = true;
             return;
         }
-        if (mem.indexOfScalar(u8, line, ';') != null) {
-            self.supported = false;
+        if (self.reading_accessibility_description) {
+            if (mem.indexOfScalar(u8, line, '}') != null) self.reading_accessibility_description = false;
             return;
         }
+        if (self.feedMetadata(line)) return;
         if (self.pending_lifecycle != null) {
             const message = parseMessageLine(line) orelse {
                 self.supported = false;
@@ -1133,6 +1186,7 @@ const SeqParser = struct {
             }
             return;
         }
+        if (self.feedActorMetadata(line)) return;
         if (self.feedLifecycle(line)) return;
         if (parseParticipantLine(line)) |participant| {
             _ = self.addParticipant(participant);
@@ -1152,7 +1206,9 @@ const SeqParser = struct {
 
     fn finish(self: *SeqParser) void {
         if (self.seq.degraded) return;
-        if (self.pending_lifecycle != null or self.open_participant_box != null or self.stack_len > 0) {
+        if (self.pending_lifecycle != null or self.open_participant_box != null or self.stack_len > 0 or
+            self.reading_accessibility_description or self.reading_frontmatter)
+        {
             self.supported = false;
             return;
         }
@@ -1206,10 +1262,6 @@ const SeqParser = struct {
     }
 
     fn addMessage(self: *SeqParser, m: ParsedMessage) void {
-        if (m.central != .none and mem.eql(u8, m.src, m.dst)) {
-            self.supported = false;
-            return;
-        }
         const s = self.intern(m.src) orelse return;
         const d = self.intern(m.dst) orelse return;
         if (self.seq.participants[s].destroyed_at != null or self.seq.participants[d].destroyed_at != null) {
@@ -1239,10 +1291,12 @@ const SeqParser = struct {
             .src_endpoint = m.src_endpoint,
             .dst_endpoint = m.dst_endpoint,
             .central = m.central,
+            .number = if (self.seq.autonumber != null) self.next_sequence_number else null,
             .text = m.text,
             .pos = self.pos,
         };
         self.seq.message_count += 1;
+        if (self.seq.autonumber) |autonumber| self.next_sequence_number += autonumber.increment;
         if (self.pending_lifecycle) |pending| {
             switch (pending) {
                 .create => |participant| self.seq.participants[participant].created_at = self.pos,
@@ -1258,12 +1312,75 @@ const SeqParser = struct {
         if (m.minus) self.endActivation(s, self.pos);
     }
 
-    fn feedLifecycle(self: *SeqParser, line: []const u8) bool {
-        if (stripKeyword(line, "create")) |declaration| {
-            if (self.stack_len > 0) {
+    fn feedActorMetadata(self: *SeqParser, line: []const u8) bool {
+        if (stripKeyword(line, "links")) |statement| {
+            const parsed = splitActorStatement(statement) orelse {
+                self.supported = false;
+                return true;
+            };
+            const uri = findFirstUrl(parsed.payload) orelse {
+                self.supported = false;
+                return true;
+            };
+            const participant = self.intern(parsed.actor) orelse return true;
+            if (self.seq.participants[participant].link == null) self.seq.participants[participant].link = uri;
+            return true;
+        }
+        if (stripKeyword(line, "link")) |statement| {
+            const parsed = splitActorStatement(statement) orelse {
+                self.supported = false;
+                return true;
+            };
+            const separator = mem.indexOfScalar(u8, parsed.payload, '@') orelse {
+                self.supported = false;
+                return true;
+            };
+            const uri = mem.trim(u8, parsed.payload[separator + 1 ..], " \t");
+            if (uri.len == 0) {
                 self.supported = false;
                 return true;
             }
+            const participant = self.intern(parsed.actor) orelse return true;
+            if (self.seq.participants[participant].link == null) self.seq.participants[participant].link = uri;
+            return true;
+        }
+        for ([_][]const u8{ "properties", "details" }) |keyword| {
+            if (stripKeyword(line, keyword)) |statement| {
+                const parsed = splitActorStatement(statement) orelse {
+                    self.supported = false;
+                    return true;
+                };
+                if (parsed.payload.len == 0) self.supported = false else _ = self.intern(parsed.actor);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn feedMetadata(self: *SeqParser, line: []const u8) bool {
+        if (stripColonDirective(line, "title")) |title| {
+            if (title.len == 0) self.supported = false else self.seq.title = title;
+            return true;
+        }
+        if (stripKeyword(line, "title")) |title| {
+            if (title.len == 0) self.supported = false else self.seq.title = title;
+            return true;
+        }
+        if (stripColonDirective(line, "accTitle") != null) return true;
+        if (stripColonDirective(line, "accDescr") != null) return true;
+        if (stripKeyword(line, "accDescr")) |rest| {
+            if (rest.len == 0 or rest[0] != '{') {
+                self.supported = false;
+            } else if (mem.indexOfScalar(u8, rest[1..], '}') == null) {
+                self.reading_accessibility_description = true;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn feedLifecycle(self: *SeqParser, line: []const u8) bool {
+        if (stripKeyword(line, "create")) |declaration| {
             const participant = parseParticipantLine(declaration) orelse {
                 self.supported = false;
                 return true;
@@ -1277,11 +1394,7 @@ const SeqParser = struct {
             return true;
         }
         if (stripKeyword(line, "destroy")) |raw_id| {
-            if (self.stack_len > 0) {
-                self.supported = false;
-                return true;
-            }
-            const id = parseId(raw_id) orelse {
+            const id = parseActorId(raw_id) orelse {
                 self.supported = false;
                 return true;
             };
@@ -1309,10 +1422,6 @@ const SeqParser = struct {
     fn startParticipantBox(self: *SeqParser, descriptor: []const u8) void {
         if (self.seq.participant_box_count >= max_participant_boxes) {
             self.seq.degraded = true;
-            return;
-        }
-        if (self.pos > 0 or self.stack_len > 0) {
-            self.supported = false;
             return;
         }
         const label = participantBoxLabel(descriptor) orelse {
@@ -1400,14 +1509,19 @@ const SeqParser = struct {
 
     fn feedControl(self: *SeqParser, line: []const u8) bool {
         if (stripKeyword(line, "autonumber")) |options| {
+            if (eqlIgnoreCase(options, "off")) {
+                self.seq.autonumber = null;
+                return true;
+            }
             self.seq.autonumber = parseAutonumber(options) orelse {
                 self.supported = false;
                 return true;
             };
+            self.next_sequence_number = self.seq.autonumber.?.start;
             return true;
         }
         if (stripKeyword(line, "activate")) |raw_id| {
-            const id = parseId(raw_id) orelse {
+            const id = parseActorId(raw_id) orelse {
                 self.supported = false;
                 return true;
             };
@@ -1415,7 +1529,7 @@ const SeqParser = struct {
             return true;
         }
         if (stripKeyword(line, "deactivate")) |raw_id| {
-            const id = parseId(raw_id) orelse {
+            const id = parseActorId(raw_id) orelse {
                 self.supported = false;
                 return true;
             };
@@ -1427,6 +1541,7 @@ const SeqParser = struct {
             .{ .kw = "alt", .op = .alt },
             .{ .kw = "opt", .op = .opt },
             .{ .kw = "par", .op = .par },
+            .{ .kw = "par_over", .op = .par_over },
             .{ .kw = "critical", .op = .critical },
             .{ .kw = "break", .op = .@"break" },
             .{ .kw = "rect", .op = .rect },
@@ -1442,7 +1557,7 @@ const SeqParser = struct {
             return true;
         }
         if (stripKeyword(line, "and")) |label| {
-            if (!self.topIs(.par)) self.supported = false else self.div("and", label);
+            if (!self.topIs(.par) and !self.topIs(.par_over)) self.supported = false else self.div("and", label);
             return true;
         }
         if (stripKeyword(line, "else")) |label| {
@@ -1500,12 +1615,68 @@ const SeqParser = struct {
     }
 };
 
+const ActorStatement = struct {
+    actor: []const u8,
+    payload: []const u8,
+};
+
+fn splitActorStatement(statement: []const u8) ?ActorStatement {
+    const colon = mem.indexOfScalar(u8, statement, ':') orelse return null;
+    const actor = parseActorId(statement[0..colon]) orelse return null;
+    const payload = mem.trim(u8, statement[colon + 1 ..], " \t");
+    if (payload.len == 0) return null;
+    return .{ .actor = actor, .payload = payload };
+}
+
+fn findFirstUrl(text: []const u8) ?[]const u8 {
+    const start = mem.indexOf(u8, text, "https://") orelse mem.indexOf(u8, text, "http://") orelse return null;
+    var end = start;
+    while (end < text.len and text[end] != '"' and text[end] != '\'' and text[end] != ',' and text[end] != '}' and
+        text[end] != ' ' and text[end] != '\t') : (end += 1)
+    {}
+    return text[start..end];
+}
+
+fn stripColonDirective(line: []const u8, name: []const u8) ?[]const u8 {
+    if (line.len <= name.len or !eqlIgnoreCase(line[0..name.len], name) or line[name.len] != ':') return null;
+    return mem.trim(u8, line[name.len + 1 ..], " \t");
+}
+
+fn stripSequenceComment(line: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] != '#') continue;
+        const semicolon = mem.indexOfScalarPos(u8, line, i + 1, ';');
+        if (semicolon) |end| {
+            var entity = true;
+            for (line[i + 1 .. end]) |char| {
+                if (!ascii.isAlphanumeric(char)) {
+                    entity = false;
+                    break;
+                }
+            }
+            if (entity) {
+                i = end;
+                continue;
+            }
+        }
+        return line[0..i];
+    }
+    return line;
+}
+
+fn isEntitySemicolon(text: []const u8, semicolon: usize) bool {
+    var start = semicolon;
+    while (start > 0 and ascii.isAlphanumeric(text[start - 1])) start -= 1;
+    return start > 0 and (text[start - 1] == '#' or text[start - 1] == '&');
+}
+
 fn boundary(s: []const u8, n: usize) bool {
     return s.len == n or s[n] == ' ' or s[n] == '\t';
 }
 
 fn stripKeyword(s: []const u8, kw: []const u8) ?[]const u8 {
-    if (!mem.startsWith(u8, s, kw) or !boundary(s, kw.len)) return null;
+    if (s.len < kw.len or !eqlIgnoreCase(s[0..kw.len], kw) or !boundary(s, kw.len)) return null;
     return mem.trim(u8, s[kw.len..], " \t");
 }
 
@@ -1514,7 +1685,7 @@ fn parseAutonumber(raw: []const u8) ?Autonumber {
     if (options.len == 0) return .{ .start = 100, .increment = 100 };
     var tokens = mem.tokenizeAny(u8, options, " \t");
     const start = parseHundredths(tokens.next() orelse return null) orelse return null;
-    const increment = parseHundredths(tokens.next() orelse return null) orelse return null;
+    const increment = if (tokens.next()) |token| parseHundredths(token) orelse return null else 100;
     if (tokens.next() != null) return null;
     return .{ .start = start, .increment = increment };
 }
@@ -1544,10 +1715,13 @@ fn parseHundredths(raw: []const u8) ?u32 {
     return whole * 100 + fraction;
 }
 
-fn parseId(s: []const u8) ?[]const u8 {
-    if (s.len == 0) return null;
-    for (s) |c| if (!isIdChar(c)) return null;
-    return s;
+fn parseActorId(raw: []const u8) ?[]const u8 {
+    const id = mem.trim(u8, raw, " \t");
+    if (id.len == 0) return null;
+    for (id) |char| {
+        if (char == '<' or char == '>' or char == ':' or char == ',' or char == ';' or char == '@' or char == '\n' or char == '\r') return null;
+    }
+    return id;
 }
 
 const ParsedParticipant = struct {
@@ -1563,6 +1737,18 @@ const ParticipantMetadata = struct {
     kind: ?ParticipantKind = null,
 };
 
+fn findKeywordSeparator(text: []const u8, keyword: []const u8) ?usize {
+    if (text.len < keyword.len + 2) return null;
+    var i: usize = 1;
+    while (i + keyword.len < text.len) : (i += 1) {
+        if (text[i - 1] != ' ' and text[i - 1] != '\t') continue;
+        if (!eqlIgnoreCase(text[i .. i + keyword.len], keyword)) continue;
+        const after = text[i + keyword.len];
+        if (after == ' ' or after == '\t') return i;
+    }
+    return null;
+}
+
 fn parseParticipantLine(line: []const u8) ?ParsedParticipant {
     const parsed_keyword: struct { rest: []const u8, kind: ParticipantKind } = if (stripKeyword(line, "participant")) |rest|
         .{ .rest = rest, .kind = ParticipantKind.participant }
@@ -1570,11 +1756,11 @@ fn parseParticipantLine(line: []const u8) ?ParsedParticipant {
         .{ .rest = rest, .kind = ParticipantKind.actor }
     else
         return null;
-    var i: usize = 0;
-    while (i < parsed_keyword.rest.len and isIdChar(parsed_keyword.rest[i])) : (i += 1) {}
-    if (i == 0) return null;
-    const id = parsed_keyword.rest[0..i];
-    var after = mem.trim(u8, parsed_keyword.rest[i..], " \t");
+    const metadata_start = mem.indexOf(u8, parsed_keyword.rest, "@{");
+    const alias_start = if (metadata_start == null) findKeywordSeparator(parsed_keyword.rest, "as") else null;
+    const id_end = metadata_start orelse alias_start orelse parsed_keyword.rest.len;
+    const id = parseActorId(parsed_keyword.rest[0..id_end]) orelse return null;
+    var after = mem.trim(u8, parsed_keyword.rest[id_end..], " \t");
     var label = id;
     var label_explicit = false;
     var kind = parsed_keyword.kind;
@@ -1656,7 +1842,7 @@ fn participantBoxLabel(raw: []const u8) ?[]const u8 {
 
 fn parseParticipantKind(value: []const u8) ?ParticipantKind {
     inline for (std.meta.fields(ParticipantKind)) |field| {
-        if (mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        if (eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
     }
     return null;
 }
@@ -1675,17 +1861,17 @@ fn parseNoteLine(line: []const u8) ?ParsedNote {
         const actors = mem.trim(u8, after[0..ci], " \t");
         const text = mem.trim(u8, after[ci + 1 ..], " \t");
         if (mem.indexOfScalar(u8, actors, ',')) |comma| {
-            const a = parseId(mem.trim(u8, actors[0..comma], " \t")) orelse return null;
-            const b = parseId(mem.trim(u8, actors[comma + 1 ..], " \t")) orelse return null;
+            const a = parseActorId(actors[0..comma]) orelse return null;
+            const b = parseActorId(actors[comma + 1 ..]) orelse return null;
             return .{ .kind = .over, .a = a, .b = b, .text = text };
         }
-        return .{ .kind = .over, .a = parseId(actors) orelse return null, .b = null, .text = text };
+        return .{ .kind = .over, .a = parseActorId(actors) orelse return null, .b = null, .text = text };
     }
     for ([_]struct { kw: []const u8, kind: NoteKind }{ .{ .kw = "left", .kind = .left }, .{ .kw = "right", .kind = .right } }) |side| {
         const after_side = stripKeyword(rest, side.kw) orelse continue;
         const after_of = stripKeyword(after_side, "of") orelse return null;
         const ci = mem.indexOfScalar(u8, after_of, ':') orelse return null;
-        const actor = parseId(mem.trim(u8, after_of[0..ci], " \t")) orelse return null;
+        const actor = parseActorId(after_of[0..ci]) orelse return null;
         return .{ .kind = side.kind, .a = actor, .b = null, .text = mem.trim(u8, after_of[ci + 1 ..], " \t") };
     }
     return null;
@@ -1753,7 +1939,7 @@ fn parseMessageLine(line: []const u8) ?ParsedMessage {
             source_central = true;
             raw_src = mem.trim(u8, raw_src[0 .. raw_src.len - 2], " \t");
         }
-        const src = parseId(raw_src) orelse return null;
+        const src = parseActorId(raw_src) orelse continue;
         var j = i + arrow.len;
         while (j < line.len and (line[j] == ' ' or line[j] == '\t')) j += 1;
         var destination_central = false;
@@ -1769,16 +1955,10 @@ fn parseMessageLine(line: []const u8) ?ParsedMessage {
             j += 1;
             while (j < line.len and (line[j] == ' ' or line[j] == '\t')) j += 1;
         }
-        var k = j;
-        while (k < line.len and isIdChar(line[k])) : (k += 1) {}
-        if (k == j) return null;
-        const dst = line[j..k];
-        const after = mem.trim(u8, line[k..], " \t");
-        var text: []const u8 = "";
-        if (after.len > 0) {
-            if (after[0] != ':') return null;
-            text = mem.trim(u8, after[1..], " \t");
-        }
+        const colon = mem.indexOfScalarPos(u8, line, j, ':');
+        const actor_end = colon orelse line.len;
+        const dst = parseActorId(line[j..actor_end]) orelse continue;
+        const text = if (colon) |index| normalizeMessageText(line[index + 1 ..]) else "";
         const central: CentralConnection = if (source_central and destination_central)
             .both
         else if (source_central)
@@ -1800,6 +1980,14 @@ fn parseMessageLine(line: []const u8) ?ParsedMessage {
         };
     }
     return null;
+}
+
+fn normalizeMessageText(raw: []const u8) []const u8 {
+    const text = mem.trim(u8, raw, " \t");
+    for ([_][]const u8{ "wrap:", "nowrap:" }) |prefix| {
+        if (text.len >= prefix.len and eqlIgnoreCase(text[0..prefix.len], prefix)) return mem.trim(u8, text[prefix.len..], " \t");
+    }
+    return text;
 }
 
 const std = @import("std");
@@ -2223,12 +2411,83 @@ test "unsupported sequence participant state is rejected" {
         "sequenceDiagram\ndestroy Missing\nA->>B: wrong\n",
         "sequenceDiagram\nbox Empty\nend\n",
         "sequenceDiagram\nbox Group\nparticipant A\nA->>B: inside\nend\n",
-        "sequenceDiagram\nloop x\ncreate participant B\nA->>B: inside\nend\n",
         "sequenceDiagram\nparticipant A\nparticipant B\ndestroy B\nA->>B: bye\nB->>A: after\n",
         "sequenceDiagram\nparticipant A@{ \"type\": \"unknown\" }\n",
     }) |text| {
         try testing.expect(parseSequenceBlockText(text) == null);
     }
+}
+
+test "sequence actor metadata and configuration" {
+    const seq = parseSequenceBlockText(
+        "---\n" ++
+            "config:\n" ++
+            "  theme: dark\n" ++
+            "---\n" ++
+            "%%{init: {'themeVariables': {'primaryColor': '#fff'}}}%%\n" ++
+            "sequenceDiagram\n" ++
+            "participant Alice\n" ++
+            "link Alice: Dashboard @ https://example.com/dashboard\n" ++
+            "properties Alice: { role: admin }\n" ++
+            "details Alice: Primary user\n" ++
+            "links Bob: {\"Wiki\": \"https://example.com/wiki\"}\n" ++
+            "Alice->>Bob: hello\n",
+    ).?;
+    try testing.expectEqualStrings("https://example.com/dashboard", seq.participants[0].link.?);
+    try testing.expectEqualStrings("https://example.com/wiki", seq.participants[1].link.?);
+}
+
+test "sequence title and accessibility metadata" {
+    const seq = parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "title: Conversation\n" ++
+            "accTitle: Accessible conversation\n" ++
+            "accDescr {\n" ++
+            "A conversation between services\n" ++
+            "}\n" ++
+            "A->>B: hello\n",
+    ).?;
+    try testing.expectEqualStrings("Conversation", seq.title.?);
+}
+
+test "sequence grammar compatibility" {
+    const seq = parseSequenceBlockText(
+        "SEQUENCEDIAGRAM; " ++
+            "PARTICIPANT Alice-in-Wonderland; " ++
+            "PARTICIPANT Service = API; " ++
+            "PARTICIPANT A-x-id; " ++
+            "AUTONUMBER 5; " ++
+            "Alice-in-Wonderland->>Service = API: first; " ++
+            "AUTONUMBER OFF; " ++
+            "Service = API-->>Alice-in-Wonderland: second; " ++
+            "A-x-id->>Alice-in-Wonderland: third\n",
+    ).?;
+    try testing.expectEqualStrings("Alice-in-Wonderland", seq.participants[0].id);
+    try testing.expectEqualStrings("Service = API", seq.participants[1].id);
+    try testing.expectEqualStrings("A-x-id", seq.participants[2].id);
+    try testing.expectEqual(@as(?u64, 500), seq.messages[0].number);
+    try testing.expect(seq.messages[1].number == null);
+}
+
+test "late boxes and lifecycle inside fragments" {
+    const seq = parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "A->>B: before\n" ++
+            "box Later\n" ++
+            "participant C\n" ++
+            "end\n" ++
+            "par_over work\n" ++
+            "create actor D\n" ++
+            "A->>D: create\n" ++
+            "and finish\n" ++
+            "destroy D\n" ++
+            "D--xA: destroy\n" ++
+            "end\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 1), seq.participant_box_count);
+    try testing.expect(seq.fragments[0].op == .par_over);
+    try testing.expectEqual(@as(?usize, 1), seq.participants[3].created_at);
+    try testing.expectEqual(@as(?usize, 2), seq.participants[3].destroyed_at);
 }
 
 test "sequence arrows" {
@@ -2320,7 +2579,16 @@ test "sequence central connections" {
     try testing.expect(seq.messages[2].central == .both);
     try testing.expect(seq.messages[3].central == .both);
     try testing.expect(seq.messages[3].src_endpoint == .arrow and seq.messages[3].dst_endpoint == .arrow);
-    try testing.expect(parseSequenceBlockText("sequenceDiagram\nA()->>()A: self\n") == null);
+    try testing.expect(parseSequenceBlockText("sequenceDiagram\nA()->>()A: self\n") != null);
+}
+
+test "sequence comments and wrap directives" {
+    const seq = parseSequenceBlockText(
+        "SEQUENCEDIAGRAM\n" ++
+            "# a comment\n" ++
+            "A->>B:wrap:hello # trailing comment\n",
+    ).?;
+    try testing.expectEqualStrings("hello", seq.messages[0].text);
 }
 
 test "sequence message text splits on first colon" {
@@ -2405,11 +2673,8 @@ test "critical break and rect sequence fragments" {
 
 test "unsupported sequence statements are rejected" {
     for ([_][]const u8{
-        "sequenceDiagram\nA->>B: before\nbox Group\nparticipant C\nend\n",
         "sequenceDiagram\nA->>B: before\nnot sequence syntax\n",
         "sequenceDiagram\nloop forever\nA->>B: again\n",
-        "sequenceDiagram\nA->>B: one; B->>A: two\n",
-        "%%{init: {'theme': 'dark'}}%%\nsequenceDiagram\nA->>B: before\n",
     }) |text| {
         try testing.expect(parseSequenceBlockText(text) == null);
     }
@@ -2478,7 +2743,6 @@ test "sequence autonumber configuration" {
     const plain = parseSequenceBlockText("sequenceDiagram\nA->>B: x\n").?;
     try testing.expect(plain.autonumber == null);
     for ([_][]const u8{
-        "sequenceDiagram\nautonumber 1\nA->>B: x\n",
         "sequenceDiagram\nautonumber 1.001 1\nA->>B: x\n",
         "sequenceDiagram\nautonumber x 1\nA->>B: x\n",
     }) |text| {

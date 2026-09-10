@@ -34,28 +34,31 @@ Falls back:
 
 Supported:
 
-- `participant` and `actor`, including `as` aliases and boundary, control,
-  entity, database, collections, and queue stereotypes
-- Participant `box` groups declared before messages; color descriptors are
-  accepted but terminal rendering uses the active theme
-- Actor and participant creation and destruction outside fragments
+- `participant` and `actor`, including `as` aliases, IDs containing spaces,
+  hyphens, or equals signs, and all participant stereotypes
+- Participant `box` groups wherever Mermaid permits them; color descriptors
+  are accepted but terminal rendering uses the active theme
+- Actor and participant creation and destruction, including inside fragments
 - Solid and dotted plain, arrow, cross, open, bidirectional, and half-arrow
   messages
-- Source, destination, and dual `()` central connections between participants
+- Source, destination, and dual `()` central connections, including self-messages
 - Notes over, left of, and right of participants
-- `loop`, `alt`/`else`, `opt`, `par`/`and`, `critical`/`option`, `break`, and
-  `rect` fragments
+- `loop`, `alt`/`else`, `opt`, `par`/`par_over`/`and`, `critical`/`option`,
+  `break`, and `rect` fragments
 - Stacked activations and the `+`/`-` activation shorthand
-- `autonumber` with optional start and increment values up to two decimal places
-- `%%` comments
+- `autonumber`, optional start and increment values, and `autonumber off`
+- Case-insensitive keywords and semicolon-separated statements
+- Titles, accessibility metadata, frontmatter, and configuration directives
+- Actor links as terminal hyperlinks; properties and details are accepted as
+  non-popup metadata
+- `<br/>` flattened to spaces and common Mermaid/HTML entities decoded
+- `%%` and `#` comments
 
 Falls back:
 
-- Participant boxes declared after messages or containing non-participant lines
-- Actor creation and destruction inside fragments or without a matching message
-- Central self-connections
-- Actor links, styling, configuration directives, and semicolon-separated
-  statements
+- Participant boxes containing non-participant lines
+- Actor creation or destruction without an immediately matching message
+- Browser-only popup menus, CSS styling, and JavaScript callbacks
 
 Other Mermaid diagram families, including class, state, ER, Gantt, pie, Git,
 mindmap, and timeline diagrams, fall back to the code card.

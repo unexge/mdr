@@ -52,12 +52,12 @@ const Layout = struct {
         }
         var extra = [_]usize{0} ** Mermaid.max_participants;
         for (lay.spans[0..lay.span_count]) |span| extra[span.p] = @max(extra[span.p], span.depth);
-        for (seq.messages[0..seq.message_count], 0..) |*m, i| {
-            if ((seq.autonumber == null and m.text.len == 0) or mem.eql(u8, m.src, m.dst)) continue;
+        for (seq.messages[0..seq.message_count]) |*m| {
+            if ((m.number == null and m.text.len == 0) or mem.eql(u8, m.src, m.dst)) continue;
             const s = partIndex(seq, m.src) orelse continue;
             const d = partIndex(seq, m.dst) orelse continue;
             var lw = cells.labelWidth(m.text);
-            if (seq.autonumber != null) lw += numberWidth(sequenceNumber(seq, i));
+            if (m.number) |number| lw += numberWidth(number);
             const row = lay.rowOf(m.pos);
             const scx = lay.lifelineCol(s, row);
             const dcx = lay.lifelineCol(d, row);
@@ -90,15 +90,16 @@ const Layout = struct {
             const nb = lay.noteBox(n) orelse continue;
             cols = @max(cols, nb.c2 + 1);
         }
-        for (seq.messages[0..seq.message_count], 0..) |*m, i| {
-            if (seq.autonumber == null and m.text.len == 0) continue;
+        for (seq.messages[0..seq.message_count]) |*m| {
+            if (m.number == null and m.text.len == 0) continue;
             const s = partIndex(seq, m.src) orelse continue;
             const d = partIndex(seq, m.dst) orelse continue;
             const row = lay.rowOf(m.pos);
             var end = lay.labelStart(s, d, row) + cells.labelWidth(m.text);
-            if (seq.autonumber != null) end += numberWidth(sequenceNumber(seq, i));
+            if (m.number) |number| end += numberWidth(number);
             cols = @max(cols, end + 1);
         }
+        if (seq.title) |title| cols = @max(cols, cells.labelWidth(title));
         if (cols > width) return null;
         lay.cols = cols;
         lay.rows = lay.headerRows() + lay.rowsBefore(seq.message_count + seq.note_count);
@@ -122,7 +123,7 @@ const Layout = struct {
             const np = if (ni < notes.len) notes[ni].pos else std.math.maxInt(usize);
             if (mp >= pos and np >= pos) break;
             if (mp < np) {
-                r += self.msgHeight(&msgs[mi]);
+                r += msgHeight(&msgs[mi]);
                 mi += 1;
             } else {
                 r += 3;
@@ -154,16 +155,22 @@ const Layout = struct {
         return self.headerRows() + self.rowsBefore(pos + 1);
     }
 
+    fn titleRows(self: *const Layout) usize {
+        return if (self.seq.title != null) 2 else 0;
+    }
+
     fn headerRows(self: *const Layout) usize {
-        return if (self.seq.participant_box_count > 0) 6 else 3;
+        const participant_rows: usize = if (self.seq.participant_box_count > 0) 6 else 3;
+        return self.titleRows() + participant_rows;
     }
 
     fn participantTop(self: *const Layout) usize {
-        return if (self.seq.participant_box_count > 0) 2 else 0;
+        const box_rows: usize = if (self.seq.participant_box_count > 0) 2 else 0;
+        return self.titleRows() + box_rows;
     }
 
-    fn msgHeight(self: *const Layout, m: *const Mermaid.Message) usize {
-        var r: usize = if (self.seq.autonumber != null or m.text.len > 0) 1 else 0;
+    fn msgHeight(m: *const Mermaid.Message) usize {
+        var r: usize = if (m.number != null or m.text.len > 0) 1 else 0;
         r += if (mem.eql(u8, m.src, m.dst)) 2 else 1;
         return r;
     }
@@ -213,6 +220,14 @@ const Layout = struct {
         }
     }
 
+    fn creationRowsAt(self: *const Layout, pos: usize) usize {
+        var rows: usize = 0;
+        for (self.seq.participants[0..self.seq.participant_count]) |participant| {
+            if (participant.created_at == pos) rows += 3;
+        }
+        return rows;
+    }
+
     fn fragTop(self: *const Layout, fi: usize) usize {
         const f = &self.seq.fragments[fi];
         var k: usize = 0;
@@ -222,7 +237,7 @@ const Layout = struct {
             k += 1;
             if (g.depth < f.depth or (g.depth == f.depth and j < fi)) rank += 1;
         }
-        return self.rowOf(f.start) -| k + rank;
+        return self.rowOf(f.start) -| k -| self.creationRowsAt(f.start) + rank;
     }
 
     fn fragBottom(self: *const Layout, fi: usize) usize {
@@ -253,6 +268,7 @@ const Layout = struct {
     }
 
     fn draw(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
+        if (self.seq.title) |title| cells.putText(win, 0, 0, start_row, skip, title, self.cols, .{ .bold = true });
         self.drawParticipantBoxes(win, start_row, skip);
         for (self.seq.participants[0..self.count], 0..) |*participant, index| {
             if (participant.created_at == null) {
@@ -290,31 +306,33 @@ const Layout = struct {
             const row = self.rowOf(n.pos);
             cells.box(win, nb.c1, row, nb.c2 - nb.c1 + 1, n.text, cells.square, start_row, skip, .{ .bg = Theme.panel });
         }
-        for (self.seq.messages[0..self.seq.message_count], 0..) |*m, i| {
-            self.drawLabel(win, m, i, start_row, skip);
+        for (self.seq.messages[0..self.seq.message_count]) |*m| {
+            self.drawLabel(win, m, start_row, skip);
         }
     }
 
     fn drawParticipantBoxes(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
         const style: vaxis.Style = .{ .dim = true };
+        const top = self.titleRows();
+        const bottom = top + 5;
         for (self.seq.participant_boxes[0..self.seq.participant_box_count]) |box| {
             const last = box.first + box.count - 1;
             const x1 = self.x[box.first] - 1;
             const x2 = self.x[last] + self.w[last];
-            cells.putLine(win, 0, x1, start_row, skip, "┌", style);
-            cells.putLine(win, 0, x2, start_row, skip, "┐", style);
-            cells.putLine(win, 5, x1, start_row, skip, "└", style);
-            cells.putLine(win, 5, x2, start_row, skip, "┘", style);
+            cells.putLine(win, top, x1, start_row, skip, "┌", style);
+            cells.putLine(win, top, x2, start_row, skip, "┐", style);
+            cells.putLine(win, bottom, x1, start_row, skip, "└", style);
+            cells.putLine(win, bottom, x2, start_row, skip, "┘", style);
             var col = x1 + 1;
             while (col < x2) : (col += 1) {
-                cells.putLine(win, 0, col, start_row, skip, "─", style);
-                cells.putLine(win, 5, col, start_row, skip, "─", style);
+                cells.putLine(win, top, col, start_row, skip, "─", style);
+                cells.putLine(win, bottom, col, start_row, skip, "─", style);
             }
-            for (1..5) |row| {
+            for (top + 1..bottom) |row| {
                 cells.putLine(win, row, x1, start_row, skip, "│", style);
                 cells.putLine(win, row, x2, start_row, skip, "│", style);
             }
-            cells.putText(win, 0, x1 + 2, start_row, skip, box.label, x2 - 1, style);
+            cells.putText(win, top, x1 + 2, start_row, skip, box.label, x2 - 1, style);
         }
     }
 
@@ -325,13 +343,16 @@ const Layout = struct {
             .participant, .boundary, .control, .entity, .collections, .queue => cells.square,
         };
         cells.box(win, self.x[index], top, self.w[index], participant.label, corners, start_row, skip, .{});
+        if (participant.link) |uri| {
+            cells.putTextLink(win, top + 1, self.x[index] + 2, start_row, skip, participant.label, self.x[index] + self.w[index] - 2, .{}, uri);
+        }
     }
 
     fn drawMessage(self: *const Layout, win: vaxis.Window, m: *const Mermaid.Message, start_row: usize, skip: usize) void {
         const s = partIndex(self.seq, m.src) orelse return;
         const d = partIndex(self.seq, m.dst) orelse return;
         const base = self.rowOf(m.pos);
-        const wire = base + @intFromBool(self.seq.autonumber != null or m.text.len > 0);
+        const wire = base + @intFromBool(m.number != null or m.text.len > 0);
         var scx = self.lifelineCol(s, wire);
         var dcx = self.lifelineCol(d, wire);
         if (mem.eql(u8, m.src, m.dst)) {
@@ -345,6 +366,10 @@ const Layout = struct {
             cells.putLine(win, wire + 1, scx + 4, start_row, skip, "┘", .{});
             drawEndpoint(win, wire + 1, scx + 1, m.dst_endpoint, false, start_row, skip);
             drawEndpoint(win, wire, scx + 1, m.src_endpoint, true, start_row, skip);
+            if (m.central == .source or m.central == .both)
+                cells.putRaw(win, wire, scx, start_row, skip, "○", .{});
+            if (m.central == .destination or m.central == .both)
+                cells.putRaw(win, wire + 1, scx, start_row, skip, "○", .{});
             return;
         }
         const source_lifeline = scx;
@@ -364,14 +389,14 @@ const Layout = struct {
             cells.putRaw(win, wire, destination_lifeline, start_row, skip, "○", .{});
     }
 
-    fn drawLabel(self: *const Layout, win: vaxis.Window, m: *const Mermaid.Message, index: usize, start_row: usize, skip: usize) void {
-        if (self.seq.autonumber == null and m.text.len == 0) return;
+    fn drawLabel(self: *const Layout, win: vaxis.Window, m: *const Mermaid.Message, start_row: usize, skip: usize) void {
+        if (m.number == null and m.text.len == 0) return;
         const s = partIndex(self.seq, m.src) orelse return;
         const d = partIndex(self.seq, m.dst) orelse return;
         const row = self.rowOf(m.pos);
         const c = self.labelStart(s, d, row);
-        if (self.seq.autonumber != null) {
-            const num_width = putNumber(win, row, c, start_row, skip, sequenceNumber(self.seq, index), self.cols -| 1);
+        if (m.number) |number| {
+            const num_width = putNumber(win, row, c, start_row, skip, number, self.cols -| 1);
             cells.putText(win, row, c + num_width, start_row, skip, m.text, self.cols -| 1, .{});
         } else {
             cells.putText(win, row, c, start_row, skip, m.text, self.cols -| 1, .{});
@@ -447,11 +472,6 @@ const ActiveSpan = struct {
     depth: usize,
 };
 
-fn sequenceNumber(seq: *const Mermaid.Sequence, index: usize) u64 {
-    const config = seq.autonumber.?;
-    return @as(u64, config.start) + @as(u64, config.increment) * index;
-}
-
 fn numberWidth(value: u64) usize {
     const fraction = value % 100;
     const fraction_width: usize = if (fraction == 0) 2 else if (fraction % 10 == 0) 4 else 5;
@@ -525,6 +545,32 @@ const Mermaid = @import("../../Mermaid.zig");
 const cells = @import("cells.zig");
 const Theme = @import("../Theme.zig");
 const vaxis = @import("vaxis");
+
+test "sequence titles render above participants" {
+    var seq = Mermaid.parseSequenceBlockText("sequenceDiagram\ntitle: Conversation\nA->>B: hi\n").?;
+    try testing.expectEqual(@as(usize, 7), layout(null, &seq, 0, 0, 40).?);
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 7, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 0, 0, "C");
+    try expectGlyph(win, 0, 2, "┌");
+    try testing.expect(win.readCell(0, 0).?.style.bold);
+}
+
+test "participant links render as terminal hyperlinks" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "participant Alice\n" ++
+            "link Alice: Dashboard @ https://example.com/dashboard\n" ++
+            "Alice->>Bob: hi\n",
+    ).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 5, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try testing.expectEqualStrings("https://example.com/dashboard", win.readCell(2, 1).?.link.uri);
+}
 
 test "participants render boxes and lifelines" {
     var seq = Mermaid.parseSequenceBlockText("sequenceDiagram\nA->>B: hi\n").?;
@@ -646,9 +692,10 @@ test "central connections render circles beside endpoints" {
     var seq = Mermaid.parseSequenceBlockText(
         "sequenceDiagram\n" ++
             "A->>()B: d\n" ++
-            "A()->>B: s\n",
+            "A()->>B: s\n" ++
+            "A()->>()A: self\n",
     ).?;
-    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 7, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(testing.allocator);
     const win = window(&screen);
     _ = layout(win, &seq, 0, 0, 40).?;
@@ -656,6 +703,8 @@ test "central connections render circles beside endpoints" {
     try expectGlyph(win, 10, 4, "○");
     try expectGlyph(win, 2, 6, "○");
     try expectGlyph(win, 10, 6, "►");
+    try expectGlyph(win, 2, 8, "○");
+    try expectGlyph(win, 2, 9, "○");
 }
 
 test "self messages bump east" {
@@ -782,6 +831,26 @@ test "critical fragments render option dividers" {
     try expectGlyph(win, 0, 9, "└");
 }
 
+test "lifecycle renders inside par over fragments" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "par_over work\n" ++
+            "create actor D\n" ++
+            "A->>D: create\n" ++
+            "and finish\n" ++
+            "destroy D\n" ++
+            "D--xA: destroy\n" ++
+            "end\n",
+    ).?;
+    const rows = layout(null, &seq, 0, 0, 40).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(rows), .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 0, 3, "┌");
+    try expectGlyph(win, 2, 5, "D");
+}
+
 test "activations widen lifelines" {
     var seq = Mermaid.parseSequenceBlockText(
         "sequenceDiagram\n" ++
@@ -850,6 +919,35 @@ test "configured autonumber prefixes" {
     try expectGlyph(win, 5, 3, "5");
     try expectGlyph(win, 6, 5, "5");
     try expectGlyph(win, 3, 7, "3");
+}
+
+test "autonumber can start and stop" {
+    var seq = Mermaid.parseSequenceBlockText(
+        "sequenceDiagram\n" ++
+            "autonumber 5\n" ++
+            "A->>B: first\n" ++
+            "autonumber off\n" ++
+            "A->>B: second\n",
+    ).?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 7, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 3, 3, "5");
+    try expectGlyph(win, 3, 5, "s");
+}
+
+test "sequence text normalizes line breaks and entities" {
+    var seq = Mermaid.parseSequenceBlockText("sequenceDiagram\nA->>B: hi<br/>there #9829; #infin; &amp;\n").?;
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 5, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &seq, 0, 0, 40).?;
+    try expectGlyph(win, 5, 3, " ");
+    try expectGlyph(win, 6, 3, "t");
+    try expectGlyph(win, 12, 3, "♥");
+    try expectGlyph(win, 14, 3, "∞");
+    try expectGlyph(win, 16, 3, "&");
 }
 
 test "long labels extend the diagram" {

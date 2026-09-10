@@ -58,9 +58,9 @@ over capacity, cyclic, or wider than the viewport degrades back to the code
 card instead of failing. Ordinary flowcharts use ranked layout, while local
 subgraph directions and group edges use a bounded recursive hierarchy layout.
 Ambiguous flat cluster overlays still fall back. Sequence
-participant groups, lifecycle positions, and activation stacks are fixed
-parser state from which header and lifeline rows are derived. Sequence numbers
-use bounded fixed-point hundredths. Message endpoints and central connections
-are explicit enums, keeping rendering exhaustive. The supported grammar is
+participant groups, lifecycle positions, activation stacks, numbering state,
+and message metadata are fixed parser state from which header and lifeline rows
+are derived. Message endpoints and central connections are explicit enums,
+keeping rendering exhaustive. The supported grammar is
 listed in [`MERMAID.md`](MERMAID.md). Shared cell drawing (junction merging, clipping,
 display widths) lives in `renderer/cells.zig`.
