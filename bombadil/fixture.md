@@ -48,7 +48,8 @@ pub fn main() void {
 flowchart LR
 subgraph process [Process]
 direction TB
-A["x"] e1@---> B["`**data**<br/>store`"]
+A["x"] e1@---> B["`**data**<br/>sto
+re`"]
 end
 subgraph result [Result]
 C{choice} <--> D(((done))):::terminal

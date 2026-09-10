@@ -196,6 +196,14 @@ test "mermaid flowcharts render as diagrams" {
     try testing.expectEqualStrings("▼", win.readCell(2, 4).?.char.grapheme);
 }
 
+test "multiline mermaid source renders as a diagram" {
+    const diagram: Document.Element.CodeBlock = .{
+        .info = .{ .mermaid = "mermaid" },
+        .content = "flowchart TD\nA[\"one\ntwo\"]-->B\n",
+    };
+    try testing.expectEqual(@as(usize, 9), layout(null, diagram, 0, 0, 40));
+}
+
 test "unsupported mermaid syntax falls back to the card" {
     const diagram: Document.Element.CodeBlock = .{
         .info = .{ .mermaid = "mermaid" },

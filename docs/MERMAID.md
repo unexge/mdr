@@ -26,7 +26,6 @@ Supported:
 
 Falls back:
 
-- Flat cluster layouts whose boundaries would overlap unrelated nodes or groups
 - Icons and image nodes
 - Edge animation, click actions, and configuration directives
 

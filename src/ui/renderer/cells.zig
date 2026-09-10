@@ -66,6 +66,14 @@ const DiagramTextIterator = struct {
 
     fn next(self: *DiagramTextIterator) ?[]const u8 {
         if (self.remaining.len == 0) return null;
+        if (self.remaining[0] == '\n') {
+            self.remaining = self.remaining[1..];
+            return " ";
+        }
+        if (self.remaining[0] == '\r') {
+            self.remaining = self.remaining[1..];
+            return self.next();
+        }
         for ([_][]const u8{ "<br>", "<br/>", "<br />" }) |tag| {
             if (startsWithIgnoreCase(self.remaining, tag)) {
                 self.remaining = self.remaining[tag.len..];
@@ -109,6 +117,11 @@ pub const LineIterator = struct {
         if (self.done) return null;
         var index: usize = 0;
         while (index < self.remaining.len) : (index += 1) {
+            if (self.remaining[index] == '\n') {
+                const line = mem.trimEnd(u8, self.remaining[0..index], "\r");
+                self.remaining = self.remaining[index + 1 ..];
+                return line;
+            }
             for ([_][]const u8{ "<br>", "<br/>", "<br />" }) |tag| {
                 if (!startsWithIgnoreCase(self.remaining[index..], tag)) continue;
                 const line = self.remaining[0..index];
@@ -133,6 +146,27 @@ pub fn maxLineWidth(text: []const u8) usize {
     var lines: LineIterator = .{ .remaining = text };
     while (lines.next()) |line| width = @max(width, labelWidth(line));
     return width;
+}
+
+pub fn wrappedLineCount(text: []const u8, max_width: usize) usize {
+    if (max_width == 0) return lineCount(text);
+    var count: usize = 0;
+    var lines: LineIterator = .{ .remaining = text };
+    while (lines.next()) |line| {
+        var col: usize = 0;
+        var graphemes: DiagramTextIterator = .{ .remaining = line };
+        while (graphemes.next()) |grapheme| {
+            const width = vaxis.gwidth.gwidth(grapheme, .unicode);
+            if (width == 0) continue;
+            if (col > 0 and col + width > max_width) {
+                count += 1;
+                col = 0;
+            }
+            col += width;
+        }
+        count += 1;
+    }
+    return count;
 }
 
 fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
@@ -218,6 +252,42 @@ pub fn putText(win: vaxis.Window, r: usize, c0: usize, start_row: usize, skip: u
         if (c + gw > max_c or c + gw > win.width) break;
         win.writeCell(@intCast(c), @intCast(rr), .{ .char = .{ .grapheme = bytes, .width = @intCast(gw) }, .style = style });
         c += gw;
+    }
+}
+
+pub fn putWrappedText(
+    win: vaxis.Window,
+    r: usize,
+    c0: usize,
+    start_row: usize,
+    skip: usize,
+    text: []const u8,
+    max_width: usize,
+    max_c: usize,
+    style: vaxis.Style,
+) void {
+    var row = r;
+    var lines: LineIterator = .{ .remaining = text };
+    while (lines.next()) |line| : (row += 1) {
+        var col: usize = 0;
+        var graphemes: DiagramTextIterator = .{ .remaining = line };
+        while (graphemes.next()) |bytes| {
+            const width = vaxis.gwidth.gwidth(bytes, .unicode);
+            if (width == 0) continue;
+            if (col > 0 and col + width > max_width) {
+                row += 1;
+                col = 0;
+            }
+            if (row >= skip) {
+                const visible_row = start_row + (row - skip);
+                if (visible_row >= win.height or c0 + col + width > max_c or c0 + col + width > win.width) break;
+                win.writeCell(@intCast(c0 + col), @intCast(visible_row), .{
+                    .char = .{ .grapheme = bytes, .width = @intCast(width) },
+                    .style = style,
+                });
+            }
+            col += width;
+        }
     }
 }
 

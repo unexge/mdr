@@ -88,15 +88,7 @@ pub const Flowchart = struct {
     }
 
     pub fn needsHierarchicalLayout(self: *const Flowchart) bool {
-        for (self.subgraphList()) |subgraph| {
-            if (subgraph.direction) |direction| {
-                if (direction != self.direction) return true;
-            }
-        }
-        for (self.edgeList()) |edge| {
-            if (self.subgraphIndex(edge.src) != null or self.subgraphIndex(edge.dst) != null) return true;
-        }
-        return false;
+        return self.subgraph_count > 0;
     }
 
     pub fn nodeInSubgraph(self: *const Flowchart, node: *const Node, subgraph: usize) bool {
@@ -154,8 +146,42 @@ const Parser = struct {
     subgraph_stack: [max_subgraph_depth]usize = undefined,
     subgraph_stack_len: usize = 0,
     next_order: usize = 0,
+    pending_start: ?[*]const u8 = null,
+    pending_depth: usize = 0,
+    pending_quoted: bool = false,
 
     fn feed(self: *Parser, raw: []const u8) void {
+        const trimmed = mem.trim(u8, raw, " \t\r");
+        if (self.pending_start == null and isComment(trimmed)) {
+            self.feedComplete(trimmed);
+            return;
+        }
+        if (self.pending_start == null) self.pending_start = raw.ptr;
+        self.scanContinuation(raw);
+        if (self.pending_quoted or self.pending_depth > 0) return;
+
+        const start = self.pending_start.?;
+        const len = @intFromPtr(raw.ptr) + raw.len - @intFromPtr(start);
+        self.pending_start = null;
+        self.feedComplete(start[0..len]);
+    }
+
+    fn scanContinuation(self: *Parser, raw: []const u8) void {
+        for (raw) |char| {
+            switch (char) {
+                '"' => self.pending_quoted = !self.pending_quoted,
+                '[', '(', '{' => if (!self.pending_quoted) {
+                    self.pending_depth += 1;
+                },
+                ']', ')', '}' => if (!self.pending_quoted) {
+                    self.pending_depth -|= 1;
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn feedComplete(self: *Parser, raw: []const u8) void {
         const trimmed = mem.trim(u8, raw, " \t\r");
         if (isComment(trimmed)) {
             self.feedStatement(trimmed);
@@ -230,7 +256,7 @@ const Parser = struct {
 
     fn finish(self: *Parser) void {
         if (self.flow.degraded) return;
-        if (self.subgraph_stack_len > 0) {
+        if (self.subgraph_stack_len > 0 or self.pending_start != null) {
             self.supported = false;
             return;
         }
@@ -2287,6 +2313,16 @@ test "flowchart syntax extensions" {
     try testing.expectEqualStrings("x;y", flow.edges[1].label.?);
     try testing.expect(flow.edges[2].style == .dotted);
     try testing.expectEqual(@as(usize, 2), flow.edges[2].min_length);
+}
+
+test "multiline quoted flowchart labels" {
+    const flow = parseText(
+        "flowchart TD\n" ++
+            "A[\"Accepts local sessions, decodes request\n" ++
+            "s\"] --> B\n",
+    ).?;
+    try testing.expectEqualStrings("Accepts local sessions, decodes request\ns", flow.nodes[0].label);
+    try testing.expectEqual(@as(usize, 1), flow.edge_count);
 }
 
 test "flowchart comments are skipped" {

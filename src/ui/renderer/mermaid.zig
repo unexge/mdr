@@ -120,8 +120,13 @@ const Hierarchy = struct {
         }
         const root_size = hierarchy.measureItems(null, flow.direction) orelse return null;
         hierarchy.rows = root_size.height + 2;
-        hierarchy.cols = root_size.width + 2;
-        if (hierarchy.rows > max_rows or hierarchy.cols > width) return null;
+        const base_cols = root_size.width + 2;
+        if (hierarchy.rows > max_rows or base_cols > width) return null;
+        var max_label_width: usize = 0;
+        for (flow.edgeList()) |edge| {
+            if (edge.label) |label| max_label_width = @max(max_label_width, cells.maxLineWidth(label));
+        }
+        hierarchy.cols = base_cols + @min(max_label_width + @intFromBool(max_label_width > 0), width - base_cols);
         hierarchy.placeItems(null, flow.direction, .{ .x1 = 1, .y1 = 1, .x2 = root_size.width, .y2 = root_size.height });
         for (flow.edgeList()) |*edge| _ = hierarchy.route(edge) orelse return null;
         return hierarchy;
@@ -312,12 +317,74 @@ const Hierarchy = struct {
                 path.label = .{ .r = mid, .c = dst_at.c + 2, .text = label };
             }
         }
+        if (self.pathIntersectsNode(path, source, destination))
+            return self.routeDetour(edge, source, destination, dx < dy);
+        return path;
+    }
+
+    fn pathIntersectsNode(self: *const Hierarchy, path: HierarchyPath, source: HierarchyEndpoint, destination: HierarchyEndpoint) bool {
         for (path.segments[0..path.count]) |segment| {
             for (self.flow.nodeList(), 0..) |_, index| {
                 if (source.node == index or destination.node == index) continue;
-                if (segmentIntersectsBounds(segment, self.node_bounds[index])) return null;
+                if (segmentIntersectsBounds(segment, self.node_bounds[index])) return true;
             }
         }
+        return false;
+    }
+
+    fn routeDetour(
+        self: *const Hierarchy,
+        edge: *const Mermaid.Edge,
+        source: HierarchyEndpoint,
+        destination: HierarchyEndpoint,
+        vertical: bool,
+    ) ?HierarchyPath {
+        const source_center = CellPos{ .r = (source.bounds.y1 + source.bounds.y2) / 2, .c = (source.bounds.x1 + source.bounds.x2) / 2 };
+        const destination_center = CellPos{ .r = (destination.bounds.y1 + destination.bounds.y2) / 2, .c = (destination.bounds.x1 + destination.bounds.x2) / 2 };
+        var path: HierarchyPath = undefined;
+        path.count = 0;
+        path.label = null;
+        if (vertical) {
+            const down = destination_center.r > source_center.r;
+            const src_at = CellPos{ .r = if (down) source.bounds.y2 + 1 else source.bounds.y1 - 1, .c = source_center.c };
+            const dst_at = CellPos{ .r = if (down) destination.bounds.y1 - 1 else destination.bounds.y2 + 1, .c = destination_center.c };
+            const detour = self.cols - 1;
+            path.src_at = src_at;
+            path.dst_at = dst_at;
+            path.src_arrow = "◄";
+            path.dst_arrow = "◄";
+            path.src_line = "─";
+            path.dst_line = "─";
+            path.add(.{ .r1 = src_at.r, .c1 = @min(src_at.c, detour), .r2 = src_at.r, .c2 = @max(src_at.c, detour), .glyph = "─" });
+            path.add(.{ .r1 = @min(src_at.r, dst_at.r), .c1 = detour, .r2 = @max(src_at.r, dst_at.r), .c2 = detour, .glyph = "│" });
+            path.add(.{ .r1 = dst_at.r, .c1 = @min(dst_at.c, detour), .r2 = dst_at.r, .c2 = @max(dst_at.c, detour), .glyph = "─" });
+            if (edge.label) |label| {
+                const width = cells.maxLineWidth(label);
+                if (src_at.c + 1 + width >= detour) return null;
+                path.label = .{ .r = src_at.r, .c = src_at.c + 1, .text = label };
+            }
+        } else {
+            const right = destination_center.c > source_center.c;
+            const src_at = CellPos{ .r = source_center.r, .c = if (right) source.bounds.x2 + 1 else source.bounds.x1 - 1 };
+            const dst_at = CellPos{ .r = destination_center.r, .c = if (right) destination.bounds.x1 - 1 else destination.bounds.x2 + 1 };
+            const detour = self.rows - 1;
+            path.src_at = src_at;
+            path.dst_at = dst_at;
+            path.src_arrow = "▲";
+            path.dst_arrow = "▲";
+            path.src_line = "│";
+            path.dst_line = "│";
+            path.add(.{ .r1 = @min(src_at.r, detour), .c1 = src_at.c, .r2 = @max(src_at.r, detour), .c2 = src_at.c, .glyph = "│" });
+            path.add(.{ .r1 = detour, .c1 = @min(src_at.c, dst_at.c), .r2 = detour, .c2 = @max(src_at.c, dst_at.c), .glyph = "─" });
+            path.add(.{ .r1 = @min(dst_at.r, detour), .c1 = dst_at.c, .r2 = @max(dst_at.r, detour), .c2 = dst_at.c, .glyph = "│" });
+            if (edge.label) |label| {
+                const width = cells.maxLineWidth(label);
+                const start = @min(src_at.c, dst_at.c);
+                if (start + width > self.cols) return null;
+                path.label = .{ .r = detour, .c = start, .text = label };
+            }
+        }
+        if (self.pathIntersectsNode(path, source, destination)) return null;
         return path;
     }
 
@@ -379,6 +446,7 @@ const Grid = struct {
     h: [Mermaid.max_nodes]usize,
     layer_height: [Mermaid.max_nodes]usize,
     row_height: [Mermaid.max_nodes]usize,
+    label_height: [Mermaid.max_nodes]usize,
     x: [Mermaid.max_nodes]usize,
     y: [Mermaid.max_nodes]usize,
     fwd: [Mermaid.max_nodes + 1]usize,
@@ -389,6 +457,7 @@ const Grid = struct {
     lmax: [Mermaid.max_nodes]usize,
     subgraphs: [Mermaid.max_subgraphs]Bounds,
     pad: usize,
+    max_cols: usize,
     wire: ?usize,
     rows: usize,
     cols: usize,
@@ -408,6 +477,7 @@ const Grid = struct {
             .h = [_]usize{0} ** Mermaid.max_nodes,
             .layer_height = [_]usize{0} ** Mermaid.max_nodes,
             .row_height = [_]usize{0} ** Mermaid.max_nodes,
+            .label_height = [_]usize{0} ** Mermaid.max_nodes,
             .x = [_]usize{0} ** Mermaid.max_nodes,
             .y = [_]usize{0} ** Mermaid.max_nodes,
             .fwd = [_]usize{0} ** (Mermaid.max_nodes + 1),
@@ -418,19 +488,51 @@ const Grid = struct {
             .lmax = [_]usize{0} ** Mermaid.max_nodes,
             .subgraphs = undefined,
             .pad = subgraphPadding(flow),
+            .max_cols = width,
             .wire = null,
             .rows = 0,
             .cols = 0,
         };
-        for (flow.nodeList(), 0..) |node, i| {
-            grid.w[i] = cells.maxLineWidth(node.label) + 4;
-            grid.h[i] = cells.lineCount(node.label) + 2;
-        }
         grid.computeRanks();
+        var max_box_width: usize = std.math.maxInt(usize);
+        if (grid.vertical) {
+            const gap_width = (3 + 2 * grid.pad) * (grid.n_cross - 1);
+            const wire_width = @intFromBool(grid.hasLongEdge());
+            if (width <= gap_width + wire_width or (width - gap_width - wire_width) / grid.n_cross < 5) return null;
+            max_box_width = (width - gap_width - wire_width) / grid.n_cross;
+        } else {
+            grid.computeHorizontalLabelWidths();
+            const gap = 4 + 2 * grid.pad;
+            const base_width = gap * (grid.n_layers - 1) + 5 * grid.n_layers;
+            if (width <= base_width) return null;
+            var label_budget = width - base_width;
+            var label_width: usize = 0;
+            for (grid.lmax[0 .. grid.n_layers - 1]) |*max_label| {
+                if (max_label.* == 0) continue;
+                max_label.* = @min(max_label.*, 16);
+                label_width += max_label.* + 1;
+            }
+            while (label_width > label_budget) {
+                var widest: ?usize = null;
+                for (grid.lmax[0 .. grid.n_layers - 1], 0..) |max_label, index| {
+                    if (max_label > 1 and (widest == null or max_label > grid.lmax[widest.?])) widest = index;
+                }
+                const index = widest orelse return null;
+                grid.lmax[index] -= 1;
+                label_width -= 1;
+            }
+            label_budget -= label_width;
+            max_box_width = 5 + label_budget / grid.n_layers;
+        }
+        for (flow.nodeList(), 0..) |node, i| {
+            grid.w[i] = @min(cells.maxLineWidth(node.label) + 4, max_box_width);
+            grid.h[i] = cells.wrappedLineCount(node.label, grid.w[i] - 4) + 2;
+        }
         for (0..grid.count) |i| {
             grid.layer_height[grid.rank[i]] = @max(grid.layer_height[grid.rank[i]], grid.h[i]);
             grid.row_height[grid.slot[i]] = @max(grid.row_height[grid.slot[i]], grid.h[i]);
         }
+        if (!grid.vertical) grid.assignHorizontalLabelRows();
         for (grid.layer_height[0..grid.n_layers]) |*height| height.* = @max(height.*, 3);
         if (grid.vertical) {
             grid.layoutVertical(width) orelse return null;
@@ -445,7 +547,7 @@ const Grid = struct {
                 const d = nodeIndex(flow, edge.dst) orelse continue;
                 if (grid.rank[d] <= grid.rank[s]) continue;
                 if (grid.labelInfo(edge)) |info| {
-                    grid.cols = @max(grid.cols, info.c + cells.labelWidth(info.text));
+                    grid.cols = @max(grid.cols, info.c + cells.maxLineWidth(info.text));
                 }
             }
             if (grid.cols > width) return null;
@@ -508,6 +610,7 @@ const Grid = struct {
         for (0..self.count) |i| {
             self.x[i] = self.cpos[self.slot[i]] + (self.cw[self.slot[i]] - self.w[i]) / 2;
         }
+        self.cols = cols;
         self.assignLabelRows();
         self.fwd[0] = 0;
         for (0..self.n_layers) |layer| {
@@ -528,15 +631,32 @@ const Grid = struct {
         }
     }
 
-    fn layoutHorizontal(self: *Grid, width: usize) ?void {
+    fn computeHorizontalLabelWidths(self: *Grid) void {
         for (self.flow.edgeList()) |*edge| {
             const text = edge.label orelse continue;
-            const s = nodeIndex(self.flow, edge.src) orelse continue;
-            const d = nodeIndex(self.flow, edge.dst) orelse continue;
-            if (self.rank[d] <= self.rank[s]) continue;
-            const g = self.rank[d] - 1;
-            self.lmax[g] = @max(self.lmax[g], cells.labelWidth(text));
+            const source = nodeIndex(self.flow, edge.src) orelse continue;
+            const destination = nodeIndex(self.flow, edge.dst) orelse continue;
+            if (self.rank[destination] <= self.rank[source]) continue;
+            const gap = self.rank[destination] - 1;
+            self.lmax[gap] = @max(self.lmax[gap], cells.maxLineWidth(text));
         }
+    }
+
+    fn assignHorizontalLabelRows(self: *Grid) void {
+        for (self.flow.edgeList(), 0..) |*edge, index| {
+            const text = edge.label orelse continue;
+            const source = nodeIndex(self.flow, edge.src) orelse continue;
+            const destination = nodeIndex(self.flow, edge.dst) orelse continue;
+            if (self.rank[destination] <= self.rank[source]) continue;
+            const gap = self.rank[destination] - 1;
+            const row = self.slot[destination];
+            self.lrow[index] = self.label_height[row];
+            self.label_height[row] += cells.wrappedLineCount(text, self.lmax[gap]);
+            self.row_height[row] = @max(self.row_height[row], self.label_height[row]);
+        }
+    }
+
+    fn layoutHorizontal(self: *Grid, width: usize) ?void {
         const forward_gap = 4 + 2 * self.pad;
         self.fwd[0] = 0;
         for (0..self.n_layers) |l| {
@@ -647,26 +767,38 @@ const Grid = struct {
             const s = nodeIndex(self.flow, edge.src) orelse continue;
             const d = nodeIndex(self.flow, edge.dst) orelse continue;
             if (self.rank[d] <= self.rank[s]) continue;
-            const c = self.x[d] + self.w[d] / 2 + 2;
-            const end = c + cells.labelWidth(text);
-            var r: usize = 0;
-            while (self.labelRowTaken(s, i, r, c, end)) r += 1;
-            self.lrow[i] = r;
-            self.glabels[self.rank[s]] = @max(self.glabels[self.rank[s]], r + 1);
+            const c = self.verticalLabelColumn(d, text);
+            const end = c + cells.maxLineWidth(text);
+            const row_count = cells.lineCount(text);
+            var row: usize = 0;
+            while (self.labelRowsTaken(s, i, row, row_count, c, end)) row += 1;
+            self.lrow[i] = row;
+            self.glabels[self.rank[s]] = @max(self.glabels[self.rank[s]], row + row_count);
         }
     }
 
-    fn labelRowTaken(self: *const Grid, s: usize, upto: usize, r: usize, c: usize, end: usize) bool {
-        for (self.flow.edgeList()[0..upto], 0..) |*other, j| {
-            if (other.label == null or self.lrow[j] != r) continue;
-            const os = nodeIndex(self.flow, other.src) orelse continue;
-            if (self.rank[os] != self.rank[s]) continue;
-            const od = nodeIndex(self.flow, other.dst) orelse continue;
-            const oc = self.x[od] + self.w[od] / 2 + 2;
-            const oend = oc + cells.labelWidth(other.label.?);
-            if (c < oend and oc < end) return true;
+    fn labelRowsTaken(self: *const Grid, s: usize, upto: usize, row: usize, row_count: usize, c: usize, end: usize) bool {
+        for (self.flow.edgeList()[0..upto], 0..) |*other, index| {
+            const other_label = other.label orelse continue;
+            const other_source = nodeIndex(self.flow, other.src) orelse continue;
+            if (self.rank[other_source] != self.rank[s]) continue;
+            const other_row = self.lrow[index];
+            const rows_overlap = row < other_row + cells.lineCount(other_label) and other_row < row + row_count;
+            if (!rows_overlap) continue;
+            const other_destination = nodeIndex(self.flow, other.dst) orelse continue;
+            const other_c = self.verticalLabelColumn(other_destination, other_label);
+            const other_end = other_c + cells.maxLineWidth(other_label);
+            if (c < other_end and other_c < end) return true;
         }
         return false;
+    }
+
+    fn verticalLabelColumn(self: *const Grid, destination: usize, text: []const u8) usize {
+        const width = cells.maxLineWidth(text);
+        const center = self.x[destination] + self.w[destination] / 2;
+        const right = center + 2;
+        if (right + width <= self.max_cols) return right;
+        return center -| (width + 2);
     }
 
     fn route(self: *const Grid, edge: *const Mermaid.Edge) ?Walk {
@@ -844,13 +976,17 @@ const Grid = struct {
             const d = nodeIndex(self.flow, edge.dst) orelse return null;
             const k = self.lrow[idx];
             const base = if (self.forward) self.y[s] + self.h[s] + 1 else self.y[s] - 2;
-            return .{ .r = if (self.forward) base + k else base - k, .c = self.x[d] + self.w[d] / 2 + 2, .text = text };
+            return .{ .r = if (self.forward) base + k else base - k, .c = self.verticalLabelColumn(d, text), .text = text };
         }
         const d = nodeIndex(self.flow, edge.dst) orelse return null;
-        const lw = cells.labelWidth(text);
-        if (lw == 0) return null;
-        const r = self.y[d] + self.h[d] / 2;
         const s = nodeIndex(self.flow, edge.src) orelse return null;
+        const gap = self.rank[d] - 1;
+        const max_width = self.lmax[gap];
+        const lw = @min(cells.maxLineWidth(text), max_width);
+        if (lw == 0) return null;
+        const slot = self.slot[d];
+        const index = edgeIndex(self.flow, edge) orelse return null;
+        const r = self.cpos[slot] + (self.row_height[slot] - self.label_height[slot]) / 2 + self.lrow[index];
         const bent = self.rank[d] > self.rank[s] + 1 or self.y[s] != self.y[d];
         if (self.forward) {
             const arrow = self.x[d] - 1;
@@ -874,6 +1010,7 @@ const Grid = struct {
     fn checkHorizontalLabels(self: *const Grid) ?void {
         var n: usize = 0;
         var rows: [Mermaid.max_edges]usize = undefined;
+        var row_ends: [Mermaid.max_edges]usize = undefined;
         var starts: [Mermaid.max_edges]usize = undefined;
         var ends: [Mermaid.max_edges]usize = undefined;
         var na: usize = 0;
@@ -887,18 +1024,21 @@ const Grid = struct {
                 na += 1;
             }
             const info = self.labelInfo(edge) orelse continue;
+            const destination = nodeIndex(self.flow, edge.dst) orelse continue;
+            const max_width = self.lmax[self.rank[destination] - 1];
             rows[n] = info.r;
+            row_ends[n] = info.r + cells.wrappedLineCount(info.text, max_width);
             starts[n] = info.c;
-            ends[n] = info.c + cells.labelWidth(info.text);
+            ends[n] = info.c + @min(cells.maxLineWidth(info.text), max_width);
             n += 1;
         }
         for (0..n) |i| {
             for (0..n) |j| {
-                if (i == j or rows[i] != rows[j]) continue;
+                if (i == j or rows[i] >= row_ends[j] or rows[j] >= row_ends[i]) continue;
                 if (starts[i] < ends[j] and starts[j] < ends[i]) return null;
             }
             for (0..na) |k| {
-                if (arows[k] != rows[i]) continue;
+                if (arows[k] < rows[i] or arows[k] >= row_ends[i]) continue;
                 if (acols[k] >= starts[i] and acols[k] < ends[i]) return null;
             }
         }
@@ -930,7 +1070,20 @@ const Grid = struct {
         for (self.flow.edgeList()) |*edge| {
             if (edge.style == .invisible) continue;
             const path = self.route(edge) orelse continue;
-            if (path.label) |label| cells.putText(win, label.r, label.c, start_row, skip, label.text, self.cols, .{});
+            if (path.label) |label| {
+                if (self.vertical) {
+                    var lines: cells.LineIterator = .{ .remaining = label.text };
+                    var index: usize = 0;
+                    while (lines.next()) |line| : (index += 1) {
+                        const row = if (self.forward) label.r + index else label.r - index;
+                        cells.putText(win, row, label.c, start_row, skip, line, self.cols, .{});
+                    }
+                } else {
+                    const destination = nodeIndex(self.flow, edge.dst) orelse continue;
+                    const max_width = self.lmax[self.rank[destination] - 1];
+                    cells.putWrappedText(win, label.r, label.c, start_row, skip, label.text, max_width, self.cols, .{});
+                }
+            }
         }
     }
 
@@ -1015,10 +1168,17 @@ fn drawNodeBox(win: vaxis.Window, node: *const Mermaid.Node, bounds: Bounds, sta
             cells.putRaw(win, row, bounds.x2 - 1, start_row, skip, "│", .{});
         }
     }
-    var lines: cells.LineIterator = .{ .remaining = node.label };
-    var row = bounds.y1 + 1;
-    while (lines.next()) |line| : (row += 1)
-        cells.putText(win, row, bounds.x1 + 2, start_row, skip, line, bounds.x2 - 1, .{});
+    cells.putWrappedText(
+        win,
+        bounds.y1 + 1,
+        bounds.x1 + 2,
+        start_row,
+        skip,
+        node.label,
+        bounds.width() - 4,
+        bounds.x2 - 1,
+        .{},
+    );
 }
 
 fn drawStyledSegment(
@@ -1166,7 +1326,7 @@ test "flowchart node shapes render distinct frames" {
 }
 
 test "flowchart node labels render multiple lines" {
-    var flow = Mermaid.parseText("graph TD\nA[\"one<br/>two\"]-->B\n").?;
+    var flow = Mermaid.parseText("graph TD\nA[\"one\ntwo\"]-->B\n").?;
     try testing.expectEqual(@as(usize, 9), layout(null, &flow, 0, 0, 40).?);
     var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 9, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(testing.allocator);
@@ -1176,6 +1336,80 @@ test "flowchart node labels render multiple lines" {
     try expectGlyph(win, 2, 2, "t");
     try expectGlyph(win, 3, 5, "▼");
     try expectGlyph(win, 1, 6, "┌");
+}
+
+test "wrapped multiline flowchart source renders" {
+    const diagram =
+        "flowchart TD\n" ++
+        "    S[\"Field Device<br/>(local transport)\"]\n" ++
+        "    S -->|\"Envelope protocol (binary over local socket)<br/>Heartbeat / PublishSamples\"| R\n" ++
+        "    R[\"Socket Receiver<br/>(module/receiver.rs)<br/>Accepts local sessions, decodes request\n" ++
+        "s\"]\n" ++
+        "    R -->|\"wire::Sample (batch)\"| X\n" ++
+        "    M[\"Metadata resolution<br/>Device Information: deviceId + attributeName<br/>or de\n" ++
+        "terministic identifier\"] --> X\n" ++
+        "    X[\"Transformer<br/>(module/transform/)<br/>Translates wire::Sample -&gt; model::Record, as\n" ++
+        "sembles Batch\"]\n" ++
+        "    X -->|\"Batch\"| Q\n" ++
+        "    Q[\"DiskQueueLayer<br/>(storage/queue/)<br/>Buffers to disk on failure, drains on recovery\n" ++
+        "\"]\n" ++
+        "    Q -->|\"Batch\"| T\n" ++
+        "    T[\"DeliveryBackend<br/>(backend/stream.rs or backend/service/)<br/>StreamBackend or Servi\n" ++
+        "ceBackend\"]\n" ++
+        "    T -->|\"primary + secondary\"| B1[\"Primary Service (active)\"]\n" ++
+        "    T -->|\"primary only\"| B2[\"Message Broker\"]\n";
+    var flow = Mermaid.parseText(diagram).?;
+    try testing.expect(layout(null, &flow, 0, 0, 96) != null);
+}
+
+test "wide horizontal and branched flowcharts fit the content width" {
+    const diagrams = [_][]const u8{
+        "flowchart LR\n" ++
+            "A[\"Device\"] --> B[\"Local Receiver\"] --> C[\"StateCache::refresh_entry\"]\n" ++
+            "C --> D[\"Status Publisher\"] --> E[\"Delivery Backend\"] --> F[\"Primary Service\"]\n",
+        "flowchart TD\n" ++
+            "S[\"Field Device<br/>(peer transport)\"]\n" ++
+            "S -->|\"SampleEvent<br/>device/samples/points/&lt;id&gt;\"| P\n" ++
+            "S -->|\"MetadataEvent<br/>device/samples/metadata/&lt;id&gt;\"| M\n" ++
+            "P[\"Point wildcard subscriber<br/>ReadTag&lt;SampleEvent&gt;\"] --> A\n" ++
+            "M[\"Metadata wildcard subscriber<br/>ReadTag&lt;MetadataEvent&gt;\"] --> A\n" ++
+            "R[\"Identity resolution<br/>Device Information: deviceId + attributeName<br/>or deterministic identifier\n" ++
+            "suffix\"] --> A\n" ++
+            "A[\"Batch assembler<br/>(module/samples.rs)<br/>groups by timestamp, joins metadata,<br/>\n" ++
+            "flushes after configured silence\"]\n" ++
+            "A -->|\"model::Batch\"| B[\"Disk Queue -&gt; Delivery Backend<br/>(same as local path)\"]\n",
+        "flowchart LR\n" ++
+            "A[\"Device<br/>WriteTag&lt;OperationStatus&gt;<br/>scalar or batch status\"] --> B[\"Scalar/batch subscribers<br/>\n" ++
+            "(module/commands.rs)\"]\n" ++
+            "B --> C[\"Status Publisher\"] --> D[\"Delivery Backend\"] --> E[\"Primary Service\"]\n",
+        "flowchart LR\n" ++
+            "S[\"Inventory Source\"] -->|\"inventory decision for device identifier<br/>(polled every few minutes)\"| G[\"Publication Gate\"]\n" ++
+            "S -->|\"last decision persisted\"| C[\"Disk cache\"]\n" ++
+            "C -->|\"restored at startup when<br/>the source is unavailable\"| G\n" ++
+            "G -->|\"gates\"| B[\"Delivery Backend\"]\n",
+        "flowchart TD\n" ++
+            "P[\"publish record\"] --> RP[\"resolve and publish record\"]\n" ++
+            "RP --> RL[\"resolve destination\"]\n" ++
+            "RL -->|\"fail\"| RF[\"Resolution failed\"]\n" ++
+            "RL -->|\"ok\"| CV[\"convert input to producer document\"]\n" ++
+            "CV -->|\"fail\"| VD[\"Validation, drop\"]\n" ++
+            "CV -->|\"ok\"| AGE{\"record age &gt; threshold?\"}\n" ++
+            "AGE -->|\"yes\"| BP[\"Backfill publish\"]\n" ++
+            "AGE -->|\"no\"| PUB[\"Publish\"]\n" ++
+            "BP --> CL[\"classify service result\"]\n" ++
+            "PUB --> CL\n" ++
+            "CL -->|\"Ok\"| S[\"success\"]\n" ++
+            "CL -->|\"Data too old\"| D1[\"drop and return success\"]\n" ++
+            "CL -->|\"Validation error\"| D2[\"Validation, drop without retry\"]\n" ++
+            "CL -->|\"Not leader\"| R1[\"invalidate and retry once\"]\n" ++
+            "CL -->|\"Internal error\"| R2[\"invalidate and retry once\"]\n" ++
+            "CL -->|\"Timeout / Dispatch / Response error\"| R3[\"invalidate and retry once\"]\n" ++
+            "CL -->|\"other\"| O[\"return error for caller backfill\"]\n",
+    };
+    for (diagrams) |diagram| {
+        var flow = Mermaid.parseText(diagram).?;
+        try testing.expect(layout(null, &flow, 0, 0, 96) != null);
+    }
 }
 
 test "branch lays out siblings side by side" {
@@ -1253,7 +1487,26 @@ test "hierarchical subgraph directions and group edges render" {
     try testing.expect(c.r == d.r and c.c > d.c);
 }
 
-test "interleaved subgraph members fall back" {
+test "nested disconnected subgraph renders without flat overlap" {
+    const diagram =
+        "flowchart TD\n" ++
+        "    L[\"Input Adapter\"] -->|\"publish\"| Try\n" ++
+        "    subgraph Store[\"Buffered Storage Layer\"]\n" ++
+        "        direction TB\n" ++
+        "        Try[\"try downstream service\"]\n" ++
+        "        Try -->|\"OK\"| OK[\"return success\"]\n" ++
+        "        Try -->|\"Err(Temporary)\"| Buf[\"buffer locally\"]\n" ++
+        "        Try -->|\"Err(Permanent / Unsupported)\"| Prop[\"propagate\"]\n" ++
+        "        subgraph Worker[\"Background Reconciliation Task (worker.rs)\"]\n" ++
+        "            direction TB\n" ++
+        "            W1[\"sleep interval\"] --> W2[\"evict expired\"] --> W3[\"enforce limit\"] --> W4[\"drain batch -&gt; downstream\"] --> W5[\"update counters\"]\n" ++
+        "        end\n" ++
+        "    end\n";
+    var flow = Mermaid.parseText(diagram).?;
+    try testing.expect(layout(null, &flow, 0, 0, 96) != null);
+}
+
+test "interleaved subgraph members use hierarchy layout" {
     var flow = Mermaid.parseText(
         "flowchart TD\n" ++
             "subgraph group\n" ++
@@ -1263,7 +1516,7 @@ test "interleaved subgraph members fall back" {
             "B\n" ++
             "A-->B-->C\n",
     ).?;
-    try testing.expect(layout(null, &flow, 0, 0, 80) == null);
+    try testing.expect(layout(null, &flow, 0, 0, 80) != null);
 }
 
 test "left to right flows horizontally" {
@@ -1391,9 +1644,9 @@ test "left to right labels sit on the edge" {
     try expectGlyph(win, 47, 0, "◇");
 }
 
-test "crowded horizontal labels fall back" {
+test "crowded horizontal labels stack" {
     var flow = Mermaid.parseText("flowchart LR\nA-->|xx|C\nB-->|yy|C\n").?;
-    try testing.expect(layout(null, &flow, 0, 0, 80) == null);
+    try testing.expect(layout(null, &flow, 0, 0, 80) != null);
 }
 
 test "left to right skip edges use the wire row" {
