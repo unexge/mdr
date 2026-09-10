@@ -106,6 +106,13 @@ quit: bool = false,
 search: Search = .{},
 scrollbar_visible: bool = true,
 scrollbar_generation: u64 = 0,
+toc_entries: ArrayList(Toc.Entry) = .empty,
+toc_open: bool = false,
+toc_selected: usize = 0,
+toc_top: usize = 0,
+toc_return: usize = 0,
+toc_built: bool = false,
+toc_list_h: usize = 10,
 
 pub fn init(gpa: mem.Allocator, doc: *Document) App {
     return .{ .gpa = gpa, .doc = doc };
@@ -118,6 +125,7 @@ pub fn initFile(gpa: mem.Allocator, doc: *Document, file_path: []const u8) App {
 pub fn deinit(self: *App) void {
     for (self.entries.items) |*entry| entry.syntax.deinit(self.gpa);
     self.entries.deinit(self.gpa);
+    self.toc_entries.deinit(self.gpa);
     self.syntax_cache.deinit();
     self.* = undefined;
 }
@@ -202,6 +210,10 @@ fn handleKey(self: *App, io: Io, vx: *vaxis.Vaxis, key: vaxis.Key, loop: *vaxis.
         try self.handleSearchKey(io, key, loop, search_tasks);
         return;
     }
+    if (self.toc_open) {
+        try self.handleTocKey(key);
+        return;
+    }
     if (key.matches('q', .{})) {
         self.quit = true;
     } else if (key.matches('/', .{})) {
@@ -217,6 +229,8 @@ fn handleKey(self: *App, io: Io, vx: *vaxis.Vaxis, key: vaxis.Key, loop: *vaxis.
         self.scroll = self.maxScroll();
     } else if (key.matches('l', .{ .ctrl = true })) {
         vx.queueRefresh();
+    } else if (key.matches('t', .{})) {
+        try self.openToc();
     } else {
         self.scrollKeys(key);
     }
@@ -364,10 +378,103 @@ fn scrollToOffset(self: *App, offset: usize) !usize {
             if (self.total_height == before) break;
         }
     }
+    // Measure a screenful past the target (or to the end) so the clamp
+    // below uses a complete total instead of the parsed prefix.
+    try self.ensureVisible(row + self.viewport + 1);
     self.scroll = row -| 1;
     self.clampScroll();
     if (self.entries.items.len == 0) return 0;
     return @min(index, self.entries.items.len - 1);
+}
+
+fn handleTocKey(self: *App, key: vaxis.Key) !void {
+    if (key.matches(vaxis.Key.escape, .{})) {
+        self.tocRestore();
+    } else if (key.matches(vaxis.Key.enter, .{})) {
+        self.tocCommit();
+    } else if (key.matches('t', .{})) {
+        self.tocCommit();
+    } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+        try self.tocMove(-1);
+    } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+        try self.tocMove(1);
+    } else if (key.matches(vaxis.Key.home, .{}) or key.matches('g', .{})) {
+        try self.tocGoTo(0);
+    } else if (key.matches(vaxis.Key.end, .{}) or key.matches('G', .{})) {
+        try self.tocGoTo(self.toc_entries.items.len -| 1);
+    } else if (key.matches(vaxis.Key.page_up, .{})) {
+        try self.tocMove(-@as(isize, @intCast(self.toc_list_h)));
+    } else if (key.matches(vaxis.Key.page_down, .{}) or key.matches(' ', .{})) {
+        try self.tocMove(@as(isize, @intCast(self.toc_list_h)));
+    }
+}
+
+fn openToc(self: *App) !void {
+    try self.ensureToc();
+    self.toc_return = self.scroll;
+    self.toc_selected = self.tocIndexAtScroll();
+    self.toc_top = 0;
+    self.toc_open = true;
+}
+
+fn tocCommit(self: *App) void {
+    self.toc_open = false;
+}
+
+fn tocRestore(self: *App) void {
+    self.scroll = self.toc_return;
+    self.clampScroll();
+    self.toc_open = false;
+}
+
+fn ensureToc(self: *App) !void {
+    if (self.toc_built) return;
+    const list = try Toc.collect(self.gpa, self.doc.text);
+    self.toc_entries.deinit(self.gpa);
+    self.toc_entries = list;
+    self.toc_built = true;
+}
+
+fn tocMove(self: *App, step: isize) !void {
+    const count = self.toc_entries.items.len;
+    if (count == 0) return;
+    const last: isize = @intCast(count - 1);
+    const next = @max(0, @min(@as(isize, @intCast(self.toc_selected)) + step, last));
+    try self.tocGoTo(@intCast(next));
+}
+
+fn tocGoTo(self: *App, index: usize) !void {
+    const count = self.toc_entries.items.len;
+    if (count == 0) return;
+    self.toc_selected = @min(index, count - 1);
+    const list_h = @max(self.toc_list_h, 1);
+    if (self.toc_selected < self.toc_top) self.toc_top = self.toc_selected;
+    if (self.toc_selected >= self.toc_top + list_h) self.toc_top = self.toc_selected - list_h + 1;
+    _ = try self.scrollToOffset(self.toc_entries.items[self.toc_selected].offset);
+}
+
+/// Heading at or above the first visible content row, so reopening the
+/// outline selects where the reader already is.
+fn tocIndexAtScroll(self: *const App) usize {
+    const items = self.toc_entries.items;
+    if (items.len == 0) return 0;
+    const probe = @min(self.scroll + 1, self.total_height -| 1);
+    var skip = probe;
+    var off: usize = 0;
+    for (self.entries.items, 0..) |entry, i| {
+        if (skip >= entry.height) {
+            skip -= entry.height;
+            continue;
+        }
+        off = if (i == 0) 0 else self.entries.items[i - 1].source_end;
+        break;
+    }
+    var selected: usize = 0;
+    for (items, 0..) |entry, i| {
+        if (entry.offset > off) break;
+        selected = i;
+    }
+    return selected;
 }
 
 fn scrollKeys(self: *App, key: vaxis.Key) void {
@@ -439,6 +546,7 @@ fn draw(
         self.drawScrollbar(win);
     }
     self.drawSearchCount(win);
+    if (self.toc_open) self.drawToc(win);
     if (self.placement_mode == .unicode and self.virtual_placement_count > 0) {
         try Kitty.defineVirtualPlacements(tty, self.virtual_placements[0..self.virtual_placement_count]);
     }
@@ -587,6 +695,126 @@ fn drawSearchCount(self: *App, win: vaxis.Window) void {
     }
 }
 
+/// Centered outline modal. Document cells behind stay as drawn; image
+/// placements are suppressed while open so graphics cannot leak through.
+fn drawToc(self: *App, win: vaxis.Window) void {
+    const items = self.toc_entries.items;
+    const box = Toc.boxFor(win.width, win.height, items.len);
+    if (box.w < 10 or box.h < 5) return;
+    Toc.beginFrame();
+    self.toc_list_h = @max(box.list_h, 1);
+    if (self.toc_selected < self.toc_top) self.toc_top = self.toc_selected;
+    if (self.toc_selected >= self.toc_top + self.toc_list_h) {
+        self.toc_top = self.toc_selected - self.toc_list_h + 1;
+    }
+    const frame: vaxis.Window = win.child(.{
+        .x_off = @intCast(box.x),
+        .y_off = @intCast(box.y),
+        .width = @intCast(box.w),
+        .height = @intCast(box.h),
+    });
+    const panel: vaxis.Style = .{ .bg = Theme.panel };
+    var r: usize = 0;
+    while (r < box.h) : (r += 1) {
+        var c: usize = 0;
+        while (c < box.w) : (c += 1) {
+            frame.writeCell(@intCast(c), @intCast(r), .{
+                .char = .{ .grapheme = " ", .width = 1 },
+                .style = panel,
+            });
+        }
+    }
+    const border: vaxis.Style = .{ .fg = Theme.muted, .bg = Theme.panel };
+    var c: usize = 1;
+    while (c + 1 < box.w) : (c += 1) {
+        frame.writeCell(@intCast(c), 0, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = border });
+        frame.writeCell(@intCast(c), @intCast(box.h - 1), .{ .char = .{ .grapheme = "─", .width = 1 }, .style = border });
+    }
+    frame.writeCell(0, 0, .{ .char = .{ .grapheme = "┌", .width = 1 }, .style = border });
+    frame.writeCell(@intCast(box.w - 1), 0, .{ .char = .{ .grapheme = "┐", .width = 1 }, .style = border });
+    frame.writeCell(0, @intCast(box.h - 1), .{ .char = .{ .grapheme = "└", .width = 1 }, .style = border });
+    frame.writeCell(@intCast(box.w - 1), @intCast(box.h - 1), .{ .char = .{ .grapheme = "┘", .width = 1 }, .style = border });
+    var side: usize = 1;
+    while (side + 1 < box.h) : (side += 1) {
+        frame.writeCell(0, @intCast(side), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = border });
+        frame.writeCell(@intCast(box.w - 1), @intCast(side), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = border });
+    }
+    _ = putTocCells(frame, 2, 0, "Contents", .{ .fg = Theme.accent, .bg = Theme.panel, .bold = true }, box.w -| 4);
+    if (items.len == 0) {
+        _ = putTocCells(frame, 2, 1, "(no headings)", .{ .fg = Theme.muted, .bg = Theme.panel }, box.w -| 4);
+    } else {
+        var title_buf: [256]u8 = undefined;
+        var i: usize = 0;
+        while (i < box.list_h) : (i += 1) {
+            const index = self.toc_top + i;
+            if (index >= items.len) break;
+            const entry = items[index];
+            const row = i + 1;
+            const selected = index == self.toc_selected;
+            const row_style: vaxis.Style = if (selected)
+                .{ .fg = Theme.panel, .bg = Theme.accent, .bold = true }
+            else
+                .{ .bg = Theme.panel };
+            const guide_style: vaxis.Style = if (selected) row_style else .{ .fg = Theme.muted, .bg = Theme.panel };
+            var pad: usize = 1;
+            while (pad + 1 < box.w) : (pad += 1) {
+                frame.writeCell(@intCast(pad), @intCast(row), .{
+                    .char = .{ .grapheme = " ", .width = 1 },
+                    .style = row_style,
+                });
+            }
+            var col: usize = 1;
+            var chain: [6]bool = undefined;
+            var chain_len: usize = 0;
+            var ancestor = entry.parent;
+            while (ancestor) |a| {
+                chain[chain_len] = items[a].last;
+                chain_len += 1;
+                ancestor = items[a].parent;
+            }
+            while (chain_len > 0) {
+                chain_len -= 1;
+                col += putTocCells(frame, col, row, if (chain[chain_len]) "   " else "│  ", guide_style, 3);
+            }
+            col += putTocCells(frame, col, row, if (entry.last) "└── " else "├── ", guide_style, 4);
+            const avail = (box.w -| 1) -| col;
+            if (avail == 0) continue;
+            const raw = Toc.flatten(entry.content, &self.doc.refs, &title_buf);
+            const title = Toc.copyTitle(raw);
+            _ = putTocCells(frame, col, row, title, row_style, avail);
+        }
+    }
+    const footer_style: vaxis.Style = .{ .fg = Theme.muted, .bg = Theme.panel };
+    var hint_max = box.w -| 4;
+    if (items.len > 0) hint_max = hint_max -| 8;
+    _ = putTocCells(frame, 2, box.h - 2, "Up/Down jump  Enter stay  Esc back", footer_style, hint_max);
+    if (items.len > 0) {
+        var count_buf: [16]u8 = undefined;
+        const count = std.fmt.bufPrint(&count_buf, "{d}/{d}", .{ self.toc_selected + 1, items.len }) catch "";
+        if (count.len + 3 < box.w) {
+            _ = putTocCells(frame, box.w - 2 - count.len, box.h - 2, count, footer_style, count.len);
+        }
+    }
+}
+
+fn putTocCells(box: vaxis.Window, col: usize, row: usize, text: []const u8, style: vaxis.Style, max_cols: usize) usize {
+    if (col >= box.width or row >= box.height) return 0;
+    var c = col;
+    const limit = @min(col + max_cols, box.width);
+    var iter = unicode.graphemeIterator(text);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(text);
+        const w = vaxis.gwidth.gwidth(bytes, .unicode);
+        if (w == 0 or c + w > limit) break;
+        box.writeCell(@intCast(c), @intCast(row), .{
+            .char = .{ .grapheme = bytes, .width = @intCast(w) },
+            .style = style,
+        });
+        c += w;
+    }
+    return c - col;
+}
+
 fn queryCursorWidth(before: []const u8) usize {
     var w: usize = 0;
     var iter = unicode.graphemeIterator(before);
@@ -636,6 +864,9 @@ fn renderEntry(self: *App, win: vaxis.Window, entry: *Entry, row: usize, skip: u
             if (skip >= rows) return row;
             const visible_rows = rows - skip;
             const draw_rows = @min(visible_rows, win.height -| row);
+            // Behind the outline modal images keep their rows but emit no
+            // placements, so no graphics show through the panel.
+            if (self.toc_open) return row + draw_rows;
             if (self.placement_mode == .unicode) {
                 if ((entry.virtual_rows != rows or entry.virtual_cols != cols) and
                     self.virtual_placement_count < self.virtual_placements.len)
@@ -1047,6 +1278,7 @@ const Syntax = @import("Syntax.zig");
 const Theme = @import("Theme.zig");
 const Media = @import("Media.zig");
 const Kitty = @import("Kitty.zig");
+const Toc = @import("Toc.zig");
 const unicode = vaxis.unicode;
 const Element = Document.Element;
 const ArrayList = std.ArrayList;
@@ -2112,4 +2344,220 @@ test "container measures match render" {
         const drawn = Renderer.render(win, entry.elem, 0, 0);
         try testing.expectEqual(entry.height - 1, drawn);
     }
+}
+
+const toc_text = "# Alpha\n\nfill one two three\n\n## Beta\n\nfill four five six\n\n### Gamma\n\nfill seven eight\n";
+
+test "toc scans all headings without laying out the viewport" {
+    var doc = Document.init(toc_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 30;
+
+    try app.openToc();
+    try testing.expect(app.toc_open);
+    try testing.expectEqual(@as(usize, 3), app.toc_entries.items.len);
+    try testing.expectEqual(@as(usize, 0), app.entries.items.len);
+    try testing.expectEqual(@as(u8, 1), app.toc_entries.items[0].level);
+    try testing.expectEqual(@as(u8, 2), app.toc_entries.items[1].level);
+    try testing.expectEqual(@as(u8, 3), app.toc_entries.items[2].level);
+}
+
+test "toc arrows jump, enter stays, escape restores" {
+    var doc = Document.init(toc_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 30;
+    app.viewport = 4;
+    try app.ensureVisible(math.maxInt(usize));
+
+    try app.openToc();
+    try testing.expectEqual(@as(usize, 0), app.toc_selected);
+    try app.tocMove(1);
+    try testing.expectEqual(@as(usize, 1), app.toc_selected);
+    const at_beta = app.scroll;
+    try testing.expect(at_beta > 0);
+    try app.tocMove(1);
+    try testing.expect(app.scroll > at_beta);
+
+    try app.handleTocKey(.{ .codepoint = vaxis.Key.enter });
+    try testing.expect(!app.toc_open);
+    const at_gamma = app.scroll;
+    try testing.expect(at_gamma > at_beta);
+
+    try app.openToc();
+    try testing.expectEqual(@as(usize, 2), app.toc_selected);
+    try app.tocMove(-2);
+    try testing.expectEqual(@as(usize, 0), app.toc_selected);
+    try app.handleTocKey(.{ .codepoint = vaxis.Key.escape });
+    try testing.expect(!app.toc_open);
+    try testing.expectEqual(at_gamma, app.scroll);
+}
+
+test "t toggles the outline, escape restores the scroll" {
+    var doc = Document.init(toc_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 30;
+    app.viewport = 4;
+    try app.ensureVisible(math.maxInt(usize));
+    const io: Io = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop: vaxis.Loop(Event) = undefined;
+    var tasks: Io.Group = .init;
+
+    try app.handleKey(io, &vx, .{ .codepoint = 't' }, &loop, &tasks);
+    try testing.expect(app.toc_open);
+    try app.handleTocKey(.{ .codepoint = vaxis.Key.down });
+    try testing.expect(app.scroll > 0);
+    try app.handleKey(io, &vx, .{ .codepoint = 't' }, &loop, &tasks);
+    try testing.expect(!app.toc_open);
+    const stayed = app.scroll;
+    try testing.expect(stayed > 0);
+
+    try app.handleKey(io, &vx, .{ .codepoint = 't' }, &loop, &tasks);
+    try app.handleTocKey(.{ .codepoint = vaxis.Key.down });
+    try app.handleTocKey(.{ .codepoint = vaxis.Key.escape });
+    try testing.expect(!app.toc_open);
+    try testing.expectEqual(stayed, app.scroll);
+}
+
+test "toc jump from a partial parse lands on the section" {
+    var doc = Document.init(toc_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 30;
+    app.viewport = 4;
+    try app.ensureVisible(5);
+    try testing.expect(!app.fully_parsed);
+    try app.openToc();
+
+    try app.tocGoTo(1);
+    try testing.expectEqual(@as(usize, 4), app.scroll);
+
+    try app.tocGoTo(2);
+    try testing.expect(app.fully_parsed);
+    try testing.expectEqual(app.maxScroll(), app.scroll);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 4, .cols = 30, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 30,
+        .height = 4,
+        .screen = &screen,
+    };
+    try app.renderViewport(win);
+    try expectCell(win, 2, 1, 'G');
+}
+
+test "toc modal lists headings with hierarchy" {
+    var doc = Document.init("# A\n\n## B\n\n## C\n\n# D\n");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 40;
+    try app.openToc();
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 20, .cols = 50, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 50,
+        .height = 20,
+        .screen = &screen,
+    };
+    app.drawToc(win);
+    try expectCell(win, 2, 6, 'C');
+    try testing.expectEqualStrings("├", win.readCell(1, 7).?.char.grapheme);
+    try testing.expectEqualStrings("─", win.readCell(2, 7).?.char.grapheme);
+    try expectCell(win, 5, 7, 'A');
+    try testing.expect(win.readCell(5, 7).?.style.bg.eql(Theme.accent));
+    try testing.expectEqualStrings("│", win.readCell(1, 8).?.char.grapheme);
+    try testing.expectEqualStrings("├", win.readCell(4, 8).?.char.grapheme);
+    try expectCell(win, 8, 8, 'B');
+    try testing.expectEqualStrings("│", win.readCell(1, 9).?.char.grapheme);
+    try testing.expectEqualStrings("└", win.readCell(4, 9).?.char.grapheme);
+    try expectCell(win, 8, 9, 'C');
+    try testing.expectEqualStrings("└", win.readCell(1, 10).?.char.grapheme);
+    try expectCell(win, 5, 10, 'D');
+    try expectCell(win, 2, 12, 'U');
+}
+
+test "toc with no headings opens and closes cleanly" {
+    var doc = Document.init("just text\n");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 4;
+    try app.openToc();
+    try testing.expect(app.toc_open);
+    try testing.expectEqual(@as(usize, 0), app.toc_entries.items.len);
+    try app.tocMove(1);
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 30, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 30,
+        .height = 10,
+        .screen = &screen,
+    };
+    app.drawToc(win);
+    try expectCell(win, 3, 3, 'n');
+    try app.handleTocKey(.{ .codepoint = vaxis.Key.escape });
+    try testing.expect(!app.toc_open);
+}
+
+test "toc modal suppresses image placements" {
+    var doc = Document.init("");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 40;
+    app.image_width = 24;
+    app.cell_width = 10;
+    app.cell_height = 20;
+    app.placement_mode = .stable;
+
+    var entry: Entry = .{
+        .elem = .{ .image = .{ .alt = "diagram", .source = "diagram.png", .title = null } },
+        .media = .{ .ready = vaxis.Image.init(1, 800, 400) },
+    };
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 12, .cols = 40, .x_pixel = 400, .y_pixel = 240 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 12,
+        .screen = &screen,
+    };
+    const drawn = try app.renderEntry(win, &entry, 0, 0);
+    try testing.expectEqual(@as(usize, 1), app.next_stable_placement_count);
+    try testing.expect(drawn > 0);
+
+    app.next_stable_placement_count = 0;
+    app.toc_open = true;
+    const hidden = try app.renderEntry(win, &entry, 0, 0);
+    try testing.expectEqual(drawn, hidden);
+    try testing.expectEqual(@as(usize, 0), app.next_stable_placement_count);
+
+    app.placement_mode = .unicode;
+    _ = try app.renderEntry(win, &entry, 0, 0);
+    try testing.expectEqual(@as(usize, 0), app.virtual_placement_count);
+
+    app.toc_open = false;
+    _ = try app.renderEntry(win, &entry, 0, 0);
+    try testing.expectEqual(@as(usize, 1), app.virtual_placement_count);
 }

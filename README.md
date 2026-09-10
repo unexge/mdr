@@ -28,6 +28,8 @@ mdr <file.md>
 | `/` then type | Search, jumps to the first match after a short delay |
 | `Enter` / `Esc` in search | Keep highlight and close / clear search |
 | `n` / `N` | Next / previous match (`1/3` counter top right) |
+| `t` | Outline modal, `Up` / `Down` jump between headings |
+| `Enter` / `Esc` in outline | Stay at heading / return to previous position |
 | `Ctrl-Backspace` / `Alt-Backspace` in search | Clear the query |
 | `Ctrl-l` | Redraw |
 | `q`, `Ctrl-c` | Quit |
