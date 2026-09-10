@@ -36,6 +36,19 @@ pub fn render(win: vaxis.Window, elem: Document.Element, row: usize, skip: usize
     return layoutDepth(win, elem, row, skip, 0, win.width);
 }
 
+pub fn renderHighlighted(
+    win: vaxis.Window,
+    elem: Document.Element,
+    row: usize,
+    skip: usize,
+    highlights: *const Syntax.Highlights,
+) usize {
+    return switch (elem) {
+        .code_block => |block| code_block.layoutSyntax(win, block, row, skip, win.width, highlights),
+        else => render(win, elem, row, skip),
+    };
+}
+
 /// Lays out a container's children; when `gap` is set, one blank row
 /// separates the children. In measure mode (`win` null) `start_row` must be
 /// zero and the return is content rows; when rendering, `start_row` is the
@@ -87,6 +100,7 @@ fn layoutDepth(win: ?vaxis.Window, elem: Document.Element, row: usize, skip: usi
 const std = @import("std");
 const Document = @import("../Document.zig");
 const Search = @import("Search.zig");
+const Syntax = @import("Syntax.zig");
 const vaxis = @import("vaxis");
 const text = @import("renderer/text.zig");
 const code_block = @import("renderer/code_block.zig");

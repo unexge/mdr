@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const tree_sitter_flags = &.{"-fno-sanitize=undefined"};
+
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
 // executed by an external runner. The functions in `std.Build` implement a DSL
@@ -21,6 +23,41 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const tree_sitter_dep = b.dependency("tree_sitter", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tree_sitter_lib = b.addLibrary(.{
+        .name = "mdr-tree-sitter",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    tree_sitter_lib.root_module.addIncludePath(tree_sitter_dep.path("tree-sitter/lib/include"));
+    tree_sitter_lib.root_module.addIncludePath(tree_sitter_dep.path("tree-sitter/lib/src"));
+    tree_sitter_lib.root_module.addCSourceFiles(.{
+        .root = tree_sitter_dep.path("tree-sitter/lib/src"),
+        .files = &.{"lib.c"},
+        .flags = tree_sitter_flags,
+    });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-bash/src", .has_scanner = true });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-c/src" });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-cpp/src", .has_scanner = true });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-javascript/src", .has_scanner = true });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-go/src" });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-json/src" });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-python/src", .has_scanner = true });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-rust/src", .has_scanner = true });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-typescript/typescript/src", .has_scanner = true });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-typescript/tsx/src", .has_scanner = true });
+    addTreeSitterParser(tree_sitter_lib, tree_sitter_dep, .{ .source_dir = "tree-sitter-zig/src" });
+    const treez_mod = b.createModule(.{
+        .root_source_file = tree_sitter_dep.path("treez/treez.zig"),
+    });
+    treez_mod.linkLibrary(tree_sitter_lib);
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -46,6 +83,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+    mod.addImport("treez", treez_mod);
+    addSyntaxQuery(mod, tree_sitter_dep, "bash");
+    addSyntaxQuery(mod, tree_sitter_dep, "c");
+    addSyntaxQuery(mod, tree_sitter_dep, "cpp");
+    addSyntaxQuery(mod, tree_sitter_dep, "javascript");
+    addSyntaxQuery(mod, tree_sitter_dep, "go");
+    addSyntaxQuery(mod, tree_sitter_dep, "json");
+    addSyntaxQuery(mod, tree_sitter_dep, "python");
+    addSyntaxQuery(mod, tree_sitter_dep, "rust");
+    addSyntaxQuery(mod, tree_sitter_dep, "typescript");
+    addSyntaxQuery(mod, tree_sitter_dep, "zig");
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -166,6 +214,28 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn addTreeSitterParser(
+    lib: *std.Build.Step.Compile,
+    dep: *std.Build.Dependency,
+    options: struct {
+        source_dir: []const u8,
+        has_scanner: bool = false,
+    },
+) void {
+    lib.root_module.addIncludePath(dep.path(options.source_dir));
+    lib.root_module.addCSourceFiles(.{
+        .root = dep.path(options.source_dir),
+        .files = if (options.has_scanner) &.{ "parser.c", "scanner.c" } else &.{"parser.c"},
+        .flags = tree_sitter_flags,
+    });
+}
+
+fn addSyntaxQuery(mod: *std.Build.Module, dep: *std.Build.Dependency, comptime language: []const u8) void {
+    mod.addAnonymousImport("syntax_" ++ language, .{
+        .root_source_file = dep.path("tree-sitter-" ++ language ++ "/queries/highlights.scm"),
+    });
 }
 
 fn addBombadilTest(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {

@@ -35,7 +35,8 @@ It contains **strong text**, *emphasis*, ~~deleted text~~, and a [link](https://
 
 ```zig
 pub fn main() void {
-    std.debug.print("hello from mdr\\n", .{});
+    const answer = 42; // highlighted token kinds
+    std.debug.print("hello from mdr\\n", .{answer});
 }
 ```
 

@@ -35,7 +35,8 @@ mdr <file.md>
 ## Features
 
 - CommonMark plus GFM strikethrough, task lists, tables, and reference links
-- Fenced code blocks as cards; local images via Kitty graphics
+- Fenced code blocks as cards with syntax highlighting for Bash, C, C++, Go,
+  JSON, JavaScript/JSX, Python, Rust, TypeScript/TSX, and Zig; local images via Kitty graphics
 - A Mermaid subset rendered as unicode diagrams: `graph`/`flowchart` nodes
   and edges plus `sequenceDiagram` participants, messages, notes,
   `loop`/`alt`/`opt`/`par` fragments, activations, and autonumber

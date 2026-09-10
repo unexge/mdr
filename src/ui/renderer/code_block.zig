@@ -26,6 +26,17 @@ fn covers(line: []const u8, off: usize, len: usize) bool {
 /// One walk measures (null window: no writes, no clipping, no skipping)
 /// and renders, returning the row after the last content row.
 pub fn layout(win: ?vaxis.Window, cb: Document.Element.CodeBlock, start_row: usize, skip: usize, width: usize) usize {
+    return layoutSyntax(win, cb, start_row, skip, width, null);
+}
+
+pub fn layoutSyntax(
+    win: ?vaxis.Window,
+    cb: Document.Element.CodeBlock,
+    start_row: usize,
+    skip: usize,
+    width: usize,
+    highlights: ?*const Syntax.Highlights,
+) usize {
     if (cb.info) |info| {
         if (info.isMermaid()) {
             if (Mermaid.parseBlock(cb)) |flow| {
@@ -54,7 +65,8 @@ pub fn layout(win: ?vaxis.Window, cb: Document.Element.CodeBlock, start_row: usi
     }
 
     var lines = cb.lines();
-    while (lines.next()) |line| {
+    var source_row: usize = 0;
+    while (lines.next()) |line| : (source_row += 1) {
         var hit_starts: [max_hits_per_line]usize = undefined;
         var hit_seqs: [max_hits_per_line]u32 = undefined;
         var hit_count: usize = 0;
@@ -97,7 +109,16 @@ pub fn layout(win: ?vaxis.Window, cb: Document.Element.CodeBlock, start_row: usi
                     const off = @intFromPtr(bytes.ptr) - @intFromPtr(line.ptr);
                     w2.writeCell(@intCast(col), @intCast(row), .{
                         .char = .{ .grapheme = bytes, .width = @intCast(w) },
-                        .style = lineStyle(line, off, bytes.len, hit_starts[0..hit_count], hit_seqs[0..hit_count], hit_overflow),
+                        .style = lineStyle(
+                            line,
+                            source_row,
+                            off,
+                            bytes.len,
+                            hit_starts[0..hit_count],
+                            hit_seqs[0..hit_count],
+                            hit_overflow,
+                            highlights,
+                        ),
                     });
                 }
             }
@@ -152,7 +173,16 @@ fn writeInfo(win: vaxis.Window, row: usize, info: []const u8) usize {
     return col;
 }
 
-fn lineStyle(line: []const u8, off: usize, len: usize, starts: []const usize, seqs: []const u32, overflow: bool) vaxis.Style {
+fn lineStyle(
+    line: []const u8,
+    row: usize,
+    off: usize,
+    len: usize,
+    starts: []const usize,
+    seqs: []const u32,
+    overflow: bool,
+    highlights: ?*const Syntax.Highlights,
+) vaxis.Style {
     for (starts, seqs) |s, q| {
         if (s < off + len and off < s + search_query.len) {
             if (Search.runIsFocus(q)) return Search.focus(card_style);
@@ -160,7 +190,24 @@ fn lineStyle(line: []const u8, off: usize, len: usize, starts: []const usize, se
         }
     }
     if (overflow and covers(line, off, len)) return Search.highlight(card_style);
+    if (highlights) |syntax_highlights| {
+        if (syntax_highlights.kindAt(row, off, len)) |kind| return syntaxStyle(kind);
+    }
     return card_style;
+}
+
+fn syntaxStyle(kind: Syntax.Kind) vaxis.Style {
+    return .{
+        .fg = switch (kind) {
+            .comment => Theme.muted,
+            .string => Theme.success,
+            .constant => Theme.gold,
+            .keyword => Theme.violet,
+            .function => Theme.code,
+            .type => Theme.accent,
+        },
+        .bg = Theme.panel,
+    };
 }
 
 fn gwidth(g: []const u8) usize {
@@ -171,6 +218,7 @@ const std = @import("std");
 const Document = @import("../../Document.zig");
 const Mermaid = @import("../../Mermaid.zig");
 const Search = @import("../Search.zig");
+const Syntax = @import("../Syntax.zig");
 const mermaid = @import("mermaid.zig");
 const sequence = @import("sequence.zig");
 const Theme = @import("../Theme.zig");
@@ -257,6 +305,67 @@ test "counts the info line and wrapped content lines" {
     try testing.expectEqual(@as(usize, 2), layout(null, .{ .info = .{ .other = "zig" }, .content = "short\n" }, 0, 0, 40));
     try testing.expectEqual(@as(usize, 2), layout(null, .{ .info = null, .content = "abcdefgh\n" }, 0, 0, 4));
     try testing.expectEqual(@as(usize, 3), layout(null, .{ .info = null, .content = "ab\n\ncd\n" }, 0, 0, 40));
+}
+
+test "syntax colors code cells" {
+    var spans = [_]Syntax.Span{
+        .{
+            .row = 0,
+            .start_col = 0,
+            .end_col = 3,
+            .kind = .keyword,
+            .priority = 100,
+            .pattern_index = 0,
+        },
+    };
+    const highlights: Syntax.Highlights = .{ .spans = &spans };
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 10, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 10,
+        .height = 1,
+        .screen = &screen,
+    };
+    _ = layoutSyntax(win, .{ .info = null, .content = "pub value\n" }, 0, 0, win.width, &highlights);
+
+    try testing.expect(win.readCell(0, 0).?.style.fg.eql(Theme.violet));
+    try testing.expect(win.readCell(4, 0).?.style.fg.eql(.default));
+}
+
+test "search styling overrides syntax colors" {
+    Search.beginFrame();
+    Search.setEntryFocus(false, 0);
+    setSearchQuery("pub");
+    defer setSearchQuery("");
+    var spans = [_]Syntax.Span{
+        .{
+            .row = 0,
+            .start_col = 0,
+            .end_col = 3,
+            .kind = .keyword,
+            .priority = 100,
+            .pattern_index = 0,
+        },
+    };
+    const highlights: Syntax.Highlights = .{ .spans = &spans };
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 10, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 10,
+        .height = 1,
+        .screen = &screen,
+    };
+    _ = layoutSyntax(win, .{ .info = null, .content = "pub value\n" }, 0, 0, win.width, &highlights);
+
+    try testing.expect(win.readCell(0, 0).?.style.bg.eql(Theme.gold));
 }
 
 test "search highlights code matches" {

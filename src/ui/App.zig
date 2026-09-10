@@ -12,11 +12,24 @@ const Entry = struct {
     elem: Element,
     source_end: usize = 0,
     media: Media.State = .idle,
+    syntax: SyntaxState = .idle,
     virtual_rows: u16 = 0,
     virtual_cols: u16 = 0,
     /// Footprint rows (content plus trailing gap); zero while unmeasured,
     /// e.g. right after parsing or a width change.
     height: usize = 0,
+};
+
+const SyntaxState = union(enum) {
+    idle,
+    loading,
+    ready: Syntax.Highlights,
+    failed,
+
+    fn deinit(self: *SyntaxState, gpa: mem.Allocator) void {
+        if (self.* == .ready) self.ready.deinit(gpa);
+        self.* = .idle;
+    }
 };
 
 const MediaRequest = struct {
@@ -37,6 +50,22 @@ const MediaRequest = struct {
             .ready => |*artifact| artifact.deinit(gpa),
             else => {},
         }
+        self.* = undefined;
+    }
+};
+
+const SyntaxRequest = struct {
+    entry_index: usize,
+    block: Element.CodeBlock,
+    cache: *Syntax.Cache,
+    result: union(enum) {
+        pending,
+        ready: Syntax.Highlights,
+        failed,
+    } = .pending,
+
+    fn deinit(self: *SyntaxRequest, gpa: mem.Allocator) void {
+        if (self.result == .ready) self.result.ready.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -62,6 +91,8 @@ image_width: usize = 0,
 cell_width: usize = 0,
 cell_height: usize = 0,
 pending_media: ?*MediaRequest = null,
+pending_syntax: ?*SyntaxRequest = null,
+syntax_cache: Syntax.Cache = .{},
 placement_mode: Kitty.PlacementMode = .stable,
 graphics_supported: bool = false,
 virtual_placements: [max_images]Kitty.VirtualPlacement = undefined,
@@ -83,7 +114,9 @@ pub fn initFile(gpa: mem.Allocator, doc: *Document, file_path: []const u8) App {
 }
 
 pub fn deinit(self: *App) void {
+    for (self.entries.items) |*entry| entry.syntax.deinit(self.gpa);
     self.entries.deinit(self.gpa);
+    self.syntax_cache.deinit();
     self.* = undefined;
 }
 
@@ -115,6 +148,11 @@ pub fn run(self: *App, io: Io, environ: *std.process.Environ.Map) !void {
         self.cancelPendingMedia();
         self.freeImages(tty.writer());
     }
+    var syntax_tasks: Io.Group = .init;
+    defer {
+        syntax_tasks.cancel(io);
+        self.cancelPendingSyntax();
+    }
     var search_tasks: Io.Group = .init;
     defer search_tasks.cancel(io);
 
@@ -125,11 +163,12 @@ pub fn run(self: *App, io: Io, environ: *std.process.Environ.Map) !void {
                 .key_press => |key| try self.handleKey(io, &vx, key, &loop, &search_tasks),
                 .winsize => |ws| try vx.resize(self.gpa, tty.writer(), ws),
                 .media_loaded => try self.finishMedia(tty.writer()),
+                .syntax_loaded => self.finishSyntax(),
                 .search_tick => |generation| try self.handleSearchTick(generation),
             }
             if (self.quit) break;
         }
-        if (!self.quit) try self.draw(io, &vx, tty.writer(), &loop, &media_tasks);
+        if (!self.quit) try self.draw(io, &vx, tty.writer(), &loop, &media_tasks, &syntax_tasks);
     }
 }
 
@@ -137,6 +176,7 @@ const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
     media_loaded,
+    syntax_loaded,
     search_tick: u64,
 };
 
@@ -343,7 +383,15 @@ fn halfRows(viewport: usize) usize {
     return @max(viewport / 2, 1);
 }
 
-fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop(Event), media_tasks: *Io.Group) !void {
+fn draw(
+    self: *App,
+    io: Io,
+    vx: *vaxis.Vaxis,
+    tty: *Io.Writer,
+    loop: *vaxis.Loop(Event),
+    media_tasks: *Io.Group,
+    syntax_tasks: *Io.Group,
+) !void {
     if (vx.caps.kitty_graphics) {
         self.graphics_supported = true;
         if (self.placement_mode != .unicode) vx.caps.kitty_graphics = false;
@@ -363,6 +411,7 @@ fn draw(self: *App, io: Io, vx: *vaxis.Vaxis, tty: *Io.Writer, loop: *vaxis.Loop
     }
     try self.prepareFrame(content.height);
     try self.startVisibleMedia(io, loop, media_tasks);
+    try self.startVisibleSyntax(io, loop, syntax_tasks);
 
     Renderer.beginFrame();
     Renderer.setSearchQuery(self.search.query());
@@ -580,7 +629,10 @@ fn renderEntry(self: *App, win: vaxis.Window, entry: *Entry, row: usize, skip: u
             }
             return row + draw_rows;
         },
-        else => return Renderer.render(win, entry.elem, row, skip),
+        else => return switch (entry.syntax) {
+            .ready => |*highlights| Renderer.renderHighlighted(win, entry.elem, row, skip, highlights),
+            else => Renderer.render(win, entry.elem, row, skip),
+        },
     }
 }
 
@@ -766,6 +818,85 @@ fn finishMedia(self: *App, tty: *Io.Writer) !void {
     self.invalidateMeasurementsFrom(request.entry_index);
 }
 
+fn startVisibleSyntax(self: *App, io: Io, loop: *vaxis.Loop(Event), tasks: *Io.Group) !void {
+    if (self.pending_syntax != null) return;
+    const cache = &self.syntax_cache;
+    var top: usize = 0;
+    for (self.entries.items, 0..) |*entry, index| {
+        if (entry.height == 0) break;
+        const bottom = top + entry.height;
+        const visible = bottom > self.scroll and top < self.scroll + self.viewport;
+        top = bottom;
+        if (!visible or entry.syntax != .idle) continue;
+        const block = switch (entry.elem) {
+            .code_block => |block| block,
+            else => continue,
+        };
+        if (block.info == null or block.info.?.isMermaid() or block.content.len > Syntax.max_source_bytes) {
+            entry.syntax = .failed;
+            continue;
+        }
+
+        const request = try self.gpa.create(SyntaxRequest);
+        errdefer self.gpa.destroy(request);
+        request.* = .{
+            .entry_index = index,
+            .block = block,
+            .cache = cache,
+        };
+        self.pending_syntax = request;
+        entry.syntax = .loading;
+        tasks.concurrent(io, loadSyntax, .{ io, self.gpa, request, loop }) catch {
+            self.pending_syntax = null;
+            entry.syntax = .failed;
+            request.deinit(self.gpa);
+            self.gpa.destroy(request);
+        };
+        return;
+    }
+}
+
+fn loadSyntax(
+    io: Io,
+    gpa: mem.Allocator,
+    request: *SyntaxRequest,
+    loop: *vaxis.Loop(Event),
+) Io.Cancelable!void {
+    _ = io;
+    const highlights = Syntax.load(gpa, request.cache, request.block) catch {
+        request.result = .failed;
+        try loop.postEvent(.syntax_loaded);
+        return;
+    };
+    request.result = .{ .ready = highlights };
+    try loop.postEvent(.syntax_loaded);
+}
+
+fn finishSyntax(self: *App) void {
+    const request = self.pending_syntax orelse return;
+    self.pending_syntax = null;
+    defer {
+        request.deinit(self.gpa);
+        self.gpa.destroy(request);
+    }
+    if (request.entry_index >= self.entries.items.len) return;
+    const entry = &self.entries.items[request.entry_index];
+    switch (request.result) {
+        .ready => |highlights| {
+            entry.syntax = .{ .ready = highlights };
+            request.result = .pending;
+        },
+        .pending, .failed => entry.syntax = .failed,
+    }
+}
+
+fn cancelPendingSyntax(self: *App) void {
+    const request = self.pending_syntax orelse return;
+    request.deinit(self.gpa);
+    self.gpa.destroy(request);
+    self.pending_syntax = null;
+}
+
 fn imagePixelWidth(self: *const App) u16 {
     return @intCast(@min(
         math.mul(usize, self.image_width, self.cell_width) catch math.maxInt(u16),
@@ -861,6 +992,7 @@ const vaxis = @import("vaxis");
 const Document = @import("../Document.zig");
 const Renderer = @import("Renderer.zig");
 const Search = @import("Search.zig");
+const Syntax = @import("Syntax.zig");
 const Theme = @import("Theme.zig");
 const Media = @import("Media.zig");
 const Kitty = @import("Kitty.zig");
