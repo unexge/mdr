@@ -104,6 +104,8 @@ next_stable_placement_count: usize = 0,
 next_image_id: u32 = 1,
 quit: bool = false,
 search: Search = .{},
+scrollbar_visible: bool = true,
+scrollbar_generation: u64 = 0,
 
 pub fn init(gpa: mem.Allocator, doc: *Document) App {
     return .{ .gpa = gpa, .doc = doc };
@@ -155,16 +157,26 @@ pub fn run(self: *App, io: Io, environ: *std.process.Environ.Map) !void {
     }
     var search_tasks: Io.Group = .init;
     defer search_tasks.cancel(io);
+    var scrollbar_tasks: Io.Group = .init;
+    defer scrollbar_tasks.cancel(io);
+    self.pokeScrollbar(io, &loop, &scrollbar_tasks);
 
     while (!self.quit) {
         try loop.pollEvent();
         while (try loop.tryEvent()) |event| {
             switch (event) {
-                .key_press => |key| try self.handleKey(io, &vx, key, &loop, &search_tasks),
-                .winsize => |ws| try vx.resize(self.gpa, tty.writer(), ws),
+                .key_press => |key| {
+                    try self.handleKey(io, &vx, key, &loop, &search_tasks);
+                    self.pokeScrollbar(io, &loop, &scrollbar_tasks);
+                },
+                .winsize => |ws| {
+                    try vx.resize(self.gpa, tty.writer(), ws);
+                    self.pokeScrollbar(io, &loop, &scrollbar_tasks);
+                },
                 .media_loaded => try self.finishMedia(tty.writer()),
                 .syntax_loaded => self.finishSyntax(),
                 .search_tick => |generation| try self.handleSearchTick(generation),
+                .scrollbar_tick => |generation| self.handleScrollbarTick(generation),
             }
             if (self.quit) break;
         }
@@ -178,6 +190,7 @@ const Event = union(enum) {
     media_loaded,
     syntax_loaded,
     search_tick: u64,
+    scrollbar_tick: u64,
 };
 
 fn handleKey(self: *App, io: Io, vx: *vaxis.Vaxis, key: vaxis.Key, loop: *vaxis.Loop(Event), search_tasks: *Io.Group) !void {
@@ -444,26 +457,64 @@ fn draw(
     }
 }
 
-/// Draws a reading-progress rail in the right margin; skipped on narrow
-/// windows where the content uses the full width, so it never covers text.
+/// Draws a reading-progress rail in the last column. On wide windows the
+/// content leaves that column free; on narrow windows the rail overlays
+/// the last text column while visible and hides after a second, so text
+/// is only briefly covered.
 fn drawScrollbar(self: *App, win: vaxis.Window) void {
-    if (win.width < full_width_cols or win.height < 2) return;
-    const total_height = self.scrollbarTotalHeight();
-    if (total_height <= self.viewport) return;
-    const max_scroll = total_height -| (self.viewport + 1);
-    const height: usize = win.height;
-    const thumb_h = @max(1, self.viewport * height / total_height);
-    const thumb_y = if (max_scroll == 0) 0 else self.scroll * (height - thumb_h) / max_scroll;
+    if (!self.scrollbar_visible) return;
+    if (win.width == 0 or win.height < 2) return;
+    const thumb = self.scrollbarThumb(win.height) orelse return;
     const x: u16 = win.width - 1;
     var r: usize = 0;
-    while (r < height) : (r += 1) {
-        const thumb = r >= thumb_y and r < thumb_y + thumb_h;
+    while (r < win.height) : (r += 1) {
+        const on_thumb = r >= thumb.y and r < thumb.y + thumb.h;
         win.writeCell(x, @intCast(r), .{
-            .char = .{ .grapheme = if (thumb) "█" else "│", .width = 1 },
-            .style = if (thumb) .{ .fg = Theme.accent } else .{ .fg = Theme.muted },
+            .char = .{ .grapheme = if (on_thumb) "█" else "│", .width = 1 },
+            .style = if (on_thumb) .{ .fg = Theme.accent } else .{ .fg = Theme.muted },
         });
     }
 }
+
+const ScrollbarThumb = struct {
+    h: usize,
+    y: usize,
+};
+
+fn scrollbarThumb(self: *const App, height: usize) ?ScrollbarThumb {
+    if (height < 2) return null;
+    const total_height = self.scrollbarTotalHeight();
+    if (total_height <= self.viewport) return null;
+    const max_scroll = total_height -| (self.viewport + 1);
+    const thumb_h = @max(1, self.viewport * height / total_height);
+    const thumb_y = if (max_scroll == 0) 0 else self.scroll * (height - thumb_h) / max_scroll;
+    return .{ .h = thumb_h, .y = thumb_y };
+}
+
+fn pokeScrollbar(self: *App, io: Io, loop: *vaxis.Loop(Event), tasks: *Io.Group) void {
+    self.markScrollbarActive();
+    tasks.concurrent(io, scrollbarHide, .{ io, self.scrollbar_generation, loop }) catch {};
+}
+
+fn markScrollbarActive(self: *App) void {
+    self.scrollbar_visible = true;
+    self.scrollbar_generation +%= 1;
+}
+
+fn scrollbarHide(io: Io, generation: u64, loop: *vaxis.Loop(Event)) Io.Cancelable!void {
+    Io.Timeout.sleep(.{ .duration = .{ .raw = .{ .nanoseconds = scrollbar_hide_ns }, .clock = .awake } }, io) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+        return;
+    };
+    _ = loop.tryPostEvent(.{ .scrollbar_tick = generation }) catch false;
+}
+
+fn handleScrollbarTick(self: *App, generation: u64) void {
+    if (generation != self.scrollbar_generation) return;
+    self.scrollbar_visible = false;
+}
+
+const scrollbar_hide_ns: u64 = 1_000_000_000;
 
 fn drawSearchBar(self: *App, win: vaxis.Window) void {
     if (win.height == 0 or win.width == 0) return;
@@ -1361,6 +1412,82 @@ test "scrollbar tracks scroll position" {
     app.drawScrollbar(win);
     try testing.expectEqualStrings("│", win.readCell(129, 0).?.char.grapheme);
     try testing.expectEqualStrings("█", win.readCell(129, 9).?.char.grapheme);
+}
+
+test "scrollbar hides after a second without input" {
+    var doc = Document.init(lazy_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+    app.viewport = 3;
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 130, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 130,
+        .height = 10,
+        .screen = &screen,
+    };
+
+    app.drawScrollbar(win);
+    try testing.expectEqualStrings("█", win.readCell(129, 0).?.char.grapheme);
+
+    app.markScrollbarActive();
+    app.handleScrollbarTick(app.scrollbar_generation - 1);
+    try testing.expect(app.scrollbar_visible);
+
+    app.handleScrollbarTick(app.scrollbar_generation);
+    try testing.expect(!app.scrollbar_visible);
+    win.clear();
+    app.drawScrollbar(win);
+    for (0..10) |row| {
+        const cell = win.readCell(129, @intCast(row)).?;
+        try testing.expect(!mem.eql(u8, "█", cell.char.grapheme));
+        try testing.expect(!mem.eql(u8, "│", cell.char.grapheme));
+    }
+
+    app.markScrollbarActive();
+    try testing.expect(app.scrollbar_visible);
+}
+
+test "scrollbar shows on narrow windows" {
+    var doc = Document.init(lazy_text);
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+
+    app.width = 40;
+    try app.ensureVisible(math.maxInt(usize));
+    app.viewport = 3;
+    try testing.expect(app.total_height > app.viewport);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 10,
+        .screen = &screen,
+    };
+
+    app.scroll = 0;
+    app.drawScrollbar(win);
+    try testing.expectEqualStrings("█", win.readCell(39, 0).?.char.grapheme);
+    try testing.expectEqualStrings("│", win.readCell(39, 9).?.char.grapheme);
+
+    win.clear();
+    app.scroll = app.maxScroll();
+    app.drawScrollbar(win);
+    try testing.expectEqualStrings("│", win.readCell(39, 0).?.char.grapheme);
+    try testing.expectEqualStrings("█", win.readCell(39, 9).?.char.grapheme);
 }
 
 test "images occupy four fifths of the screen" {
