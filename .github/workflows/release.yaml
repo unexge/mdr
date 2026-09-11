@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          cache-key: release-verify
+      - run: zig fmt --check .
+      - run: zig build test -Doptimize=ReleaseFast --summary all
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-linux-musl
+            asset: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+            asset: aarch64-linux
+          - runner: macos-15-intel
+            target: x86_64-macos
+            asset: x86_64-macos
+          - runner: macos-15
+            target: aarch64-macos
+            asset: aarch64-macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          cache-key: release-${{ matrix.target }}
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast --summary all
+      - name: Smoke test
+        run: |
+          output="$(./zig-out/bin/mdr 2>&1)"
+          test "$output" = "usage: mdr <file>"
+      - name: Package
+        run: |
+          archive="mdr-${{ matrix.asset }}"
+          mkdir -p "dist/$archive"
+          cp zig-out/bin/mdr README.md "dist/$archive/"
+          tar -C dist -czf "dist/$archive.tar.gz" "$archive"
+          rm -rf "dist/$archive"
+          cd dist
+          shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
