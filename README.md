@@ -1,9 +1,46 @@
 # mdr
 
-A Markdown reader for the terminal, written in Zig. Parses lazily so huge
-files open instantly, and renders through [libvaxis](https://github.com/rockorager/libvaxis).
+A Markdown reader for the terminal written in Zig using [libvaxis](https://github.com/rockorager/libvaxis) under the hood.
 
-![mdr demo](docs/demo.png)
+## Demo
+
+https://github.com/user-attachments/assets/4d136ba2-6375-4b1f-ade3-998bba08fc7f
+
+This demo runs `mdr` in a [Zellij floating pane](https://zellij.dev/features/#floating-panes) with the following Nushell function:
+
+```nu
+def md [file: path] {
+    zellij run --close-on-exit --floating -- mdr $file
+}
+```
+
+## Features
+
+- Headings, styled text, inline code, links, dividers, nested lists, tasks, quotes, and aligned tables
+- Syntax-highlighted code blocks for Bash, C/C++, Go, JSON, JavaScript/JSX, Python, Rust, TypeScript/TSX, and Zig
+- Local images in supported terminals, plus clickable placeholders for remote images
+- Mermaid flowcharts, sequence, class, state, and entity-relationship diagrams; unsupported diagrams remain code ([support matrix](docs/MERMAID.md))
+- Vim-style scrolling and an auto-hiding scrollbar
+- Search with highlighted matches and next and previous controls
+- Table of contents for quick jumps between headings
+- Adapts to the terminal size and renders content as needed; images and syntax highlighting load in the background
+
+## Keys
+
+| Keys                                         | Action                                               |
+| -------------------------------------------- | ---------------------------------------------------- |
+| `j` / `k`, arrows                            | Scroll one line                                      |
+| `Space` / `f`, `Ctrl-f` / `Ctrl-b`           | Page down / up                                       |
+| `Ctrl-d` / `Ctrl-u`                          | Half page down / up                                  |
+| `g` / `G`, Home / End                        | Top / bottom                                         |
+| `/` then type                                | Search, jumps to the first match after a short delay |
+| `Enter` / `Esc` in search                    | Keep highlight and close / clear search              |
+| `n` / `N`                                    | Next / previous match (`1/3` counter top right)      |
+| `t`                                          | Table of contents, `Up` / `Down` jump between headings |
+| `Enter` / `Esc` in table of contents         | Stay at heading / return to previous position          |
+| `Ctrl-Backspace` / `Alt-Backspace` in search | Clear the query                                      |
+| `Ctrl-l`                                     | Redraw                                               |
+| `q`, `Ctrl-c`                                | Quit                                                 |
 
 ## Build and run
 
@@ -17,34 +54,6 @@ zig fmt .            # format before committing
 
 mdr <file.md>
 ```
-
-## Keys
-
-| Keys | Action |
-|---|---|
-| `j` / `k`, arrows | Scroll one line |
-| `Space` / `f`, `Ctrl-f` / `Ctrl-b` | Page down / up |
-| `Ctrl-d` / `Ctrl-u` | Half page down / up |
-| `g` / `G`, Home / End | Top / bottom |
-| `/` then type | Search, jumps to the first match after a short delay |
-| `Enter` / `Esc` in search | Keep highlight and close / clear search |
-| `n` / `N` | Next / previous match (`1/3` counter top right) |
-| `t` | Outline modal, `Up` / `Down` jump between headings |
-| `Enter` / `Esc` in outline | Stay at heading / return to previous position |
-| `Ctrl-Backspace` / `Alt-Backspace` in search | Clear the query |
-| `Ctrl-l` | Redraw |
-| `q`, `Ctrl-c` | Quit |
-
-## Features
-
-- CommonMark plus GFM strikethrough, task lists, tables, and reference links
-- Fenced code blocks as cards with syntax highlighting for Bash, C, C++, Go,
-  JSON, JavaScript/JSX, Python, Rust, TypeScript/TSX, and Zig; local images via Kitty graphics
-- A Mermaid subset rendered as unicode diagrams: flowcharts with cyclic and
-  self-links, sequence diagrams, class diagrams, state diagrams, and
-  entity-relationship diagrams
-- Unsupported Mermaid syntax and unrenderable layouts fall back to the code card;
-  see [`docs/MERMAID.md`](docs/MERMAID.md) for the support matrix
 
 ## Testing
 
