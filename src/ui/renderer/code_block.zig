@@ -39,15 +39,11 @@ pub fn layoutSyntax(
 ) usize {
     if (cb.info) |info| {
         if (info.isMermaid()) {
-            if (Mermaid.parseBlock(cb)) |flow| {
-                if (mermaid.layout(win, &flow, start_row, skip, width)) |after| return after;
-            }
-            if (Mermaid.parseSequenceBlock(cb)) |seq| {
-                if (sequence.layout(win, &seq, start_row, skip, width)) |after| return after;
-            }
-            if (Mermaid.Structural.parseBlock(cb)) |diagram| {
-                if (structural.layout(win, &diagram, start_row, skip, width)) |after| return after;
-            }
+            if (Mermaid.parseAnyBlock(cb)) |parsed| switch (parsed) {
+                .flowchart => |flow| if (mermaid.layout(win, &flow, start_row, skip, width)) |after| return after,
+                .sequence => |seq| if (sequence.layout(win, &seq, start_row, skip, width)) |after| return after,
+                .structural => |diagram| if (structural.layout(win, &diagram, start_row, skip, width)) |after| return after,
+            };
         }
     }
     const cols = @max(width, 1);

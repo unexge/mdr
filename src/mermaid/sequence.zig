@@ -123,7 +123,10 @@ pub fn parseSequenceBlock(cb: Document.Element.CodeBlock) ?Sequence {
     if (!info.isMermaid()) return null;
     var parser: SeqParser = .{};
     var lines = cb.lines();
-    while (lines.next()) |line| parser.feed(line);
+    while (lines.next()) |line| {
+        parser.feed(line);
+        if (!parser.supported or parser.seq.degraded) break;
+    }
     if (!parser.seen_header or !parser.supported) return null;
     parser.finish();
     if (!parser.supported) return null;

@@ -101,7 +101,10 @@ pub fn parseBlock(cb: Document.Element.CodeBlock) ?Flowchart {
     if (!info.isMermaid()) return null;
     var parser: Parser = .{};
     var lines = cb.lines();
-    while (lines.next()) |line| parser.feed(line);
+    while (lines.next()) |line| {
+        parser.feed(line);
+        if (!parser.supported or parser.flow.degraded) break;
+    }
     if (!parser.seen_header or !parser.supported) return null;
     parser.finish();
     if (!parser.supported) return null;

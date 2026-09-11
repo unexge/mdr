@@ -99,7 +99,10 @@ pub fn parseBlock(cb: Document.Element.CodeBlock) ?Diagram {
     if (!info.isMermaid()) return null;
     var parser: Parser = .{};
     var lines = cb.lines();
-    while (lines.next()) |line| parser.feed(line);
+    while (lines.next()) |line| {
+        parser.feed(line);
+        if (!parser.supported or parser.diagram.degraded) break;
+    }
     return parser.result();
 }
 
