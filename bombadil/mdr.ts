@@ -10,6 +10,7 @@ import { typeFromSet } from "@antithesishq/bombadil/terminal/defaults/actions";
 export { noReplacementChars } from "@antithesishq/bombadil/terminal/defaults/properties";
 
 const startMarker = "BOMBADIL_START";
+const startHeading = `▌ ${startMarker}`;
 const endMarker = "BOMBADIL_END";
 
 const terminal = extract((state) => {
@@ -25,10 +26,11 @@ const terminal = extract((state) => {
     if (text.endsWith("█")) scrollbarThumbRows++;
     if (text.endsWith("│")) scrollbarRailRows++;
 
-    const start = text.indexOf(startMarker);
-    if (start < 0) continue;
+    const heading = text.indexOf(startHeading);
+    if (heading < 0) continue;
 
     startVisible = true;
+    const start = heading + startHeading.length - startMarker.length;
     const cells = state.grid.row(row);
     for (let column = start; column < start + startMarker.length; column++) {
       if (!Attributes.has(cells[column].style, Attributes.Bold)) {
@@ -62,6 +64,10 @@ function searchOpen(): boolean {
   return terminal.current.lines.slice(-2).some((line) => line.startsWith("/"));
 }
 
+function outlineOpen(): boolean {
+  return terminal.current.lines.some((line) => line.includes("┌─Contents"));
+}
+
 export const remainsRunning = always(() => terminal.current.exitStatus === null);
 
 export const rendersDocument = always(() =>
@@ -69,11 +75,17 @@ export const rendersDocument = always(() =>
 );
 
 export const homeShowsStart = always(() =>
-  !lastInputIs("g", "\x1b[H") || searchOpen() || markerVisible(startMarker),
+  !lastInputIs("g", "\x1b[H") ||
+  searchOpen() ||
+  outlineOpen() ||
+  markerVisible(startMarker),
 );
 
 export const endShowsEnd = always(() =>
-  !lastInputIs("G", "\x1b[F") || searchOpen() || markerVisible(endMarker),
+  !lastInputIs("G", "\x1b[F") ||
+  searchOpen() ||
+  outlineOpen() ||
+  markerVisible(endMarker),
 );
 
 export const startHeadingIsBold = always(() =>
@@ -92,7 +104,9 @@ export const loneTagsNeverRender = always(() =>
 );
 
 export const searchBarAppearsAfterSlash = always(() =>
-  !lastInputIs("/") || terminal.current.bottomLine.startsWith("/"),
+  !lastInputIs("/") ||
+  outlineOpen() ||
+  terminal.current.bottomLine.startsWith("/"),
 );
 
 export const escapeClearsSearchBar = always(() =>
