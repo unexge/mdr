@@ -5,6 +5,7 @@ pub const max_details = 256;
 pub const max_relations = 128;
 pub const max_groups = 16;
 pub const max_group_depth = 8;
+pub const max_regions_per_group = 8;
 
 pub const Family = enum { class, state, er };
 pub const Direction = enum { tb, bt, lr, rl };
@@ -30,11 +31,13 @@ pub const Node = struct {
     kind: NodeKind,
     order: usize,
     group: ?usize = null,
+    region: usize = 0,
 };
 
 pub const Group = struct {
     node: usize,
     direction: ?Direction = null,
+    region_count: usize = 1,
 };
 
 pub const Detail = struct {
@@ -124,15 +127,17 @@ const Parser = struct {
     fn result(self: *Parser) ?Diagram {
         if (!self.seen_header or !self.supported or self.reading_frontmatter or
             self.open_node != null or self.group_stack_len != 0) return null;
-        for (self.diagram.groupList(), 0..) |_, group| {
-            var has_child = false;
-            for (self.diagram.nodeList()) |node| {
-                if (node.group == group) {
-                    has_child = true;
-                    break;
+        for (self.diagram.groupList(), 0..) |item, group| {
+            for (0..item.region_count) |region| {
+                var has_child = false;
+                for (self.diagram.nodeList()) |node| {
+                    if (node.group == group and node.region == region) {
+                        has_child = true;
+                        break;
+                    }
                 }
+                if (!has_child) return null;
             }
-            if (!has_child) return null;
         }
         return self.diagram;
     }
@@ -302,7 +307,7 @@ const Parser = struct {
             return;
         }
         if (mem.eql(u8, line, "--")) {
-            self.supported = false;
+            self.startRegion();
             return;
         }
         if (parseStateTransition(line)) |transition| {
@@ -513,15 +518,39 @@ const Parser = struct {
         }
     }
 
+    fn startRegion(self: *Parser) void {
+        const group = self.currentGroup() orelse {
+            self.supported = false;
+            return;
+        };
+        if (self.diagram.groups[group].region_count >= max_regions_per_group) {
+            self.diagram.degraded = true;
+            return;
+        }
+        self.diagram.groups[group].region_count += 1;
+    }
+
     fn currentGroup(self: *const Parser) ?usize {
         if (self.group_stack_len == 0) return null;
         return self.group_stack[self.group_stack_len - 1];
     }
 
+    fn currentRegion(self: *const Parser) usize {
+        const group = self.currentGroup() orelse return 0;
+        return self.diagram.groups[group].region_count - 1;
+    }
+
     fn intern(self: *Parser, id: []const u8, label: []const u8, kind: NodeKind, explicit: bool) ?usize {
         const group = self.currentGroup();
+        const region = self.currentRegion();
         for (self.diagram.nodes[0..self.diagram.node_count], 0..) |*node, index| {
             if (!idsEqual(node.id, id)) continue;
+            if (self.diagram.family == .state and node.group == group and node.region != region and
+                kind != .start and kind != .end)
+            {
+                self.supported = false;
+                return null;
+            }
             if (self.diagram.family == .er) {
                 if (kind == .er_group) {
                     if (node.kind == .er_group) return index;
@@ -533,6 +562,7 @@ const Parser = struct {
                     node.label = label;
                     node.kind = .er_group;
                     node.group = group;
+                    node.region = region;
                     self.declared[index] = true;
                     return index;
                 }
@@ -544,12 +574,13 @@ const Parser = struct {
                 if (explicit) {
                     node.label = label;
                     node.group = group;
+                    node.region = region;
                     self.declared[index] = true;
                 }
                 return index;
             }
             const matches = switch (self.diagram.family) {
-                .state => node.group == group,
+                .state => node.group == group and node.region == region,
                 .class => if (kind == .namespace)
                     node.kind == .namespace and node.group == group
                 else
@@ -561,7 +592,10 @@ const Parser = struct {
                 node.label = label;
                 self.declared[index] = true;
                 if (node.kind != .composite and node.kind != .namespace) node.kind = kind;
-                if (self.diagram.family == .class and kind != .namespace) node.group = group;
+                if (self.diagram.family == .class and kind != .namespace) {
+                    node.group = group;
+                    node.region = region;
+                }
             }
             return index;
         }
@@ -576,6 +610,7 @@ const Parser = struct {
             .kind = kind,
             .order = index,
             .group = group,
+            .region = region,
         };
         self.declared[index] = explicit;
         self.diagram.node_count += 1;
@@ -596,6 +631,14 @@ const Parser = struct {
     }
 
     fn addRelation(self: *Parser, relation: Relation) void {
+        if (self.diagram.family == .state) {
+            const source = self.diagram.nodes[relation.src];
+            const destination = self.diagram.nodes[relation.dst];
+            if (source.group != destination.group or source.region != destination.region) {
+                self.supported = false;
+                return;
+            }
+        }
         if (self.diagram.relation_count >= max_relations) {
             self.diagram.degraded = true;
             return;
@@ -1108,6 +1151,35 @@ test "state diagrams parse nested composite states" {
     try testing.expect(diagram.relations[0].src != diagram.relations[1].src);
 }
 
+test "state diagrams parse concurrent composite regions" {
+    const diagram = parseText(
+        "stateDiagram-v2\n" ++
+            "state Active {\n" ++
+            "direction LR\n" ++
+            "[*] --> NumLockOff\n" ++
+            "NumLockOff --> NumLockOn\n" ++
+            "NumLockOn --> NumLockOff\n" ++
+            "--\n" ++
+            "[*] --> CapsLockOff\n" ++
+            "state CapsLockOn {\n" ++
+            "[*] --> Lit\n" ++
+            "Lit --> [*]\n" ++
+            "}\n" ++
+            "CapsLockOff --> CapsLockOn\n" ++
+            "}\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 2), diagram.group_count);
+    try testing.expectEqual(@as(usize, 10), diagram.node_count);
+    try testing.expectEqual(@as(usize, 7), diagram.relation_count);
+    try testing.expectEqual(@as(usize, 2), diagram.groups[0].region_count);
+    try testing.expectEqual(@as(usize, 1), diagram.groups[1].region_count);
+    try testing.expectEqual(@as(usize, 0), diagram.nodes[1].region);
+    try testing.expectEqual(@as(usize, 1), diagram.nodes[4].region);
+    try testing.expect(diagram.relations[0].src != diagram.relations[3].src);
+    try testing.expectEqual(@as(?usize, 0), diagram.nodes[diagram.groups[1].node].group);
+    try testing.expectEqual(@as(usize, 1), diagram.nodes[diagram.groups[1].node].region);
+}
+
 test "er diagrams preserve attributes and crow foot cardinalities" {
     const diagram = parseText(
         "erDiagram\n" ++
@@ -1181,7 +1253,9 @@ test "structural parser rejects unsupported blocks and unclosed bodies" {
     try testing.expect(parseText("classDiagram\nnamespace Models {\n") == null);
     try testing.expect(parseText("classDiagram\nnamespace Company.Engineering {\nclass A\n}\n") == null);
     try testing.expect(parseText("stateDiagram-v2\nstate Parent {\n") == null);
-    try testing.expect(parseText("stateDiagram-v2\nstate Parent {\nA\n--\nB\n}\n") == null);
+    try testing.expect(parseText("stateDiagram-v2\n--\nA\n") == null);
+    try testing.expect(parseText("stateDiagram-v2\nstate Parent {\nA\n--\n}\n") == null);
+    try testing.expect(parseText("stateDiagram-v2\nstate Parent {\nA\n--\nA --> B\n}\n") == null);
     try testing.expect(parseText("erDiagram\nCUSTOMER {\nstring id\n") == null);
     try testing.expect(parseText("erDiagram\nsales\nsubgraph sales\nCUSTOMER\nend\n") == null);
     try testing.expect(parseText("erDiagram\nsubgraph sales\nCUSTOMER\n") == null);

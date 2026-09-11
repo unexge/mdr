@@ -88,7 +88,10 @@ Supported:
 - Plain states, quoted descriptions with aliases, and `id: description` declarations
 - Labeled transitions, including cycles, backward transitions, and self-transitions
 - Start and end states plus choice, fork, and join states
-- Nested composite states with inherited or local directions and transitions to composites
+- Nested composite states with inherited or local directions and transitions
+  to composites
+- Concurrent composite regions separated by `--`, each with scoped start and
+  end states
 - Single-line notes attached to the left or right of a state
 - `TB`, `TD`, `BT`, `LR`, and `RL` directions
 - Style and class assignments accepted using the active terminal theme
@@ -96,7 +99,8 @@ Supported:
 
 Falls back:
 
-- Concurrency regions and multiline notes
+- Transitions across concurrent region boundaries
+- Empty concurrent regions and multiline notes
 
 ## Entity-relationship diagrams
 
@@ -123,7 +127,7 @@ A supported flowchart falls back above 64 nodes, 128 edges, 16 subgraphs, or
 128 messages, 32 notes, 16 fragments, 8 nested fragments, 64 activations, or
 16 participant boxes. Class, state, and ER diagrams fall back above 64 nodes,
 256 detail lines, or 128 relationships. Class namespaces, state composites,
-and ER subgraphs are limited to 16 groups nested 8 levels deep. All diagrams
-fall back when they exceed 200 terminal rows, a route cannot be placed, or the
-result does not fit
+and ER subgraphs are limited to 16 groups nested 8 levels deep. Composite
+states allow up to 8 concurrent regions. All diagrams fall back when they
+exceed 200 terminal rows, a route cannot be placed, or the result does not fit
 the viewport.

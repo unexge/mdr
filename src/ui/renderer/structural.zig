@@ -84,6 +84,9 @@ const Layout = struct {
     heights: [Structural.max_nodes]usize,
     bounds: [Structural.max_nodes]Bounds,
     group_directions: [Structural.max_groups]Structural.Direction,
+    region_sizes: [Structural.max_groups][Structural.max_regions_per_group]Size,
+    region_lanes: [Structural.max_groups][Structural.max_regions_per_group]usize,
+    region_dividers: [Structural.max_groups][Structural.max_regions_per_group]usize,
     rows: usize,
     cols: usize,
 
@@ -95,10 +98,13 @@ const Layout = struct {
             .heights = [_]usize{0} ** Structural.max_nodes,
             .bounds = undefined,
             .group_directions = undefined,
+            .region_sizes = undefined,
+            .region_lanes = undefined,
+            .region_dividers = undefined,
             .rows = 0,
             .cols = 0,
         };
-        const content = result.measureItems(null, diagram.direction) orelse return null;
+        const content = result.measureItems(null, 0, diagram.direction) orelse return null;
         const relation_text_width = result.maxRelationTextWidth();
         const has_vertical = result.hasDirection(true);
         const has_horizontal = result.hasDirection(false);
@@ -108,7 +114,7 @@ const Layout = struct {
         else
             0;
         if (result.rows > max_rows or result.cols > width) return null;
-        result.placeItems(null, diagram.direction, .{
+        result.placeItems(null, 0, diagram.direction, .{
             .x1 = 1,
             .y1 = 1,
             .x2 = content.width,
@@ -118,13 +124,13 @@ const Layout = struct {
         return result;
     }
 
-    fn measureItems(self: *Layout, parent: ?usize, direction: Structural.Direction) ?Size {
+    fn measureItems(self: *Layout, parent: ?usize, region: usize, direction: Structural.Direction) ?Size {
         var count: usize = 0;
         var primary: usize = 0;
         var cross: usize = 0;
         const vertical = isVertical(direction);
         for (self.diagram.nodeList(), 0..) |_, index| {
-            if (self.diagram.nodes[index].group != parent) continue;
+            if (self.diagram.nodes[index].group != parent or self.diagram.nodes[index].region != region) continue;
             const size = self.measureNode(index, direction) orelse return null;
             primary += if (vertical) size.height else size.width;
             cross = @max(cross, if (vertical) size.width else size.height);
@@ -144,10 +150,19 @@ const Layout = struct {
             const group = self.diagram.groupForNode(index) orelse return null;
             const direction = self.diagram.groups[group].direction orelse parent_direction;
             self.group_directions[group] = direction;
-            const content = self.measureItems(group, direction) orelse return null;
+            const region_count = self.diagram.groups[group].region_count;
+            var content_width: usize = 0;
+            var content_height: usize = region_count - 1;
+            if (region_count > 1) content_height += region_count;
+            for (0..region_count) |region| {
+                const size = self.measureItems(group, region, direction) orelse return null;
+                self.region_sizes[group][region] = size;
+                content_width = @max(content_width, size.width);
+                content_height += size.height;
+            }
             break :group_size Size{
-                .width = @max(@max(content.width + 3, cells.maxLineWidth(node.label) + 4), self.selfLabelWidth(index) + 2),
-                .height = content.height + 4,
+                .width = @max(@max(content_width + 3, cells.maxLineWidth(node.label) + 4), self.selfLabelWidth(index) + 2),
+                .height = content_height + 4,
             };
         } else self.leafSize(index, node);
         self.widths[index] = size.width;
@@ -192,13 +207,13 @@ const Layout = struct {
         };
     }
 
-    fn placeItems(self: *Layout, parent: ?usize, direction: Structural.Direction, area: Bounds) void {
+    fn placeItems(self: *Layout, parent: ?usize, region: usize, direction: Structural.Direction, area: Bounds) void {
         const vertical = isVertical(direction);
         const forward = direction == .tb or direction == .lr;
         var primary: usize = 0;
         var count: usize = 0;
         for (self.diagram.nodeList(), 0..) |node, index| {
-            if (node.group != parent) continue;
+            if (node.group != parent or node.region != region) continue;
             primary += if (vertical) self.heights[index] else self.widths[index];
             count += 1;
         }
@@ -209,7 +224,7 @@ const Layout = struct {
             area.x1 + (area.width() - primary) / 2;
         if (!forward) cursor += primary;
         for (self.diagram.nodeList(), 0..) |node, index| {
-            if (node.group != parent) continue;
+            if (node.group != parent or node.region != region) continue;
             const item_primary = if (vertical) self.heights[index] else self.widths[index];
             const position = if (forward) cursor else cursor - item_primary;
             const x = if (vertical) area.x1 + (area.width() - self.widths[index]) / 2 else position;
@@ -222,12 +237,27 @@ const Layout = struct {
             };
             if (isGroupKind(node.kind)) {
                 const group = self.diagram.groupForNode(index) orelse unreachable;
-                self.placeItems(group, self.group_directions[group], .{
-                    .x1 = x + 1,
-                    .y1 = y + 2,
-                    .x2 = x + self.widths[index] - 2,
-                    .y2 = y + self.heights[index] - 2,
-                });
+                const region_count = self.diagram.groups[group].region_count;
+                const has_lanes = region_count > 1;
+                var region_y = y + 2;
+                for (0..region_count) |child_region| {
+                    const region_size = self.region_sizes[group][child_region];
+                    self.placeItems(group, child_region, self.group_directions[group], .{
+                        .x1 = x + 1,
+                        .y1 = region_y,
+                        .x2 = x + self.widths[index] - 2,
+                        .y2 = region_y + region_size.height - 1,
+                    });
+                    region_y += region_size.height;
+                    if (has_lanes) {
+                        self.region_lanes[group][child_region] = region_y;
+                        region_y += 1;
+                    }
+                    if (child_region + 1 < region_count) {
+                        self.region_dividers[group][child_region] = region_y;
+                        region_y += 1;
+                    }
+                }
             }
             if (forward) cursor += item_primary + self.itemGap(direction) else cursor = position -| self.itemGap(direction);
         }
@@ -320,17 +350,21 @@ const Layout = struct {
     }
 
     fn relationDirection(self: *const Layout, relation: *const Structural.Relation) Structural.Direction {
-        const group = self.diagram.nodes[relation.src].group;
-        if (group != self.diagram.nodes[relation.dst].group) return self.diagram.direction;
+        const source = self.diagram.nodes[relation.src];
+        const destination = self.diagram.nodes[relation.dst];
+        const group = source.group;
+        if (group != destination.group or source.region != destination.region) return self.diagram.direction;
         return if (group) |index| self.group_directions[index] else self.diagram.direction;
     }
 
     fn areForwardAdjacent(self: *const Layout, source: usize, destination: usize) bool {
         const source_node = self.diagram.nodes[source];
         const destination_node = self.diagram.nodes[destination];
-        if (source_node.group != destination_node.group or source_node.order >= destination_node.order) return false;
+        if (source_node.group != destination_node.group or source_node.region != destination_node.region or
+            source_node.order >= destination_node.order) return false;
         for (self.diagram.nodeList(), 0..) |node, index| {
-            if (index == source or index == destination or node.group != source_node.group) continue;
+            if (index == source or index == destination or node.group != source_node.group or
+                node.region != source_node.region) continue;
             if (node.order > source_node.order and node.order < destination_node.order) return false;
         }
         return true;
@@ -369,7 +403,7 @@ const Layout = struct {
                 };
             }
         } else {
-            const lane = self.rows - 1;
+            const lane = self.horizontalOuterLane(relation);
             path.src_at = .{ .r = source.y2 + 1, .c = source_center.c };
             path.dst_at = .{ .r = destination.y2 + 1, .c = destination_center.c };
             path.src_arrow = "▲";
@@ -386,6 +420,21 @@ const Layout = struct {
             }
         }
         return path;
+    }
+
+    fn horizontalOuterLane(self: *const Layout, relation: *const Structural.Relation) usize {
+        const source = self.diagram.nodes[relation.src];
+        const destination = self.diagram.nodes[relation.dst];
+        if (source.group != destination.group or source.region != destination.region) return self.rows - 1;
+        var group = source.group;
+        var region = source.region;
+        while (group) |index| {
+            if (self.diagram.groups[index].region_count > 1) return self.region_lanes[index][region];
+            const parent = self.diagram.nodes[self.diagram.groups[index].node];
+            group = parent.group;
+            region = parent.region;
+        }
+        return self.rows - 1;
     }
 
     fn routeSelf(self: *const Layout, node: usize, label: ?[]const u8) ?Path {
@@ -409,9 +458,10 @@ const Layout = struct {
     }
 
     fn draw(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
-        for (self.diagram.groupList()) |group| {
+        for (self.diagram.groupList(), 0..) |group, index| {
             const node = self.diagram.nodes[group.node];
             drawGroupFrame(win, self.bounds[group.node], node.label, node.kind, start_row, skip);
+            self.drawRegionDividers(win, index, start_row, skip);
         }
         for (self.diagram.nodeList(), 0..) |node, index| {
             if (!isGroupKind(node.kind)) self.drawNode(win, index, node, start_row, skip);
@@ -429,6 +479,21 @@ const Layout = struct {
             if (path.label) |label| cells.putText(win, label.r, label.c, start_row, skip, label.text, self.cols, .{});
             if (relation.src_label) |label| self.drawEndpointLabel(win, path.src_at, path.src_arrow, label, start_row, skip);
             if (relation.dst_label) |label| self.drawEndpointLabel(win, path.dst_at, path.dst_arrow, label, start_row, skip);
+        }
+    }
+
+    fn drawRegionDividers(
+        self: *const Layout,
+        win: vaxis.Window,
+        group: usize,
+        start_row: usize,
+        skip: usize,
+    ) void {
+        const item = self.diagram.groups[group];
+        if (item.region_count < 2) return;
+        const bounds = self.bounds[item.node];
+        for (0..item.region_count - 1) |region| {
+            drawRegionDivider(win, bounds, self.region_dividers[group][region], start_row, skip);
         }
     }
 
@@ -575,6 +640,13 @@ fn drawGroupFrame(
         cells.putRaw(win, row, bounds.x2, start_row, skip, "│", style);
     }
     cells.putText(win, bounds.y1, bounds.x1 + 2, start_row, skip, label, bounds.x2 - 1, .{ .bold = true, .dim = true });
+}
+
+fn drawRegionDivider(win: vaxis.Window, bounds: Bounds, row: usize, start_row: usize, skip: usize) void {
+    const style: vaxis.Style = .{ .dim = true };
+    cells.putRaw(win, row, bounds.x1, start_row, skip, "├", style);
+    cells.putRaw(win, row, bounds.x2, start_row, skip, "┤", style);
+    for (bounds.x1 + 1..bounds.x2) |column| cells.putDotted(win, row, column, start_row, skip, style);
 }
 
 fn drawDivider(win: vaxis.Window, bounds: Bounds, row: usize, start_row: usize, skip: usize) void {
@@ -754,6 +826,59 @@ test "nested composite states render framed local layouts" {
     try testing.expectEqualStrings("╯", win.readCell(@intCast(inner.x2), @intCast(inner.y2)).?.char.grapheme);
     try testing.expect(findGlyph(win, "●") != null);
     try testing.expect(findGlyph(win, "◉") != null);
+}
+
+test "concurrent state regions render independent layouts and dividers" {
+    var diagram = Structural.parseText(
+        "stateDiagram-v2\n" ++
+            "state Active {\n" ++
+            "direction LR\n" ++
+            "[*] --> NumLockOff\n" ++
+            "NumLockOff --> NumLockOn\n" ++
+            "NumLockOn --> NumLockOff\n" ++
+            "--\n" ++
+            "[*] --> CapsLockOff\n" ++
+            "state CapsLockOn {\n" ++
+            "[*] --> Lit\n" ++
+            "Lit --> Dark\n" ++
+            "Dark --> Lit\n" ++
+            "Lit --> [*]\n" ++
+            "}\n" ++
+            "CapsLockOff --> CapsLockOn\n" ++
+            "}\n",
+    ).?;
+    const computed = Layout.compute(&diagram, 100).?;
+    const active = computed.bounds[diagram.groups[0].node];
+    const nested = computed.bounds[diagram.groups[1].node];
+    try testing.expect(computed.bounds[1].y1 < computed.bounds[4].y1);
+    try testing.expect(computed.bounds[1].x1 < computed.bounds[2].x1);
+    try testing.expect(computed.bounds[4].x1 < computed.bounds[5].x1);
+    try testing.expect(active.x1 < nested.x1 and nested.x2 < active.x2);
+    const lane = computed.region_lanes[0][0];
+    const divider = computed.region_dividers[0][0];
+    try testing.expectEqual(lane + 1, divider);
+    const backward = computed.route(&diagram.relations[2]).?;
+    var uses_lane = false;
+    for (backward.segments[0..backward.segment_count]) |segment| {
+        if (segment.r1 == lane and segment.r2 == lane) uses_lane = true;
+    }
+    try testing.expect(uses_lane);
+    const nested_backward = computed.route(&diagram.relations[6]).?;
+    var uses_parent_lane = false;
+    for (nested_backward.segments[0..nested_backward.segment_count]) |segment| {
+        if (segment.r1 == computed.region_lanes[0][1] and segment.r2 == computed.region_lanes[0][1]) {
+            uses_parent_lane = true;
+        }
+    }
+    try testing.expect(uses_parent_lane);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(computed.rows), .cols = 100, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &diagram, 0, 0, 100).?;
+    try testing.expectEqualStrings("├", win.readCell(@intCast(active.x1), @intCast(divider)).?.char.grapheme);
+    try testing.expectEqualStrings("┄", win.readCell(@intCast(active.x1 + 1), @intCast(divider)).?.char.grapheme);
+    try testing.expect(win.readCell(@intCast(active.x1), @intCast(divider)).?.style.dim);
 }
 
 test "horizontal choice self-transition labels fit" {

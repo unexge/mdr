@@ -59,11 +59,12 @@ without subgraphs use ranked layout; subgraphs and cyclic flowcharts use a
 bounded hierarchy layout with obstacle detours. Class, state, and ER diagrams
 share a compartment-aware structural renderer; class namespaces, composite
 states, and ER subgraphs use bounded recursive measurement and framed
-placement. Sequence participant groups, lifecycle positions, activation
-stacks, numbering state, and message metadata are fixed parser state from which
-header and lifeline rows
-are derived. Diagram text streams into measured lines without allocating, so
-multiline boxes preserve the measure/render invariant. Message endpoints and
+placement. Concurrent state regions are measured independently and separated
+inside their composite frame. Sequence participant groups, lifecycle positions,
+activation stacks, numbering state, and message metadata are fixed parser state
+from which header and lifeline rows are derived. Diagram text streams into
+measured lines without allocating, so multiline boxes preserve the
+measure/render invariant. Message endpoints and
 central connections are explicit enums,
 keeping rendering exhaustive. The supported grammar is
 listed in [`MERMAID.md`](MERMAID.md). Shared cell drawing (junction merging, clipping,

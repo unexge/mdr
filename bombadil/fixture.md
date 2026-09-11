@@ -119,6 +119,9 @@ state Active {
   direction LR
   [*] --> Working
   Working --> [*]
+  --
+  [*] --> Waiting
+  Waiting --> [*]
 }
 Active --> Idle : sleep
 Active --> [*]
