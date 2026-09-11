@@ -14,6 +14,19 @@ def md [file: path] {
 }
 ```
 
+## Install
+
+On x86_64 Linux:
+
+```sh
+curl -fLO https://github.com/unexge/mdr/releases/latest/download/mdr-x86_64-linux.tar.gz
+tar -xzf mdr-x86_64-linux.tar.gz
+sudo install mdr-x86_64-linux/mdr /usr/local/bin/mdr
+rm -rf mdr-x86_64-linux.tar.gz mdr-x86_64-linux
+```
+
+For other platforms, download the matching archive from the [latest release](https://github.com/unexge/mdr/releases/latest).
+
 ## Features
 
 - Headings, styled text, inline code, links, dividers, nested lists, tasks, quotes, and aligned tables
