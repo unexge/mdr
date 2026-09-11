@@ -66,6 +66,8 @@ zig build benchmark-mermaid -Doptimize=ReleaseFast
 zig fmt .            # format before committing
 
 mdr <file.md>
+<cmd> | mdr        # read from stdin
+mdr -              # read from stdin
 ```
 
 ## Testing
