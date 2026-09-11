@@ -708,7 +708,7 @@ fn drawMarker(
 
 const std = @import("std");
 const mem = std.mem;
-const Structural = @import("../../MermaidStructural.zig");
+const Structural = @import("../../mermaid/structural.zig");
 const cells = @import("cells.zig");
 const vaxis = @import("vaxis");
 

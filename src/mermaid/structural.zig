@@ -1012,7 +1012,7 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 const std = @import("std");
-const Document = @import("Document.zig");
+const Document = @import("../Document.zig");
 const mem = std.mem;
 const ascii = std.ascii;
 
