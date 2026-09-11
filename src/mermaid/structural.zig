@@ -215,8 +215,8 @@ const Parser = struct {
             return;
         }
         if (parseClassRelation(line)) |relation| {
-            const source = self.intern(relation.src.id, relation.src.label, .class, false) orelse return;
-            const destination = self.intern(relation.dst.id, relation.dst.label, .class, false) orelse return;
+            const source = self.resolveClass(relation.src.id, relation.src.label, false) orelse return;
+            const destination = self.resolveClass(relation.dst.id, relation.dst.label, false) orelse return;
             self.addRelation(.{
                 .src = source,
                 .dst = destination,
@@ -242,7 +242,7 @@ const Parser = struct {
                 self.supported = false;
                 return;
             };
-            const node = self.intern(name.id, name.label, .class, true) orelse return;
+            const node = self.resolveClass(name.id, name.label, true) orelse return;
             self.addDetail(node, line[0 .. close + 2], .annotation);
             return;
         }
@@ -259,7 +259,7 @@ const Parser = struct {
             self.supported = false;
             return;
         }
-        const node = self.intern(name.id, name.label, .class, false) orelse return;
+        const node = self.resolveClass(name.id, name.label, false) orelse return;
         self.addDetail(node, member, if (mem.indexOfScalar(u8, member, '(') != null) .operation else .attribute);
     }
 
@@ -291,7 +291,7 @@ const Parser = struct {
             self.supported = false;
             return;
         };
-        const node = self.intern(name.id, name.label, .class, true) orelse return;
+        const node = self.resolveClass(name.id, name.label, true) orelse return;
         if (annotation_start) |start| {
             const annotation = mem.trim(u8, declaration[start..], " \t");
             if (!isAnnotation(annotation)) {
@@ -336,7 +336,7 @@ const Parser = struct {
                 self.supported = false;
                 return;
             };
-            const node = self.intern(name.id, name.label, .state, false) orelse return;
+            const node = self.resolveState(name.id, name.label, .state, false) orelse return;
             self.addDetail(node, parsed.text, .note);
             return;
         }
@@ -351,14 +351,14 @@ const Parser = struct {
                 self.supported = false;
                 return;
             }
-            _ = self.intern(name.id, label, .state, true);
+            _ = self.resolveState(name.id, label, .state, true);
             return;
         }
         const name = parseName(line) orelse {
             self.supported = false;
             return;
         };
-        _ = self.intern(name.id, name.label, .state, true);
+        _ = self.resolveState(name.id, name.label, .state, true);
     }
 
     fn stateDeclaration(self: *Parser, raw: []const u8) void {
@@ -385,7 +385,7 @@ const Parser = struct {
             if (opens) {
                 self.openGroup(name.id, declaration[1..close], .composite, true);
             } else {
-                _ = self.intern(name.id, declaration[1..close], .state, true);
+                _ = self.resolveState(name.id, declaration[1..close], .state, true);
             }
             return;
         }
@@ -416,13 +416,13 @@ const Parser = struct {
                 return;
             };
         }
-        _ = self.intern(name.id, name.label, kind, true);
+        _ = self.resolveState(name.id, name.label, kind, true);
     }
 
     fn stateEndpoint(self: *Parser, raw: []const u8, source: bool) ?usize {
         const endpoint = mem.trim(u8, stripClassSuffix(raw), " \t");
         if (mem.eql(u8, endpoint, "[*]")) {
-            return self.intern(
+            return self.resolveState(
                 if (source) "__state:start" else "__state:end",
                 "",
                 if (source) .start else .end,
@@ -433,7 +433,7 @@ const Parser = struct {
             self.supported = false;
             return null;
         };
-        return self.intern(name.id, name.label, .state, false);
+        return self.resolveState(name.id, name.label, .state, false);
     }
 
     fn feedEr(self: *Parser, line: []const u8) void {
@@ -451,8 +451,8 @@ const Parser = struct {
             return;
         }
         if (parseErRelation(line)) |relation| {
-            const source = self.intern(relation.src.id, relation.src.label, .entity, false) orelse return;
-            const destination = self.intern(relation.dst.id, relation.dst.label, .entity, false) orelse return;
+            const source = self.resolveErEndpoint(relation.src.id, relation.src.label) orelse return;
+            const destination = self.resolveErEndpoint(relation.dst.id, relation.dst.label) orelse return;
             self.addRelation(.{
                 .src = source,
                 .dst = destination,
@@ -470,7 +470,7 @@ const Parser = struct {
             self.supported = false;
             return;
         };
-        const node = self.intern(name.id, name.label, .entity, true) orelse return;
+        const node = self.declareErEntity(name.id, name.label) orelse return;
         if (opens) self.open_node = node;
     }
 
@@ -499,13 +499,17 @@ const Parser = struct {
             self.diagram.degraded = true;
             return;
         }
-        const node = self.intern(id, label, kind, label_explicit) orelse return;
+        const node = switch (kind) {
+            .namespace => self.declareNamespace(id, label),
+            .composite => self.declareComposite(id, label, label_explicit),
+            .er_group => self.declareErGroup(id, label),
+            else => unreachable,
+        } orelse return;
         if (self.diagram.groupForNode(node) != null) {
             self.supported = false;
             return;
         }
         self.diagram.nodes[node].kind = kind;
-        self.declared[node] = true;
         const group = self.diagram.group_count;
         self.diagram.groups[group] = .{ .node = node };
         self.diagram.group_count += 1;
@@ -543,65 +547,109 @@ const Parser = struct {
         return self.diagram.groups[group].region_count - 1;
     }
 
-    fn intern(self: *Parser, id: []const u8, label: []const u8, kind: NodeKind, explicit: bool) ?usize {
+    fn resolveClass(self: *Parser, id: []const u8, label: []const u8, explicit: bool) ?usize {
+        const group = self.currentGroup();
+        const region = self.currentRegion();
+        for (self.diagram.nodes[0..self.diagram.node_count], 0..) |*node, index| {
+            if (node.kind == .namespace or !idsEqual(node.id, id)) continue;
+            if (explicit) {
+                node.label = label;
+                node.kind = .class;
+                node.group = group;
+                node.region = region;
+            }
+            return index;
+        }
+        return self.appendNode(id, label, .class, group, region, false);
+    }
+
+    fn declareNamespace(self: *Parser, id: []const u8, label: []const u8) ?usize {
+        const group = self.currentGroup();
+        for (self.diagram.nodes[0..self.diagram.node_count], 0..) |node, index| {
+            if (node.kind == .namespace and node.group == group and idsEqual(node.id, id)) return index;
+        }
+        return self.appendNode(id, label, .namespace, group, self.currentRegion(), false);
+    }
+
+    fn resolveState(self: *Parser, id: []const u8, label: []const u8, kind: NodeKind, explicit: bool) ?usize {
+        const group = self.currentGroup();
+        const region = self.currentRegion();
+        for (self.diagram.nodes[0..self.diagram.node_count], 0..) |*node, index| {
+            if (!idsEqual(node.id, id) or node.group != group) continue;
+            if (node.region != region) {
+                if (kind != .start and kind != .end) self.supported = false;
+                if (!self.supported) return null;
+                continue;
+            }
+            if (explicit) {
+                node.label = label;
+                if (node.kind != .composite) node.kind = kind;
+            }
+            return index;
+        }
+        return self.appendNode(id, label, kind, group, region, false);
+    }
+
+    fn declareComposite(self: *Parser, id: []const u8, label: []const u8, label_explicit: bool) ?usize {
+        return self.resolveState(id, label, .composite, label_explicit);
+    }
+
+    fn resolveErEndpoint(self: *Parser, id: []const u8, label: []const u8) ?usize {
+        for (self.diagram.nodes[0..self.diagram.node_count], 0..) |node, index| {
+            if ((node.kind == .entity or node.kind == .er_group) and idsEqual(node.id, id)) return index;
+        }
+        return self.appendNode(id, label, .entity, self.currentGroup(), self.currentRegion(), false);
+    }
+
+    fn declareErEntity(self: *Parser, id: []const u8, label: []const u8) ?usize {
         const group = self.currentGroup();
         const region = self.currentRegion();
         for (self.diagram.nodes[0..self.diagram.node_count], 0..) |*node, index| {
             if (!idsEqual(node.id, id)) continue;
-            if (self.diagram.family == .state and node.group == group and node.region != region and
-                kind != .start and kind != .end)
-            {
+            if (node.kind == .er_group) {
                 self.supported = false;
                 return null;
             }
-            if (self.diagram.family == .er) {
-                if (kind == .er_group) {
-                    if (node.kind == .er_group) return index;
-                    if (node.kind != .entity) continue;
-                    if (self.declared[index]) {
-                        self.supported = false;
-                        return null;
-                    }
-                    node.label = label;
-                    node.kind = .er_group;
-                    node.group = group;
-                    node.region = region;
-                    self.declared[index] = true;
-                    return index;
-                }
-                if (node.kind == .er_group) {
-                    if (explicit) self.supported = false;
-                    return if (explicit) null else index;
-                }
-                if (node.kind != .entity) continue;
-                if (explicit) {
-                    node.label = label;
-                    node.group = group;
-                    node.region = region;
-                    self.declared[index] = true;
-                }
-                return index;
-            }
-            const matches = switch (self.diagram.family) {
-                .state => node.group == group and node.region == region,
-                .class => if (kind == .namespace)
-                    node.kind == .namespace and node.group == group
-                else
-                    node.kind != .namespace,
-                .er => unreachable,
-            };
-            if (!matches) continue;
-            if (explicit) {
-                node.label = label;
-                self.declared[index] = true;
-                if (node.kind != .composite and node.kind != .namespace) node.kind = kind;
-                if (self.diagram.family == .class and kind != .namespace) {
-                    node.group = group;
-                    node.region = region;
-                }
-            }
+            if (node.kind != .entity) continue;
+            node.label = label;
+            node.group = group;
+            node.region = region;
+            self.declared[index] = true;
             return index;
         }
+        return self.appendNode(id, label, .entity, group, region, true);
+    }
+
+    fn declareErGroup(self: *Parser, id: []const u8, label: []const u8) ?usize {
+        const group = self.currentGroup();
+        const region = self.currentRegion();
+        for (self.diagram.nodes[0..self.diagram.node_count], 0..) |*node, index| {
+            if (!idsEqual(node.id, id)) continue;
+            if (node.kind == .er_group) return index;
+            if (node.kind != .entity) continue;
+            if (self.declared[index]) {
+                self.supported = false;
+                return null;
+            }
+            node.label = label;
+            node.kind = .er_group;
+            node.group = group;
+            node.region = region;
+            self.declared[index] = true;
+            return index;
+        }
+        return self.appendNode(id, label, .er_group, group, region, true);
+    }
+
+    fn appendNode(
+        self: *Parser,
+        id: []const u8,
+        label: []const u8,
+        kind: NodeKind,
+        group: ?usize,
+        region: usize,
+        declared: bool,
+    ) ?usize {
         if (self.diagram.node_count >= max_nodes) {
             self.diagram.degraded = true;
             return null;
@@ -615,7 +663,7 @@ const Parser = struct {
             .group = group,
             .region = region,
         };
-        self.declared[index] = explicit;
+        self.declared[index] = declared;
         self.diagram.node_count += 1;
         return index;
     }
