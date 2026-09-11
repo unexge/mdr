@@ -11,20 +11,7 @@ const vaxis = @import("vaxis");
 
 pub const max_rows = 200;
 
-const Bounds = struct {
-    x1: usize,
-    y1: usize,
-    x2: usize,
-    y2: usize,
-
-    fn width(self: Bounds) usize {
-        return self.x2 - self.x1 + 1;
-    }
-
-    fn height(self: Bounds) usize {
-        return self.y2 - self.y1 + 1;
-    }
-};
+const Bounds = geometry.Bounds;
 
 pub fn layout(win: ?vaxis.Window, flow: *const Mermaid.Flowchart, start_row: usize, skip: usize, width: usize) ?usize {
     if (flow.needsHierarchicalLayout() or hasCycle(flow)) {
@@ -74,7 +61,7 @@ fn hasCycle(flow: *const Mermaid.Flowchart) bool {
 
 const max_hierarchy_items = Mermaid.max_nodes + Mermaid.max_subgraphs;
 
-const Size = struct { width: usize, height: usize };
+const Size = geometry.Size;
 
 const HierarchyItem = union(enum) {
     node: usize,
@@ -87,32 +74,8 @@ const HierarchyEndpoint = struct {
     node: ?usize = null,
 };
 
-const HierarchySegment = struct {
-    r1: usize,
-    c1: usize,
-    r2: usize,
-    c2: usize,
-    glyph: []const u8,
-};
-
-const HierarchyPath = struct {
-    segments: [3]HierarchySegment = undefined,
-    count: usize = 0,
-    src_at: CellPos,
-    dst_at: CellPos,
-    src_arrow: []const u8,
-    dst_arrow: []const u8,
-    src_line: []const u8,
-    dst_line: []const u8,
-    label: ?LabelAt = null,
-
-    fn add(self: *HierarchyPath, segment: HierarchySegment) void {
-        if ((segment.r1 > segment.r2 and segment.c1 == segment.c2) or
-            (segment.c1 > segment.c2 and segment.r1 == segment.r2)) return;
-        self.segments[self.count] = segment;
-        self.count += 1;
-    }
-};
+const HierarchySegment = geometry.Segment;
+const HierarchyPath = geometry.Path;
 
 fn hierarchyGap(flow: *const Mermaid.Flowchart) usize {
     var min_length: usize = 1;
@@ -325,7 +288,7 @@ const Hierarchy = struct {
         const dx = if (source_center.c > destination_center.c) source_center.c - destination_center.c else destination_center.c - source_center.c;
         const dy = if (source_center.r > destination_center.r) source_center.r - destination_center.r else destination_center.r - source_center.r;
         var path: HierarchyPath = undefined;
-        path.count = 0;
+        path.segment_count = 0;
         path.label = null;
         if (dx >= dy) {
             const right = destination_center.c > source_center.c;
@@ -374,7 +337,7 @@ const Hierarchy = struct {
     }
 
     fn pathIntersectsNode(self: *const Hierarchy, path: HierarchyPath, source: HierarchyEndpoint, destination: HierarchyEndpoint) bool {
-        for (path.segments[0..path.count]) |segment| {
+        for (path.segments[0..path.segment_count]) |segment| {
             for (self.flow.nodeList(), 0..) |_, index| {
                 if (source.node == index or destination.node == index) continue;
                 if (segmentIntersectsBounds(segment, self.node_bounds[index])) return true;
@@ -384,27 +347,7 @@ const Hierarchy = struct {
     }
 
     fn routeSelf(self: *const Hierarchy, edge: *const Mermaid.Edge, target: HierarchyEndpoint) ?HierarchyPath {
-        const bounds = target.bounds;
-        const center = CellPos{ .r = (bounds.y1 + bounds.y2) / 2, .c = (bounds.x1 + bounds.x2) / 2 };
-        const source = CellPos{ .r = bounds.y2 + 1, .c = center.c };
-        const destination = CellPos{ .r = center.r, .c = bounds.x2 + 1 };
-        if (source.r >= self.rows or destination.c >= self.cols) return null;
-        var path: HierarchyPath = undefined;
-        path.count = 0;
-        path.src_at = source;
-        path.dst_at = destination;
-        path.src_arrow = "▲";
-        path.dst_arrow = "◄";
-        path.src_line = "│";
-        path.dst_line = "─";
-        path.label = if (edge.label) |label| .{
-            .r = source.r,
-            .c = bounds.x1 + 1,
-            .text = label,
-        } else null;
-        path.add(.{ .r1 = source.r, .c1 = source.c, .r2 = source.r, .c2 = destination.c, .glyph = "─" });
-        path.add(.{ .r1 = destination.r, .c1 = destination.c, .r2 = source.r, .c2 = destination.c, .glyph = "│" });
-        return path;
+        return geometry.selfPath(target.bounds, edge.label, self.rows, self.cols);
     }
 
     fn routeDetour(
@@ -417,7 +360,7 @@ const Hierarchy = struct {
         const source_center = CellPos{ .r = (source.bounds.y1 + source.bounds.y2) / 2, .c = (source.bounds.x1 + source.bounds.x2) / 2 };
         const destination_center = CellPos{ .r = (destination.bounds.y1 + destination.bounds.y2) / 2, .c = (destination.bounds.x1 + destination.bounds.x2) / 2 };
         var path: HierarchyPath = undefined;
-        path.count = 0;
+        path.segment_count = 0;
         path.label = null;
         if (vertical) {
             const src_at = CellPos{ .r = source_center.r, .c = source.bounds.x2 + 1 };
@@ -467,7 +410,7 @@ const Hierarchy = struct {
         for (self.flow.edgeList()) |*edge| {
             if (edge.style == .invisible) continue;
             const path = self.route(edge) orelse continue;
-            for (path.segments[0..path.count]) |segment|
+            for (path.segments[0..path.segment_count]) |segment|
                 drawStyledSegment(win, segment.r1, segment.c1, segment.r2, segment.c2, segment.glyph, edge.style, start_row, skip);
             drawMarker(win, path.src_at, edge.src_marker, path.src_arrow, path.src_line, edge.style, start_row, skip);
             drawMarker(win, path.dst_at, edge.dst_marker, path.dst_arrow, path.dst_line, edge.style, start_row, skip);
@@ -1181,20 +1124,7 @@ const Grid = struct {
 
 fn drawFrame(win: vaxis.Window, bounds: Bounds, label: []const u8, start_row: usize, skip: usize) void {
     const style: vaxis.Style = .{ .dim = true };
-    cells.putLine(win, bounds.y1, bounds.x1, start_row, skip, "┌", style);
-    cells.putLine(win, bounds.y1, bounds.x2, start_row, skip, "┐", style);
-    cells.putLine(win, bounds.y2, bounds.x1, start_row, skip, "└", style);
-    cells.putLine(win, bounds.y2, bounds.x2, start_row, skip, "┘", style);
-    var col = bounds.x1 + 1;
-    while (col < bounds.x2) : (col += 1) {
-        cells.putLine(win, bounds.y1, col, start_row, skip, "─", style);
-        cells.putLine(win, bounds.y2, col, start_row, skip, "─", style);
-    }
-    var row = bounds.y1 + 1;
-    while (row < bounds.y2) : (row += 1) {
-        cells.putLine(win, row, bounds.x1, start_row, skip, "│", style);
-        cells.putLine(win, row, bounds.x2, start_row, skip, "│", style);
-    }
+    geometry.drawFrame(win, bounds, cells.square, style, true, start_row, skip);
     cells.putText(win, bounds.y1, bounds.x1 + 2, start_row, skip, label, bounds.x2 - 1, style);
 }
 
@@ -1265,25 +1195,22 @@ fn drawStyledSegment(
     start_row: usize,
     skip: usize,
 ) void {
-    if (edge_style == .invisible) return;
-    const horizontal = r1 == r2;
-    const straight = (horizontal and mem.eql(u8, glyph, "─")) or (!horizontal and mem.eql(u8, glyph, "│"));
-    var row = r1;
-    var col = c1;
-    while (true) {
-        if (!straight or edge_style == .solid) {
-            cells.putLine(win, row, col, start_row, skip, glyph, .{});
-        } else if (edge_style == .dotted) {
-            if (horizontal)
-                cells.putDotted(win, row, col, start_row, skip, .{})
-            else
-                cells.putDottedVertical(win, row, col, start_row, skip, .{});
-        } else {
-            cells.putHeavy(win, row, col, start_row, skip, horizontal, .{});
-        }
-        if (row == r2 and col == c2) break;
-        if (horizontal) col += 1 else row += 1;
-    }
+    geometry.drawSegment(
+        win,
+        .{ .r1 = r1, .c1 = c1, .r2 = r2, .c2 = c2, .glyph = glyph },
+        strokeOf(edge_style),
+        start_row,
+        skip,
+    );
+}
+
+fn strokeOf(style: Mermaid.EdgeStyle) geometry.Stroke {
+    return switch (style) {
+        .solid => .solid,
+        .dotted => .dotted,
+        .thick => .heavy,
+        .invisible => .hidden,
+    };
 }
 
 fn drawMarker(win: vaxis.Window, pos: CellPos, marker: Mermaid.EdgeMarker, arrow: []const u8, line: []const u8, edge_style: Mermaid.EdgeStyle, start_row: usize, skip: usize) void {
@@ -1295,25 +1222,9 @@ fn drawMarker(win: vaxis.Window, pos: CellPos, marker: Mermaid.EdgeMarker, arrow
     }
 }
 
-fn reverseArrow(arrow: []const u8) []const u8 {
-    if (mem.eql(u8, arrow, "▼")) return "▲";
-    if (mem.eql(u8, arrow, "▲")) return "▼";
-    if (mem.eql(u8, arrow, "►")) return "◄";
-    return "►";
-}
-
-const Seg = struct {
-    r1: usize,
-    c1: usize,
-    r2: usize,
-    c2: usize,
-    glyph: []const u8,
-};
-
-const CellPos = struct {
-    r: usize,
-    c: usize,
-};
+const reverseArrow = geometry.reverseArrow;
+const Seg = geometry.Segment;
+const CellPos = geometry.CellPos;
 
 const Walk = struct {
     segs: [10]Seg = undefined,
@@ -1339,11 +1250,7 @@ const Walk = struct {
     }
 };
 
-const LabelAt = struct {
-    r: usize,
-    c: usize,
-    text: []const u8,
-};
+const LabelAt = geometry.LabelAt;
 
 fn nodeIndex(flow: *const Mermaid.Flowchart, id: []const u8) ?usize {
     for (flow.nodeList(), 0..) |*node, i| {
@@ -1354,6 +1261,7 @@ fn nodeIndex(flow: *const Mermaid.Flowchart, id: []const u8) ?usize {
 
 const std = @import("std");
 const mem = std.mem;
+const geometry = @import("diagram_geometry.zig");
 
 test "chain renders boxes joined by arrows" {
     var flow = Mermaid.parseText("graph TD\nA-->B-->C\n").?;

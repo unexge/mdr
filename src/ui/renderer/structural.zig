@@ -2,67 +2,10 @@
 
 pub const max_rows = 200;
 
-const Bounds = struct {
-    x1: usize,
-    y1: usize,
-    x2: usize,
-    y2: usize,
-
-    fn width(self: Bounds) usize {
-        return self.x2 - self.x1 + 1;
-    }
-
-    fn height(self: Bounds) usize {
-        return self.y2 - self.y1 + 1;
-    }
-};
-
-const Size = struct {
-    width: usize,
-    height: usize,
-};
-
-const CellPos = struct {
-    r: usize,
-    c: usize,
-};
-
-const Segment = struct {
-    r1: usize,
-    c1: usize,
-    r2: usize,
-    c2: usize,
-};
-
-const LabelAt = struct {
-    r: usize,
-    c: usize,
-    text: []const u8,
-};
-
-const Path = struct {
-    segments: [3]Segment = undefined,
-    segment_count: usize = 0,
-    src_at: CellPos,
-    dst_at: CellPos,
-    src_arrow: []const u8,
-    dst_arrow: []const u8,
-    src_line: []const u8,
-    dst_line: []const u8,
-    label: ?LabelAt = null,
-
-    fn horizontal(self: *Path, row: usize, first: usize, last: usize) void {
-        if (first > last or self.segment_count >= self.segments.len) return;
-        self.segments[self.segment_count] = .{ .r1 = row, .c1 = first, .r2 = row, .c2 = last };
-        self.segment_count += 1;
-    }
-
-    fn vertical(self: *Path, column: usize, first: usize, last: usize) void {
-        if (first > last or self.segment_count >= self.segments.len) return;
-        self.segments[self.segment_count] = .{ .r1 = first, .c1 = column, .r2 = last, .c2 = column };
-        self.segment_count += 1;
-    }
-};
+const Bounds = geometry.Bounds;
+const Size = geometry.Size;
+const CellPos = geometry.CellPos;
+const Path = geometry.Path;
 
 pub fn layout(
     win: ?vaxis.Window,
@@ -438,23 +381,7 @@ const Layout = struct {
     }
 
     fn routeSelf(self: *const Layout, node: usize, label: ?[]const u8) ?Path {
-        const bounds = self.bounds[node];
-        const center = CellPos{ .r = (bounds.y1 + bounds.y2) / 2, .c = (bounds.x1 + bounds.x2) / 2 };
-        const source = CellPos{ .r = bounds.y2 + 1, .c = center.c };
-        const destination = CellPos{ .r = center.r, .c = bounds.x2 + 1 };
-        if (source.r >= self.rows or destination.c >= self.cols) return null;
-        var path: Path = undefined;
-        path.segment_count = 0;
-        path.src_at = source;
-        path.dst_at = destination;
-        path.src_arrow = "▲";
-        path.dst_arrow = "◄";
-        path.src_line = "│";
-        path.dst_line = "─";
-        path.label = if (label) |text| .{ .r = source.r, .c = bounds.x1 + 1, .text = text } else null;
-        path.horizontal(source.r, source.c, destination.c);
-        path.vertical(destination.c, destination.r, source.r);
-        return path;
+        return geometry.selfPath(self.bounds[node], label, self.rows, self.cols);
     }
 
     fn draw(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
@@ -469,7 +396,7 @@ const Layout = struct {
         for (self.diagram.relationList()) |*relation| {
             const path = self.route(relation) orelse continue;
             for (path.segments[0..path.segment_count]) |segment| {
-                drawSegment(win, segment, relation.style, start_row, skip);
+                geometry.drawSegment(win, segment, strokeOf(relation.style), start_row, skip);
             }
             drawMarker(win, path.src_at, relation.src_marker, path.src_arrow, path.src_line, start_row, skip);
             drawMarker(win, path.dst_at, relation.dst_marker, path.dst_arrow, path.dst_line, start_row, skip);
@@ -603,18 +530,7 @@ fn drawBoxFrame(
     start_row: usize,
     skip: usize,
 ) void {
-    cells.putRaw(win, bounds.y1, bounds.x1, start_row, skip, corners[0], .{});
-    cells.putRaw(win, bounds.y1, bounds.x2, start_row, skip, corners[1], .{});
-    cells.putRaw(win, bounds.y2, bounds.x1, start_row, skip, corners[2], .{});
-    cells.putRaw(win, bounds.y2, bounds.x2, start_row, skip, corners[3], .{});
-    for (bounds.x1 + 1..bounds.x2) |column| {
-        cells.putRaw(win, bounds.y1, column, start_row, skip, "─", .{});
-        cells.putRaw(win, bounds.y2, column, start_row, skip, "─", .{});
-    }
-    for (bounds.y1 + 1..bounds.y2) |row| {
-        cells.putRaw(win, row, bounds.x1, start_row, skip, "│", .{});
-        cells.putRaw(win, row, bounds.x2, start_row, skip, "│", .{});
-    }
+    geometry.drawFrame(win, bounds, corners, .{}, false, start_row, skip);
 }
 
 fn drawGroupFrame(
@@ -627,18 +543,7 @@ fn drawGroupFrame(
 ) void {
     const style: vaxis.Style = .{ .dim = true };
     const corners = if (kind == .composite) cells.round else cells.square;
-    cells.putRaw(win, bounds.y1, bounds.x1, start_row, skip, corners[0], style);
-    cells.putRaw(win, bounds.y1, bounds.x2, start_row, skip, corners[1], style);
-    cells.putRaw(win, bounds.y2, bounds.x1, start_row, skip, corners[2], style);
-    cells.putRaw(win, bounds.y2, bounds.x2, start_row, skip, corners[3], style);
-    for (bounds.x1 + 1..bounds.x2) |column| {
-        cells.putRaw(win, bounds.y1, column, start_row, skip, "─", style);
-        cells.putRaw(win, bounds.y2, column, start_row, skip, "─", style);
-    }
-    for (bounds.y1 + 1..bounds.y2) |row| {
-        cells.putRaw(win, row, bounds.x1, start_row, skip, "│", style);
-        cells.putRaw(win, row, bounds.x2, start_row, skip, "│", style);
-    }
+    geometry.drawFrame(win, bounds, corners, style, false, start_row, skip);
     cells.putText(win, bounds.y1, bounds.x1 + 2, start_row, skip, label, bounds.x2 - 1, .{ .bold = true, .dim = true });
 }
 
@@ -655,27 +560,11 @@ fn drawDivider(win: vaxis.Window, bounds: Bounds, row: usize, start_row: usize, 
     for (bounds.x1 + 1..bounds.x2) |column| cells.putRaw(win, row, column, start_row, skip, "─", .{});
 }
 
-fn drawSegment(
-    win: vaxis.Window,
-    segment: Segment,
-    style: Structural.LineStyle,
-    start_row: usize,
-    skip: usize,
-) void {
-    const horizontal = segment.r1 == segment.r2;
-    var row = segment.r1;
-    var column = segment.c1;
-    while (true) {
-        if (style == .solid) {
-            cells.putLine(win, row, column, start_row, skip, if (horizontal) "─" else "│", .{});
-        } else if (horizontal) {
-            cells.putDotted(win, row, column, start_row, skip, .{});
-        } else {
-            cells.putDottedVertical(win, row, column, start_row, skip, .{});
-        }
-        if (row == segment.r2 and column == segment.c2) break;
-        if (horizontal) column += 1 else row += 1;
-    }
+fn strokeOf(style: Structural.LineStyle) geometry.Stroke {
+    return switch (style) {
+        .solid => .solid,
+        .dotted => .dotted,
+    };
 }
 
 fn drawMarker(
@@ -710,6 +599,7 @@ const std = @import("std");
 const mem = std.mem;
 const Structural = @import("../../mermaid/structural.zig");
 const cells = @import("cells.zig");
+const geometry = @import("diagram_geometry.zig");
 const vaxis = @import("vaxis");
 
 test "class diagrams render member compartments and inheritance" {
