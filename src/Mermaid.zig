@@ -1,4 +1,4 @@
-//! Zero-copy Mermaid flowchart and sequence diagram parsers.
+//! Zero-copy Mermaid flowchart, sequence, and structural diagram parsers.
 //!
 //! parseBlock borrows a fenced code block; every slice in the returned
 //! Flowchart points into the block content. There is no allocation. Unsupported
@@ -2031,6 +2031,8 @@ fn normalizeMessageText(raw: []const u8) []const u8 {
     }
     return text;
 }
+
+pub const Structural = @import("MermaidStructural.zig");
 
 const std = @import("std");
 const Document = @import("Document.zig");

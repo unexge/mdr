@@ -95,6 +95,37 @@ title: Service exchange
     end
 ```
 
+```mermaid
+classDiagram
+direction LR
+class User {
+  +String name
+  +login()
+}
+User "1" --> "*" Session : opens
+```
+
+```mermaid
+stateDiagram-v2
+direction LR
+[*] --> Idle
+Idle --> Active : wake
+Active --> Idle : sleep
+Active --> [*]
+```
+
+```mermaid
+erDiagram
+direction LR
+CUSTOMER ||--o{ ORDER : places
+CUSTOMER {
+  string id PK
+}
+ORDER {
+  int total
+}
+```
+
 ---
 
 ## Unicode

@@ -50,15 +50,14 @@ Measuring and rendering are the same walk: a null window counts rows
 without writing, so the two can never disagree. Each block kind owns a
 `renderer/` submodule dispatched from `Renderer.zig`.
 
-Mermaid fences dispatch twice: `Mermaid.parseBlock` (flowcharts) then
-`Mermaid.parseSequenceBlock` (sequences). Both parsers are zero-copy
-with bounded tables. They reject the whole diagram when a statement is
-unsupported instead of rendering a partial result. Anything unsupported,
-over capacity, unrouteable, or wider than the viewport degrades back to the
-code card instead of failing. Acyclic flowcharts without subgraphs use ranked
-layout; subgraphs and cyclic flowcharts use a bounded recursive hierarchy
-layout with obstacle detours.
-Sequence
+Mermaid fences dispatch to bounded zero-copy parsers for flowcharts,
+sequences, and structural diagrams (class, state, and ER). They reject the
+whole diagram when a statement is unsupported instead of rendering a partial
+result. Anything unsupported, over capacity, unrouteable, or wider than the
+viewport degrades back to the code card instead of failing. Acyclic flowcharts
+without subgraphs use ranked layout; subgraphs and cyclic flowcharts use a
+bounded hierarchy layout with obstacle detours. Class, state, and ER diagrams
+share a compartment-aware structural renderer. Sequence
 participant groups, lifecycle positions, activation stacks, numbering state,
 and message metadata are fixed parser state from which header and lifeline rows
 are derived. Diagram text streams into measured lines without allocating, so

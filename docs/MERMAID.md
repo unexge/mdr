@@ -60,8 +60,63 @@ Falls back:
 - Actor creation or destruction without an immediately matching message
 - Browser-only popup menus, CSS styling, and JavaScript callbacks
 
-Other Mermaid diagram families, including class, state, ER, Gantt, pie, Git,
-mindmap, and timeline diagrams, fall back to the code card.
+## Class diagrams
 
-A supported diagram also falls back when it exceeds the bounded parser tables,
-a route cannot be placed, or the result does not fit the viewport.
+Supported:
+
+- `classDiagram` declarations, labels, escaped names, annotations, and generic names
+- Attributes and operations declared with `:` or multiline `{ ... }` bodies
+- Solid and dotted inheritance, realization, composition, aggregation,
+  association, dependency, two-way inheritance, and lollipop relationships
+- Relationship labels and endpoint cardinalities
+- `TB`, `TD`, `BT`, `LR`, and `RL` directions
+- `style`, `classDef`, and `cssClass` declarations accepted using the active terminal theme
+- `%%` comments, frontmatter, and configuration directives
+
+Falls back:
+
+- Namespaces, notes, interactions, callbacks, and links
+- Inline member bodies and semicolon-separated statements
+
+## State diagrams
+
+Supported:
+
+- `stateDiagram` and `stateDiagram-v2`
+- Plain states, quoted descriptions with aliases, and `id: description` declarations
+- Labeled transitions, including cycles, backward transitions, and self-transitions
+- Start and end states plus choice, fork, and join states
+- Single-line notes attached to the left or right of a state
+- `TB`, `TD`, `BT`, `LR`, and `RL` directions
+- Style and class assignments accepted using the active terminal theme
+- `%%` comments, frontmatter, configuration, and accessibility directives
+
+Falls back:
+
+- Composite states, concurrency regions, and multiline notes
+
+## Entity-relationship diagrams
+
+Supported:
+
+- `erDiagram` entities, quoted names, aliases, and multiline attribute bodies
+- Attribute types, keys, and comments rendered verbatim
+- Symbolic crow's-foot cardinalities with identifying and non-identifying links
+- Relationship labels and `TB`, `TD`, `BT`, `LR`, and `RL` directions
+- Style and class assignments accepted using the active terminal theme
+- `%%` comments, frontmatter, and configuration directives
+
+Falls back:
+
+- Textual relationship aliases such as `one or more`
+- ER subgraphs
+
+Other Mermaid diagram families, including Gantt, pie, Git, mindmap, timeline,
+quadrant, requirement, block, and architecture diagrams, fall back to the code card.
+
+A supported flowchart falls back above 64 nodes, 128 edges, 16 subgraphs, or
+8 nested subgraphs. A supported sequence falls back above 32 participants,
+128 messages, 32 notes, 16 fragments, 8 nested fragments, 64 activations, or
+16 participant boxes. Class, state, and ER diagrams fall back above 64 nodes,
+256 detail lines, or 128 relationships. All diagrams fall back when they exceed
+200 terminal rows, a route cannot be placed, or the result does not fit the viewport.

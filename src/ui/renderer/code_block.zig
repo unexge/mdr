@@ -1,7 +1,7 @@
 //! Fenced code blocks: verbatim lines hard-wrapped at the window width,
 //! rendered as a card with a filled background and the info string dimmed
-//! above the content. Mermaid diagrams dispatch to mermaid.zig and
-//! sequence.zig and fall back to the card when they cannot render.
+//! above the content. Mermaid diagrams dispatch to diagram renderers and
+//! fall back to the card when they cannot render.
 
 const card_style: vaxis.Style = .{ .bg = Theme.panel };
 const info_style: vaxis.Style = .{ .fg = Theme.muted, .bg = Theme.panel };
@@ -44,6 +44,9 @@ pub fn layoutSyntax(
             }
             if (Mermaid.parseSequenceBlock(cb)) |seq| {
                 if (sequence.layout(win, &seq, start_row, skip, width)) |after| return after;
+            }
+            if (Mermaid.Structural.parseBlock(cb)) |diagram| {
+                if (structural.layout(win, &diagram, start_row, skip, width)) |after| return after;
             }
         }
     }
@@ -221,6 +224,7 @@ const Search = @import("../Search.zig");
 const Syntax = @import("../Syntax.zig");
 const mermaid = @import("mermaid.zig");
 const sequence = @import("sequence.zig");
+const structural = @import("structural.zig");
 const Theme = @import("../Theme.zig");
 const vaxis = @import("vaxis");
 
@@ -299,6 +303,31 @@ test "sequence diagrams render lifelines" {
     try testing.expectEqualStrings("┌", win.readCell(0, 0).?.char.grapheme);
     try testing.expectEqualStrings("│", win.readCell(2, 3).?.char.grapheme);
     try testing.expectEqualStrings("►", win.readCell(10, 4).?.char.grapheme);
+}
+
+test "class state and er diagrams render as diagrams" {
+    const cases = [_]struct { source: []const u8, corner: []const u8 }{
+        .{ .source = "classDiagram\nclass A\n", .corner = "┌" },
+        .{ .source = "stateDiagram-v2\nA\n", .corner = "╭" },
+        .{ .source = "erDiagram\nA\n", .corner = "┌" },
+    };
+    for (cases) |case| {
+        const diagram: Document.Element.CodeBlock = .{ .info = .{ .mermaid = "mermaid" }, .content = case.source };
+        const rows = layout(null, diagram, 0, 0, 40);
+        var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(rows), .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(testing.allocator);
+        const win: vaxis.Window = .{
+            .x_off = 0,
+            .y_off = 0,
+            .parent_x_off = 0,
+            .parent_y_off = 0,
+            .width = 40,
+            .height = @intCast(rows),
+            .screen = &screen,
+        };
+        _ = layout(win, diagram, 0, 0, 40);
+        try testing.expectEqualStrings(case.corner, win.readCell(1, 1).?.char.grapheme);
+    }
 }
 
 test "counts the info line and wrapped content lines" {
