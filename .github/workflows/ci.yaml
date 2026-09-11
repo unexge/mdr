@@ -25,7 +25,7 @@ jobs:
       - name: Bombadil
         uses: antithesishq/bombadil-action@v2
         with:
-          version: 0.7.3
+          version: 0.7.4
           driver: terminal
           command: ./zig-out/bin/mdr ./bombadil/fixture.md
           specification: ./bombadil/mdr.ts
