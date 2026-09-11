@@ -110,6 +110,11 @@ stateDiagram-v2
 direction LR
 [*] --> Idle
 Idle --> Active : wake
+state Active {
+  direction LR
+  [*] --> Working
+  Working --> [*]
+}
 Active --> Idle : sleep
 Active --> [*]
 ```

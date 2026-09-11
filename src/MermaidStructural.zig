@@ -3,10 +3,12 @@
 pub const max_nodes = 64;
 pub const max_details = 256;
 pub const max_relations = 128;
+pub const max_groups = 16;
+pub const max_group_depth = 8;
 
 pub const Family = enum { class, state, er };
 pub const Direction = enum { tb, bt, lr, rl };
-pub const NodeKind = enum { class, state, entity, start, end, choice, fork, join };
+pub const NodeKind = enum { class, state, entity, start, end, choice, fork, join, composite };
 pub const DetailKind = enum { annotation, attribute, operation, field, note };
 pub const LineStyle = enum { solid, dotted };
 pub const Marker = enum {
@@ -27,6 +29,12 @@ pub const Node = struct {
     label: []const u8,
     kind: NodeKind,
     order: usize,
+    group: ?usize = null,
+};
+
+pub const Group = struct {
+    node: usize,
+    direction: ?Direction = null,
 };
 
 pub const Detail = struct {
@@ -55,6 +63,8 @@ pub const Diagram = struct {
     detail_count: usize = 0,
     relations: [max_relations]Relation = undefined,
     relation_count: usize = 0,
+    groups: [max_groups]Group = undefined,
+    group_count: usize = 0,
     degraded: bool = false,
 
     pub fn nodeList(self: *const Diagram) []const Node {
@@ -67,6 +77,17 @@ pub const Diagram = struct {
 
     pub fn relationList(self: *const Diagram) []const Relation {
         return self.relations[0..self.relation_count];
+    }
+
+    pub fn groupList(self: *const Diagram) []const Group {
+        return self.groups[0..self.group_count];
+    }
+
+    pub fn groupForNode(self: *const Diagram, node: usize) ?usize {
+        for (self.groupList(), 0..) |group, index| {
+            if (group.node == node) return index;
+        }
+        return null;
     }
 };
 
@@ -96,9 +117,22 @@ const Parser = struct {
     supported: bool = true,
     reading_frontmatter: bool = false,
     open_node: ?usize = null,
+    group_stack: [max_group_depth]usize = undefined,
+    group_stack_len: usize = 0,
 
     fn result(self: *Parser) ?Diagram {
-        if (!self.seen_header or !self.supported or self.reading_frontmatter or self.open_node != null) return null;
+        if (!self.seen_header or !self.supported or self.reading_frontmatter or
+            self.open_node != null or self.group_stack_len != 0) return null;
+        for (self.diagram.groupList(), 0..) |_, group| {
+            var has_child = false;
+            for (self.diagram.nodeList()) |node| {
+                if (node.group == group) {
+                    has_child = true;
+                    break;
+                }
+            }
+            if (!has_child) return null;
+        }
         return self.diagram;
     }
 
@@ -237,7 +271,15 @@ const Parser = struct {
 
     fn feedState(self: *Parser, line: []const u8) void {
         if (self.feedDirection(line) or ignoreStyle(line) or stripKeyword(line, "class") != null or metadataLine(line)) return;
-        if (mem.eql(u8, line, "--") or mem.indexOfScalar(u8, line, '{') != null or mem.eql(u8, line, "}")) {
+        if (mem.eql(u8, line, "}")) {
+            if (self.group_stack_len == 0) {
+                self.supported = false;
+            } else {
+                self.group_stack_len -= 1;
+            }
+            return;
+        }
+        if (mem.eql(u8, line, "--")) {
             self.supported = false;
             return;
         }
@@ -249,6 +291,10 @@ const Parser = struct {
         }
         if (stripKeyword(line, "state")) |declaration| {
             self.stateDeclaration(declaration);
+            return;
+        }
+        if (mem.indexOfScalar(u8, line, '{') != null) {
+            self.supported = false;
             return;
         }
         if (stripKeyword(line, "note")) |note| {
@@ -286,7 +332,9 @@ const Parser = struct {
     }
 
     fn stateDeclaration(self: *Parser, raw: []const u8) void {
-        const declaration = mem.trim(u8, raw, " \t");
+        var declaration = mem.trim(u8, raw, " \t");
+        const opens = mem.endsWith(u8, declaration, "{");
+        if (opens) declaration = mem.trim(u8, declaration[0 .. declaration.len - 1], " \t");
         if (declaration.len == 0) {
             self.supported = false;
             return;
@@ -304,7 +352,11 @@ const Parser = struct {
                 self.supported = false;
                 return;
             };
-            _ = self.intern(name.id, declaration[1..close], .state, true);
+            if (opens) {
+                self.openComposite(name.id, declaration[1..close], true);
+            } else {
+                _ = self.intern(name.id, declaration[1..close], .state, true);
+            }
             return;
         }
         const stereotype = mem.indexOf(u8, declaration, "<<");
@@ -312,6 +364,14 @@ const Parser = struct {
             self.supported = false;
             return;
         };
+        if (opens) {
+            if (stereotype != null) {
+                self.supported = false;
+                return;
+            }
+            self.openComposite(name.id, name.label, !mem.eql(u8, name.id, name.label));
+            return;
+        }
         var kind: NodeKind = .state;
         if (stereotype) |start| {
             const annotation = mem.trim(u8, declaration[start..], " \t");
@@ -378,19 +438,48 @@ const Parser = struct {
 
     fn feedDirection(self: *Parser, line: []const u8) bool {
         const raw = stripKeyword(line, "direction") orelse return false;
-        self.diagram.direction = parseDirection(raw) orelse {
+        const direction = parseDirection(raw) orelse {
             self.supported = false;
             return true;
         };
+        if (self.diagram.family == .state and self.currentGroup() != null) {
+            self.diagram.groups[self.currentGroup().?].direction = direction;
+        } else {
+            self.diagram.direction = direction;
+        }
         return true;
     }
 
+    fn openComposite(self: *Parser, id: []const u8, label: []const u8, label_explicit: bool) void {
+        if (self.diagram.group_count >= max_groups or self.group_stack_len >= self.group_stack.len) {
+            self.diagram.degraded = true;
+            return;
+        }
+        const node = self.intern(id, label, .composite, label_explicit) orelse return;
+        if (self.diagram.groupForNode(node) != null) {
+            self.supported = false;
+            return;
+        }
+        self.diagram.nodes[node].kind = .composite;
+        const group = self.diagram.group_count;
+        self.diagram.groups[group] = .{ .node = node };
+        self.diagram.group_count += 1;
+        self.group_stack[self.group_stack_len] = group;
+        self.group_stack_len += 1;
+    }
+
+    fn currentGroup(self: *const Parser) ?usize {
+        if (self.group_stack_len == 0) return null;
+        return self.group_stack[self.group_stack_len - 1];
+    }
+
     fn intern(self: *Parser, id: []const u8, label: []const u8, kind: NodeKind, explicit: bool) ?usize {
+        const group = if (self.diagram.family == .state) self.currentGroup() else null;
         for (self.diagram.nodes[0..self.diagram.node_count], 0..) |*node, index| {
-            if (!idsEqual(node.id, id)) continue;
+            if (node.group != group or !idsEqual(node.id, id)) continue;
             if (explicit) {
                 node.label = label;
-                node.kind = kind;
+                if (node.kind != .composite) node.kind = kind;
             }
             return index;
         }
@@ -399,7 +488,7 @@ const Parser = struct {
             return null;
         }
         const index = self.diagram.node_count;
-        self.diagram.nodes[index] = .{ .id = id, .label = label, .kind = kind, .order = index };
+        self.diagram.nodes[index] = .{ .id = id, .label = label, .kind = kind, .order = index, .group = group };
         self.diagram.node_count += 1;
         return index;
     }
@@ -872,6 +961,37 @@ test "state diagrams preserve special states choices notes and cycles" {
     try testing.expect(diagram.details[0].kind == .note);
 }
 
+test "state diagrams parse nested composite states" {
+    const diagram = parseText(
+        "stateDiagram-v2\n" ++
+            "[*] --> First\n" ++
+            "First: Outer state\n" ++
+            "state First {\n" ++
+            "direction LR\n" ++
+            "[*] --> Second\n" ++
+            "state \"Inner state\" as Second {\n" ++
+            "[*] --> Idle\n" ++
+            "Idle --> [*]\n" ++
+            "}\n" ++
+            "Second --> [*]\n" ++
+            "}\n" ++
+            "First: Renamed outer\n" ++
+            "First --> [*]\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 2), diagram.group_count);
+    try testing.expectEqual(@as(usize, 9), diagram.node_count);
+    try testing.expectEqual(@as(usize, 6), diagram.relation_count);
+    try testing.expectEqualStrings("Renamed outer", diagram.nodes[diagram.groups[0].node].label);
+    try testing.expectEqualStrings("Inner state", diagram.nodes[diagram.groups[1].node].label);
+    try testing.expect(diagram.nodes[diagram.groups[0].node].group == null);
+    try testing.expectEqual(@as(?usize, 0), diagram.nodes[diagram.groups[1].node].group);
+    try testing.expectEqual(@as(?Direction, .lr), diagram.groups[0].direction);
+    try testing.expect(diagram.groups[1].direction == null);
+    try testing.expectEqual(diagram.groups[0].node, diagram.relations[0].dst);
+    try testing.expectEqual(diagram.groups[1].node, diagram.relations[1].dst);
+    try testing.expect(diagram.relations[0].src != diagram.relations[1].src);
+}
+
 test "er diagrams preserve attributes and crow foot cardinalities" {
     const diagram = parseText(
         "erDiagram\n" ++
@@ -913,6 +1033,7 @@ test "structural parser rejects unsupported blocks and unclosed bodies" {
     try testing.expect(parseText("pie\ntitle Pets\n") == null);
     try testing.expect(parseText("classDiagram\nnamespace Models {\n") == null);
     try testing.expect(parseText("stateDiagram-v2\nstate Parent {\n") == null);
+    try testing.expect(parseText("stateDiagram-v2\nstate Parent {\nA\n--\nB\n}\n") == null);
     try testing.expect(parseText("erDiagram\nCUSTOMER {\nstring id\n") == null);
 }
 

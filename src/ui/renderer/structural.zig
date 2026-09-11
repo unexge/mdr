@@ -17,6 +17,11 @@ const Bounds = struct {
     }
 };
 
+const Size = struct {
+    width: usize,
+    height: usize,
+};
+
 const CellPos = struct {
     r: usize,
     c: usize,
@@ -78,7 +83,7 @@ const Layout = struct {
     widths: [Structural.max_nodes]usize,
     heights: [Structural.max_nodes]usize,
     bounds: [Structural.max_nodes]Bounds,
-    vertical_flow: bool,
+    group_directions: [Structural.max_groups]Structural.Direction,
     rows: usize,
     cols: usize,
 
@@ -89,78 +94,84 @@ const Layout = struct {
             .widths = [_]usize{0} ** Structural.max_nodes,
             .heights = [_]usize{0} ** Structural.max_nodes,
             .bounds = undefined,
-            .vertical_flow = diagram.direction == .tb or diagram.direction == .bt,
+            .group_directions = undefined,
             .rows = 0,
             .cols = 0,
         };
-        var max_node_width: usize = 0;
-        var max_node_height: usize = 0;
-        for (diagram.nodeList(), 0..) |node, index| {
-            const size = result.nodeSize(index, node);
-            result.widths[index] = size.width;
-            result.heights[index] = size.height;
-            max_node_width = @max(max_node_width, size.width);
-            max_node_height = @max(max_node_height, size.height);
-        }
+        const content = result.measureItems(null, diagram.direction) orelse return null;
         const relation_text_width = result.maxRelationTextWidth();
-        if (result.vertical_flow) {
-            const gap: usize = 3;
-            var content_height: usize = 0;
-            for (result.heights[0..diagram.node_count]) |height| content_height += height;
-            content_height += gap * (diagram.node_count - 1);
-            result.rows = content_height + 2;
-            result.cols = max_node_width + 2 + relation_text_width + @intFromBool(relation_text_width > 0);
-            if (result.rows > max_rows or result.cols > width) return null;
-            var cursor: usize = if (diagram.direction == .tb) 1 else result.rows - 1;
-            for (0..diagram.node_count) |index| {
-                const height = result.heights[index];
-                const y = if (diagram.direction == .tb) cursor else cursor - height;
-                const x = 1 + (max_node_width - result.widths[index]) / 2;
-                result.bounds[index] = .{
-                    .x1 = x,
-                    .y1 = y,
-                    .x2 = x + result.widths[index] - 1,
-                    .y2 = y + height - 1,
-                };
-                if (diagram.direction == .tb) cursor += height + gap else cursor = y -| gap;
-            }
-        } else {
-            const gap = result.horizontalGap();
-            var content_width: usize = 0;
-            for (result.widths[0..diagram.node_count]) |node_width| content_width += node_width;
-            content_width += gap * (diagram.node_count - 1);
-            result.cols = content_width + 2;
-            result.rows = max_node_height + 3;
-            if (result.rows > max_rows or result.cols > width) return null;
-            var cursor: usize = if (diagram.direction == .lr) 1 else result.cols - 1;
-            for (0..diagram.node_count) |index| {
-                const node_width = result.widths[index];
-                const x = if (diagram.direction == .lr) cursor else cursor - node_width;
-                const y = 1 + (max_node_height - result.heights[index]) / 2;
-                result.bounds[index] = .{
-                    .x1 = x,
-                    .y1 = y,
-                    .x2 = x + node_width - 1,
-                    .y2 = y + result.heights[index] - 1,
-                };
-                if (diagram.direction == .lr) cursor += node_width + gap else cursor = x -| gap;
-            }
-        }
+        const has_vertical = result.hasDirection(true);
+        const has_horizontal = result.hasDirection(false);
+        result.rows = content.height + 2 + @intFromBool(has_horizontal);
+        result.cols = content.width + 2 + if (has_vertical)
+            relation_text_width + @intFromBool(relation_text_width > 0)
+        else
+            0;
+        if (result.rows > max_rows or result.cols > width) return null;
+        result.placeItems(null, diagram.direction, .{
+            .x1 = 1,
+            .y1 = 1,
+            .x2 = content.width,
+            .y2 = content.height,
+        });
         for (diagram.relationList()) |*relation| _ = result.route(relation) orelse return null;
         return result;
     }
 
-    fn nodeSize(self: *const Layout, index: usize, node: Structural.Node) struct { width: usize, height: usize } {
-        var self_label_width: usize = 0;
+    fn measureItems(self: *Layout, parent: ?usize, direction: Structural.Direction) ?Size {
+        var count: usize = 0;
+        var primary: usize = 0;
+        var cross: usize = 0;
+        const vertical = isVertical(direction);
+        for (self.diagram.nodeList(), 0..) |_, index| {
+            if (self.diagram.nodes[index].group != parent) continue;
+            const size = self.measureNode(index, direction) orelse return null;
+            primary += if (vertical) size.height else size.width;
+            cross = @max(cross, if (vertical) size.width else size.height);
+            count += 1;
+        }
+        if (count == 0) return null;
+        primary += self.itemGap(direction) * (count - 1);
+        return if (vertical)
+            .{ .width = cross, .height = primary }
+        else
+            .{ .width = primary, .height = cross };
+    }
+
+    fn measureNode(self: *Layout, index: usize, parent_direction: Structural.Direction) ?Size {
+        const node = self.diagram.nodes[index];
+        const size = if (node.kind == .composite) composite: {
+            const group = self.diagram.groupForNode(index) orelse return null;
+            const direction = self.diagram.groups[group].direction orelse parent_direction;
+            self.group_directions[group] = direction;
+            const content = self.measureItems(group, direction) orelse return null;
+            break :composite Size{
+                .width = @max(@max(content.width + 3, cells.maxLineWidth(node.label) + 4), self.selfLabelWidth(index) + 2),
+                .height = content.height + 4,
+            };
+        } else self.leafSize(index, node);
+        self.widths[index] = size.width;
+        self.heights[index] = size.height;
+        return size;
+    }
+
+    fn selfLabelWidth(self: *const Layout, index: usize) usize {
+        var width: usize = 0;
         for (self.diagram.relationList()) |relation| {
             if (relation.src != index or relation.dst != index or relation.label == null) continue;
-            self_label_width = @max(self_label_width, cells.maxLineWidth(relation.label.?));
+            width = @max(width, cells.maxLineWidth(relation.label.?));
         }
+        return width;
+    }
+
+    fn leafSize(self: *const Layout, index: usize, node: Structural.Node) Size {
+        const self_label_width = self.selfLabelWidth(index);
         switch (node.kind) {
             .start, .end => return .{ .width = 1, .height = 1 },
             .fork, .join => return .{ .width = @max(self_label_width + 2, 7), .height = 1 },
             .choice => return .{ .width = @max(@max(cells.maxLineWidth(node.label) + 4, self_label_width + 2), 5), .height = 3 },
             .class, .state, .entity => {},
+            .composite => unreachable,
         }
         var box_width = @max(@max(cells.maxLineWidth(node.label) + 4, self_label_width + 2), 5);
         var detail_rows: usize = 0;
@@ -181,6 +192,59 @@ const Layout = struct {
         };
     }
 
+    fn placeItems(self: *Layout, parent: ?usize, direction: Structural.Direction, area: Bounds) void {
+        const vertical = isVertical(direction);
+        const forward = direction == .tb or direction == .lr;
+        var primary: usize = 0;
+        var count: usize = 0;
+        for (self.diagram.nodeList(), 0..) |node, index| {
+            if (node.group != parent) continue;
+            primary += if (vertical) self.heights[index] else self.widths[index];
+            count += 1;
+        }
+        primary += self.itemGap(direction) * (count - 1);
+        var cursor = if (vertical)
+            area.y1 + (area.height() - primary) / 2
+        else
+            area.x1 + (area.width() - primary) / 2;
+        if (!forward) cursor += primary;
+        for (self.diagram.nodeList(), 0..) |node, index| {
+            if (node.group != parent) continue;
+            const item_primary = if (vertical) self.heights[index] else self.widths[index];
+            const position = if (forward) cursor else cursor - item_primary;
+            const x = if (vertical) area.x1 + (area.width() - self.widths[index]) / 2 else position;
+            const y = if (vertical) position else area.y1 + (area.height() - self.heights[index]) / 2;
+            self.bounds[index] = .{
+                .x1 = x,
+                .y1 = y,
+                .x2 = x + self.widths[index] - 1,
+                .y2 = y + self.heights[index] - 1,
+            };
+            if (node.kind == .composite) {
+                const group = self.diagram.groupForNode(index) orelse unreachable;
+                self.placeItems(group, self.group_directions[group], .{
+                    .x1 = x + 1,
+                    .y1 = y + 2,
+                    .x2 = x + self.widths[index] - 2,
+                    .y2 = y + self.heights[index] - 2,
+                });
+            }
+            if (forward) cursor += item_primary + self.itemGap(direction) else cursor = position -| self.itemGap(direction);
+        }
+    }
+
+    fn itemGap(self: *const Layout, direction: Structural.Direction) usize {
+        return if (isVertical(direction)) 3 else self.horizontalGap();
+    }
+
+    fn hasDirection(self: *const Layout, vertical: bool) bool {
+        if (isVertical(self.diagram.direction) == vertical) return true;
+        for (self.group_directions[0..self.diagram.group_count]) |direction| {
+            if (isVertical(direction) == vertical) return true;
+        }
+        return false;
+    }
+
     fn maxRelationTextWidth(self: *const Layout) usize {
         var widest: usize = 0;
         for (self.diagram.relationList()) |relation| {
@@ -194,6 +258,7 @@ const Layout = struct {
     fn horizontalGap(self: *const Layout) usize {
         var gap: usize = 4;
         for (self.diagram.relationList()) |relation| {
+            if (!self.areForwardAdjacent(relation.src, relation.dst)) continue;
             var width: usize = 4;
             if (relation.label) |label| width += cells.maxLineWidth(label);
             if (relation.src_label) |label| width += cells.maxLineWidth(label);
@@ -206,11 +271,8 @@ const Layout = struct {
     fn route(self: *const Layout, relation: *const Structural.Relation) ?Path {
         if (relation.src >= self.diagram.node_count or relation.dst >= self.diagram.node_count) return null;
         if (relation.src == relation.dst) return self.routeSelf(relation.src, relation.label);
-        const adjacent = if (relation.src < relation.dst)
-            relation.dst - relation.src == 1
-        else
-            false;
-        if (!adjacent) return self.routeOuter(relation);
+        const direction = self.relationDirection(relation);
+        if (!self.areForwardAdjacent(relation.src, relation.dst)) return self.routeOuter(relation, direction);
         const source = self.bounds[relation.src];
         const destination = self.bounds[relation.dst];
         const source_center = CellPos{ .r = (source.y1 + source.y2) / 2, .c = (source.x1 + source.x2) / 2 };
@@ -218,7 +280,7 @@ const Layout = struct {
         var path: Path = undefined;
         path.segment_count = 0;
         path.label = null;
-        if (self.vertical_flow) {
+        if (isVertical(direction)) {
             const down = destination_center.r > source_center.r;
             path.src_at = .{ .r = if (down) source.y2 + 1 else source.y1 - 1, .c = source_center.c };
             path.dst_at = .{ .r = if (down) destination.y1 - 1 else destination.y2 + 1, .c = destination_center.c };
@@ -257,7 +319,28 @@ const Layout = struct {
         return path;
     }
 
-    fn routeOuter(self: *const Layout, relation: *const Structural.Relation) ?Path {
+    fn relationDirection(self: *const Layout, relation: *const Structural.Relation) Structural.Direction {
+        const group = self.diagram.nodes[relation.src].group;
+        if (group != self.diagram.nodes[relation.dst].group) return self.diagram.direction;
+        return if (group) |index| self.group_directions[index] else self.diagram.direction;
+    }
+
+    fn areForwardAdjacent(self: *const Layout, source: usize, destination: usize) bool {
+        const source_node = self.diagram.nodes[source];
+        const destination_node = self.diagram.nodes[destination];
+        if (source_node.group != destination_node.group or source_node.order >= destination_node.order) return false;
+        for (self.diagram.nodeList(), 0..) |node, index| {
+            if (index == source or index == destination or node.group != source_node.group) continue;
+            if (node.order > source_node.order and node.order < destination_node.order) return false;
+        }
+        return true;
+    }
+
+    fn routeOuter(
+        self: *const Layout,
+        relation: *const Structural.Relation,
+        direction: Structural.Direction,
+    ) ?Path {
         const source = self.bounds[relation.src];
         const destination = self.bounds[relation.dst];
         const source_center = CellPos{ .r = (source.y1 + source.y2) / 2, .c = (source.x1 + source.x2) / 2 };
@@ -265,7 +348,7 @@ const Layout = struct {
         var path: Path = undefined;
         path.segment_count = 0;
         path.label = null;
-        if (self.vertical_flow) {
+        if (isVertical(direction)) {
             const lane = self.cols - 1;
             path.src_at = .{ .r = source_center.r, .c = source.x2 + 1 };
             path.dst_at = .{ .r = destination_center.r, .c = destination.x2 + 1 };
@@ -326,7 +409,13 @@ const Layout = struct {
     }
 
     fn draw(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
-        for (self.diagram.nodeList(), 0..) |node, index| self.drawNode(win, index, node, start_row, skip);
+        for (self.diagram.groupList()) |group| {
+            const node = self.diagram.nodes[group.node];
+            drawGroupFrame(win, self.bounds[group.node], node.label, start_row, skip);
+        }
+        for (self.diagram.nodeList(), 0..) |node, index| {
+            if (node.kind != .composite) self.drawNode(win, index, node, start_row, skip);
+        }
         for (self.diagram.relationList()) |*relation| {
             const path = self.route(relation) orelse continue;
             for (path.segments[0..path.segment_count]) |segment| {
@@ -359,6 +448,7 @@ const Layout = struct {
                 return;
             },
             .class, .state, .entity, .choice => {},
+            .composite => return,
         }
         for (0..bounds.height()) |row| {
             for (0..bounds.width()) |column| cells.putRaw(win, bounds.y1 + row, bounds.x1 + column, start_row, skip, " ", .{});
@@ -366,7 +456,8 @@ const Layout = struct {
         const corners = switch (node.kind) {
             .state => cells.round,
             .choice => cells.diamond,
-            else => cells.square,
+            .class, .entity => cells.square,
+            .start, .end, .fork, .join, .composite => unreachable,
         };
         drawBoxFrame(win, bounds, corners, start_row, skip);
         const title_width = cells.maxLineWidth(node.label);
@@ -419,6 +510,10 @@ const Layout = struct {
     }
 };
 
+fn isVertical(direction: Structural.Direction) bool {
+    return direction == .tb or direction == .bt;
+}
+
 fn endpointLabelWidth(label: ?[]const u8) usize {
     return if (label) |text| cells.maxLineWidth(text) else 0;
 }
@@ -451,6 +546,29 @@ fn drawBoxFrame(
         cells.putRaw(win, row, bounds.x1, start_row, skip, "│", .{});
         cells.putRaw(win, row, bounds.x2, start_row, skip, "│", .{});
     }
+}
+
+fn drawGroupFrame(
+    win: vaxis.Window,
+    bounds: Bounds,
+    label: []const u8,
+    start_row: usize,
+    skip: usize,
+) void {
+    const style: vaxis.Style = .{ .dim = true };
+    cells.putRaw(win, bounds.y1, bounds.x1, start_row, skip, "╭", style);
+    cells.putRaw(win, bounds.y1, bounds.x2, start_row, skip, "╮", style);
+    cells.putRaw(win, bounds.y2, bounds.x1, start_row, skip, "╰", style);
+    cells.putRaw(win, bounds.y2, bounds.x2, start_row, skip, "╯", style);
+    for (bounds.x1 + 1..bounds.x2) |column| {
+        cells.putRaw(win, bounds.y1, column, start_row, skip, "─", style);
+        cells.putRaw(win, bounds.y2, column, start_row, skip, "─", style);
+    }
+    for (bounds.y1 + 1..bounds.y2) |row| {
+        cells.putRaw(win, row, bounds.x1, start_row, skip, "│", style);
+        cells.putRaw(win, row, bounds.x2, start_row, skip, "│", style);
+    }
+    cells.putText(win, bounds.y1, bounds.x1 + 2, start_row, skip, label, bounds.x2 - 1, .{ .bold = true, .dim = true });
 }
 
 fn drawDivider(win: vaxis.Window, bounds: Bounds, row: usize, start_row: usize, skip: usize) void {
@@ -555,6 +673,47 @@ test "state diagrams render terminal states choices and backward transitions" {
     try testing.expect(findGlyph(win, "◉") != null);
     try testing.expect(findGlyph(win, "◇") != null);
     try testing.expect(findGlyph(win, "◄") != null);
+}
+
+test "nested composite states render framed local layouts" {
+    var diagram = Structural.parseText(
+        "stateDiagram-v2\n" ++
+            "[*] --> First\n" ++
+            "First: Outer state\n" ++
+            "state First {\n" ++
+            "direction LR\n" ++
+            "[*] --> Second\n" ++
+            "state Second {\n" ++
+            "[*] --> Idle\n" ++
+            "Idle --> Idle : wait\n" ++
+            "Idle --> [*]\n" ++
+            "}\n" ++
+            "Second --> Second : retry nested composite\n" ++
+            "Second --> [*]\n" ++
+            "}\n" ++
+            "First --> [*]\n",
+    ).?;
+    const computed = Layout.compute(&diagram, 80).?;
+    const outer = computed.bounds[diagram.groups[0].node];
+    const inner = computed.bounds[diagram.groups[1].node];
+    try testing.expect(outer.x1 < inner.x1 and inner.x2 < outer.x2);
+    try testing.expect(outer.y1 < inner.y1 and inner.y2 < outer.y2);
+    try testing.expect(inner.width() >= cells.maxLineWidth("retry nested composite") + 2);
+    try testing.expect((computed.bounds[2].y1 + computed.bounds[2].y2) / 2 ==
+        (computed.bounds[3].y1 + computed.bounds[3].y2) / 2);
+    try testing.expect(computed.bounds[2].x1 < computed.bounds[3].x1);
+    try testing.expect((computed.bounds[4].y1 + computed.bounds[4].y2) / 2 ==
+        (computed.bounds[5].y1 + computed.bounds[5].y2) / 2);
+    try testing.expect(computed.bounds[4].x1 < computed.bounds[5].x1);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(computed.rows), .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &diagram, 0, 0, 80).?;
+    try testing.expect(win.readCell(@intCast(outer.x1), @intCast(outer.y1)).?.style.dim);
+    try testing.expectEqualStrings("╯", win.readCell(@intCast(inner.x2), @intCast(inner.y2)).?.char.grapheme);
+    try testing.expect(findGlyph(win, "●") != null);
+    try testing.expect(findGlyph(win, "◉") != null);
 }
 
 test "horizontal choice self-transition labels fit" {
