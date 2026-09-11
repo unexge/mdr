@@ -12,6 +12,7 @@ Requires Zig 0.17.0-dev.27+0dd99c37c.
 ```sh
 zig build            # produces zig-out/bin/mdr
 zig build test       # unit tests
+zig build benchmark-mermaid -Doptimize=ReleaseFast
 zig fmt .            # format before committing
 
 mdr <file.md>

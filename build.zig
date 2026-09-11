@@ -203,6 +203,18 @@ pub fn build(b: *std.Build) void {
     const bombadil_step = b.step("bombadil", "Run Bombadil terminal property tests");
     bombadil_step.dependOn(&addBombadilTest(b, exe).step);
 
+    const benchmark = b.addExecutable(.{
+        .name = "benchmark-mermaid",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark_mermaid.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vaxis", .module = vaxis_dep.module("vaxis") }},
+        }),
+    });
+    const benchmark_step = b.step("benchmark-mermaid", "Benchmark Mermaid parsing and layout");
+    benchmark_step.dependOn(&b.addRunArtifact(benchmark).step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
