@@ -156,7 +156,7 @@ const SeqParser = struct {
     reading_accessibility_description: bool = false,
     reading_frontmatter: bool = false,
 
-    fn feed(self: *SeqParser, raw: []const u8) void {
+    pub fn feed(self: *SeqParser, raw: []const u8) void {
         const raw_trimmed = mem.trim(u8, raw, " \t\r");
         if (isConfigDirective(raw_trimmed)) {
             self.feedStatement(raw_trimmed);
@@ -724,15 +724,6 @@ fn isEntitySemicolon(text: []const u8, semicolon: usize) bool {
     return start > 0 and (text[start - 1] == '#' or text[start - 1] == '&');
 }
 
-fn boundary(s: []const u8, n: usize) bool {
-    return s.len == n or s[n] == ' ' or s[n] == '\t';
-}
-
-fn stripKeyword(s: []const u8, kw: []const u8) ?[]const u8 {
-    if (s.len < kw.len or !eqlIgnoreCase(s[0..kw.len], kw) or !boundary(s, kw.len)) return null;
-    return mem.trim(u8, s[kw.len..], " \t");
-}
-
 fn parseAutonumber(raw: []const u8) ?Autonumber {
     const options = mem.trim(u8, raw, " \t");
     if (options.len == 0) return .{ .start = 100, .increment = 100 };
@@ -1054,38 +1045,13 @@ fn normalizeMessageText(raw: []const u8) []const u8 {
     return text;
 }
 
-fn feedLines(parser: anytype, text: []const u8) void {
-    var rest = text;
-    while (rest.len > 0) {
-        const nl = mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        parser.feed(rest[0..nl]);
-        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
-    }
-}
-
-fn isComment(line: []const u8) bool {
-    return mem.startsWith(u8, line, "%%") and !mem.startsWith(u8, line, "%%{");
-}
-
-fn isConfigDirective(line: []const u8) bool {
-    return mem.startsWith(u8, line, "%%{") and mem.endsWith(u8, line, "}%%");
-}
-
-fn metadataValue(raw: []const u8) ?[]const u8 {
-    const value = mem.trim(u8, raw, " \t\r");
-    if (value.len == 0) return null;
-    if (value[0] != '"') return value;
-    if (value.len < 2 or value[value.len - 1] != '"') return null;
-    return value[1 .. value.len - 1];
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (ascii.toLower(x) != ascii.toLower(y)) return false;
-    }
-    return true;
-}
+const common = @import("common.zig");
+const feedLines = common.feedLines;
+const isComment = common.isComment;
+const isConfigDirective = common.isConfigDirective;
+const metadataValue = common.metadataValue;
+const stripKeyword = common.stripKeyword;
+const eqlIgnoreCase = common.eqlIgnoreCase;
 
 const std = @import("std");
 const Document = @import("../Document.zig");

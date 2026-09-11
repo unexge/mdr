@@ -5,7 +5,7 @@ pub const max_edges = 128;
 pub const max_subgraphs = 16;
 pub const max_subgraph_depth = 8;
 
-pub const Direction = enum { tb, bt, lr, rl };
+pub const Direction = common.Direction;
 
 pub const Shape = enum {
     rect,
@@ -117,23 +117,6 @@ pub fn parseText(text: []const u8) ?Flowchart {
     return parser.flow;
 }
 
-fn feedLines(parser: anytype, text: []const u8) void {
-    var rest = text;
-    while (rest.len > 0) {
-        const nl = mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-        parser.feed(rest[0..nl]);
-        rest = if (nl < rest.len) rest[nl + 1 ..] else "";
-    }
-}
-
-fn isComment(line: []const u8) bool {
-    return mem.startsWith(u8, line, "%%") and !mem.startsWith(u8, line, "%%{");
-}
-
-fn isConfigDirective(line: []const u8) bool {
-    return mem.startsWith(u8, line, "%%{") and mem.endsWith(u8, line, "}%%");
-}
-
 const Parser = struct {
     flow: Flowchart = .{},
     seen_header: bool = false,
@@ -145,7 +128,7 @@ const Parser = struct {
     pending_depth: usize = 0,
     pending_quoted: bool = false,
 
-    fn feed(self: *Parser, raw: []const u8) void {
+    pub fn feed(self: *Parser, raw: []const u8) void {
         const trimmed = mem.trim(u8, raw, " \t\r");
         if (self.pending_start == null and isComment(trimmed)) {
             self.feedComplete(trimmed);
@@ -469,14 +452,6 @@ fn parseHeader(line: []const u8) ?Direction {
     return direction;
 }
 
-fn parseDirection(raw: []const u8) ?Direction {
-    if (eqlIgnoreCase(raw, "TD") or eqlIgnoreCase(raw, "TB")) return .tb;
-    if (eqlIgnoreCase(raw, "BT")) return .bt;
-    if (eqlIgnoreCase(raw, "LR")) return .lr;
-    if (eqlIgnoreCase(raw, "RL")) return .rl;
-    return null;
-}
-
 fn isKeywordLine(line: []const u8, keyword: []const u8) bool {
     if (!mem.startsWith(u8, line, keyword)) return false;
     if (line.len == keyword.len) return true;
@@ -605,14 +580,6 @@ fn parseNodeMetadata(id: []const u8, raw: []const u8) ?Node {
     const node_shape = shape orelse return null;
     const node_label = normalizeLabel(label orelse id);
     return .{ .id = id, .label = if (node_label.len == 0) id else node_label, .shape = node_shape };
-}
-
-fn metadataValue(raw: []const u8) ?[]const u8 {
-    const value = mem.trim(u8, raw, " \t\r");
-    if (value.len == 0) return null;
-    if (value[0] != '"') return value;
-    if (value.len < 2 or value[value.len - 1] != '"') return null;
-    return value[1 .. value.len - 1];
 }
 
 fn parseShapeName(name: []const u8) ?Shape {
@@ -965,13 +932,12 @@ fn opAt(line: []const u8, at: usize, token: Token) FoundOp {
     };
 }
 
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (ascii.toLower(x) != ascii.toLower(y)) return false;
-    }
-    return true;
-}
+const common = @import("common.zig");
+const feedLines = common.feedLines;
+const isComment = common.isComment;
+const parseDirection = common.parseDirection;
+const metadataValue = common.metadataValue;
+const eqlIgnoreCase = common.eqlIgnoreCase;
 
 const std = @import("std");
 const Document = @import("../Document.zig");

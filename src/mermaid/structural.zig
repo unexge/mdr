@@ -8,7 +8,7 @@ pub const max_group_depth = 8;
 pub const max_regions_per_group = 8;
 
 pub const Family = enum { class, state, er };
-pub const Direction = enum { tb, bt, lr, rl };
+pub const Direction = common.Direction;
 pub const NodeKind = enum { class, state, entity, start, end, choice, fork, join, composite, namespace, er_group };
 pub const DetailKind = enum { annotation, attribute, operation, field, note };
 pub const LineStyle = enum { solid, dotted };
@@ -917,15 +917,6 @@ fn erRightMarker(raw: []const u8) ?Marker {
     return null;
 }
 
-fn parseDirection(raw: []const u8) ?Direction {
-    const direction = mem.trim(u8, raw, " \t");
-    if (eqlIgnoreCase(direction, "TB") or eqlIgnoreCase(direction, "TD")) return .tb;
-    if (eqlIgnoreCase(direction, "BT")) return .bt;
-    if (eqlIgnoreCase(direction, "LR")) return .lr;
-    if (eqlIgnoreCase(direction, "RL")) return .rl;
-    return null;
-}
-
 fn ignoreStyle(line: []const u8) bool {
     for ([_][]const u8{ "style", "classDef", "cssClass" }) |keyword| {
         if (stripKeyword(line, keyword) != null) return true;
@@ -945,12 +936,6 @@ fn isAnnotation(line: []const u8) bool {
     return line.len >= 4 and mem.startsWith(u8, line, "<<") and mem.endsWith(u8, line, ">>");
 }
 
-fn stripKeyword(line: []const u8, keyword: []const u8) ?[]const u8 {
-    if (line.len < keyword.len or !eqlIgnoreCase(line[0..keyword.len], keyword)) return null;
-    if (line.len > keyword.len and line[keyword.len] != ' ' and line[keyword.len] != '\t') return null;
-    return mem.trim(u8, line[keyword.len..], " \t");
-}
-
 fn stripComment(line: []const u8) []const u8 {
     var quoted: u8 = 0;
     var index: usize = 0;
@@ -962,10 +947,6 @@ fn stripComment(line: []const u8) []const u8 {
         if (quoted == 0 and line[index] == '%' and line[index + 1] == '%') return line[0..index];
     }
     return line;
-}
-
-fn isConfigDirective(line: []const u8) bool {
-    return mem.startsWith(u8, line, "%%{") and mem.endsWith(u8, line, "}%%");
 }
 
 fn findTokenOutsideQuotes(line: []const u8, token: []const u8) ?usize {
@@ -1003,18 +984,15 @@ fn closingQuote(line: []const u8, start: usize) ?usize {
     return null;
 }
 
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |actual, expected| {
-        if (ascii.toLower(actual) != ascii.toLower(expected)) return false;
-    }
-    return true;
-}
+const common = @import("common.zig");
+const parseDirection = common.parseDirection;
+const stripKeyword = common.stripKeyword;
+const isConfigDirective = common.isConfigDirective;
+const eqlIgnoreCase = common.eqlIgnoreCase;
 
 const std = @import("std");
 const Document = @import("../Document.zig");
 const mem = std.mem;
-const ascii = std.ascii;
 
 test "class diagrams preserve members relationships and cardinalities" {
     const diagram = parseText(
