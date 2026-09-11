@@ -8,7 +8,7 @@ pub const max_group_depth = 8;
 
 pub const Family = enum { class, state, er };
 pub const Direction = enum { tb, bt, lr, rl };
-pub const NodeKind = enum { class, state, entity, start, end, choice, fork, join, composite, namespace };
+pub const NodeKind = enum { class, state, entity, start, end, choice, fork, join, composite, namespace, er_group };
 pub const DetailKind = enum { annotation, attribute, operation, field, note };
 pub const LineStyle = enum { solid, dotted };
 pub const Marker = enum {
@@ -119,6 +119,7 @@ const Parser = struct {
     open_node: ?usize = null,
     group_stack: [max_group_depth]usize = undefined,
     group_stack_len: usize = 0,
+    declared: [max_nodes]bool = [_]bool{false} ** max_nodes,
 
     fn result(self: *Parser) ?Diagram {
         if (!self.seen_header or !self.supported or self.reading_frontmatter or
@@ -429,8 +430,16 @@ const Parser = struct {
 
     fn feedEr(self: *Parser, line: []const u8) void {
         if (self.feedDirection(line) or ignoreStyle(line) or stripKeyword(line, "class") != null) return;
-        if (stripKeyword(line, "subgraph") != null or eqlIgnoreCase(line, "end")) {
-            self.supported = false;
+        if (stripKeyword(line, "subgraph")) |declaration| {
+            const name = parseName(declaration) orelse {
+                self.supported = false;
+                return;
+            };
+            self.openGroup(name.id, name.label, .er_group, true);
+            return;
+        }
+        if (eqlIgnoreCase(line, "end")) {
+            self.closeGroup();
             return;
         }
         if (parseErRelation(line)) |relation| {
@@ -463,7 +472,7 @@ const Parser = struct {
             self.supported = false;
             return true;
         };
-        if (self.diagram.family == .state and self.currentGroup() != null) {
+        if ((self.diagram.family == .state or self.diagram.family == .er) and self.currentGroup() != null) {
             self.diagram.groups[self.currentGroup().?].direction = direction;
         } else {
             self.diagram.direction = direction;
@@ -488,6 +497,7 @@ const Parser = struct {
             return;
         }
         self.diagram.nodes[node].kind = kind;
+        self.declared[node] = true;
         const group = self.diagram.group_count;
         self.diagram.groups[group] = .{ .node = node };
         self.diagram.group_count += 1;
@@ -509,19 +519,47 @@ const Parser = struct {
     }
 
     fn intern(self: *Parser, id: []const u8, label: []const u8, kind: NodeKind, explicit: bool) ?usize {
-        const group = if (self.diagram.family == .er) null else self.currentGroup();
+        const group = self.currentGroup();
         for (self.diagram.nodes[0..self.diagram.node_count], 0..) |*node, index| {
+            if (!idsEqual(node.id, id)) continue;
+            if (self.diagram.family == .er) {
+                if (kind == .er_group) {
+                    if (node.kind == .er_group) return index;
+                    if (node.kind != .entity) continue;
+                    if (self.declared[index]) {
+                        self.supported = false;
+                        return null;
+                    }
+                    node.label = label;
+                    node.kind = .er_group;
+                    node.group = group;
+                    self.declared[index] = true;
+                    return index;
+                }
+                if (node.kind == .er_group) {
+                    if (explicit) self.supported = false;
+                    return if (explicit) null else index;
+                }
+                if (node.kind != .entity) continue;
+                if (explicit) {
+                    node.label = label;
+                    node.group = group;
+                    self.declared[index] = true;
+                }
+                return index;
+            }
             const matches = switch (self.diagram.family) {
-                .state => node.group == group and idsEqual(node.id, id),
+                .state => node.group == group,
                 .class => if (kind == .namespace)
-                    node.kind == .namespace and node.group == group and idsEqual(node.id, id)
+                    node.kind == .namespace and node.group == group
                 else
-                    node.kind != .namespace and idsEqual(node.id, id),
-                .er => idsEqual(node.id, id),
+                    node.kind != .namespace,
+                .er => unreachable,
             };
             if (!matches) continue;
             if (explicit) {
                 node.label = label;
+                self.declared[index] = true;
                 if (node.kind != .composite and node.kind != .namespace) node.kind = kind;
                 if (self.diagram.family == .class and kind != .namespace) node.group = group;
             }
@@ -532,7 +570,14 @@ const Parser = struct {
             return null;
         }
         const index = self.diagram.node_count;
-        self.diagram.nodes[index] = .{ .id = id, .label = label, .kind = kind, .order = index, .group = group };
+        self.diagram.nodes[index] = .{
+            .id = id,
+            .label = label,
+            .kind = kind,
+            .order = index,
+            .group = group,
+        };
+        self.declared[index] = explicit;
         self.diagram.node_count += 1;
         return index;
     }
@@ -1084,6 +1129,37 @@ test "er diagrams preserve attributes and crow foot cardinalities" {
     try testing.expectEqualStrings("places", diagram.relations[0].label.?);
 }
 
+test "er diagrams parse nested subgraphs and group relationships" {
+    const diagram = parseText(
+        "erDiagram\n" ++
+            "direction LR\n" ++
+            "sales ||--|| support : collaborates\n" ++
+            "subgraph sales [Sales Domain]\n" ++
+            "direction TB\n" ++
+            "CUSTOMER ||--o{ ORDER : places\n" ++
+            "subgraph fulfillment\n" ++
+            "SHIPMENT ||--|{ ITEM : contains\n" ++
+            "end\n" ++
+            "end\n" ++
+            "subgraph support\n" ++
+            "AGENT\n" ++
+            "end\n" ++
+            "support ||--o{ ITEM : handles\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 3), diagram.group_count);
+    try testing.expectEqual(@as(usize, 8), diagram.node_count);
+    try testing.expectEqual(@as(usize, 4), diagram.relation_count);
+    try testing.expect(diagram.nodes[diagram.groups[0].node].kind == .er_group);
+    try testing.expectEqualStrings("Sales Domain", diagram.nodes[diagram.groups[0].node].label);
+    try testing.expectEqual(@as(?usize, 0), diagram.nodes[diagram.groups[1].node].group);
+    try testing.expect(diagram.nodes[diagram.groups[2].node].group == null);
+    try testing.expectEqual(@as(?Direction, .tb), diagram.groups[0].direction);
+    try testing.expectEqual(diagram.groups[0].node, diagram.relations[0].src);
+    try testing.expectEqual(diagram.groups[2].node, diagram.relations[0].dst);
+    try testing.expectEqual(diagram.groups[2].node, diagram.relations[3].src);
+    try testing.expectEqual(@as(?usize, 1), diagram.nodes[diagram.relations[3].dst].group);
+}
+
 test "er cardinality forms map endpoint markers" {
     const diagram = parseText(
         "erDiagram\n" ++
@@ -1107,6 +1183,8 @@ test "structural parser rejects unsupported blocks and unclosed bodies" {
     try testing.expect(parseText("stateDiagram-v2\nstate Parent {\n") == null);
     try testing.expect(parseText("stateDiagram-v2\nstate Parent {\nA\n--\nB\n}\n") == null);
     try testing.expect(parseText("erDiagram\nCUSTOMER {\nstring id\n") == null);
+    try testing.expect(parseText("erDiagram\nsales\nsubgraph sales\nCUSTOMER\nend\n") == null);
+    try testing.expect(parseText("erDiagram\nsubgraph sales\nCUSTOMER\n") == null);
 }
 
 const testing = std.testing;

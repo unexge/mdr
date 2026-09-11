@@ -127,13 +127,22 @@ Active --> [*]
 ```mermaid
 erDiagram
 direction LR
-CUSTOMER ||--o{ ORDER : places
-CUSTOMER {
-  string id PK
-}
-ORDER {
-  int total
-}
+subgraph commerce ["Commerce Domain"]
+  direction TB
+  CUSTOMER ||--o{ ORDER : places
+  CUSTOMER {
+    string id PK
+  }
+  subgraph purchasing
+    ORDER {
+      int total
+    }
+  end
+end
+subgraph fulfillment
+  SHIPMENT
+end
+commerce ||--|| fulfillment : coordinates
 ```
 
 ---

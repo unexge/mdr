@@ -106,13 +106,14 @@ Supported:
 - Attribute types, keys, and comments rendered verbatim
 - Symbolic crow's-foot cardinalities with identifying and non-identifying links
 - Relationship labels and `TB`, `TD`, `BT`, `LR`, and `RL` directions
+- Labeled and nested subgraphs with local directions
+- Relationships between subgraphs and between subgraphs and entities
 - Style and class assignments accepted using the active terminal theme
 - `%%` comments, frontmatter, and configuration directives
 
 Falls back:
 
 - Textual relationship aliases such as `one or more`
-- ER subgraphs
 
 Other Mermaid diagram families, including Gantt, pie, Git, mindmap, timeline,
 quadrant, requirement, block, and architecture diagrams, fall back to the code card.
@@ -121,7 +122,8 @@ A supported flowchart falls back above 64 nodes, 128 edges, 16 subgraphs, or
 8 nested subgraphs. A supported sequence falls back above 32 participants,
 128 messages, 32 notes, 16 fragments, 8 nested fragments, 64 activations, or
 16 participant boxes. Class, state, and ER diagrams fall back above 64 nodes,
-256 detail lines, or 128 relationships. Class namespaces and state composites
-are limited to 16 groups nested 8 levels deep. All diagrams fall back when they
-exceed 200 terminal rows, a route cannot be placed, or the result does not fit
+256 detail lines, or 128 relationships. Class namespaces, state composites,
+and ER subgraphs are limited to 16 groups nested 8 levels deep. All diagrams
+fall back when they exceed 200 terminal rows, a route cannot be placed, or the
+result does not fit
 the viewport.

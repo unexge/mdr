@@ -171,7 +171,7 @@ const Layout = struct {
             .fork, .join => return .{ .width = @max(self_label_width + 2, 7), .height = 1 },
             .choice => return .{ .width = @max(@max(cells.maxLineWidth(node.label) + 4, self_label_width + 2), 5), .height = 3 },
             .class, .state, .entity => {},
-            .composite, .namespace => unreachable,
+            .composite, .namespace, .er_group => unreachable,
         }
         var box_width = @max(@max(cells.maxLineWidth(node.label) + 4, self_label_width + 2), 5);
         var detail_rows: usize = 0;
@@ -448,7 +448,7 @@ const Layout = struct {
                 return;
             },
             .class, .state, .entity, .choice => {},
-            .composite, .namespace => return,
+            .composite, .namespace, .er_group => return,
         }
         for (0..bounds.height()) |row| {
             for (0..bounds.width()) |column| cells.putRaw(win, bounds.y1 + row, bounds.x1 + column, start_row, skip, " ", .{});
@@ -457,7 +457,7 @@ const Layout = struct {
             .state => cells.round,
             .choice => cells.diamond,
             .class, .entity => cells.square,
-            .start, .end, .fork, .join, .composite, .namespace => unreachable,
+            .start, .end, .fork, .join, .composite, .namespace, .er_group => unreachable,
         };
         drawBoxFrame(win, bounds, corners, start_row, skip);
         const title_width = cells.maxLineWidth(node.label);
@@ -511,7 +511,7 @@ const Layout = struct {
 };
 
 fn isGroupKind(kind: Structural.NodeKind) bool {
-    return kind == .composite or kind == .namespace;
+    return kind == .composite or kind == .namespace or kind == .er_group;
 }
 
 fn isVertical(direction: Structural.Direction) bool {
@@ -787,6 +787,43 @@ test "er diagrams render fields and crow foot markers" {
     try testing.expect(findGlyph(win, "1") != null);
     try testing.expect(findGlyph(win, "*") != null);
     try testing.expect(findGlyph(win, "┄") != null or findGlyph(win, "┊") != null);
+}
+
+test "nested er subgraphs render group relationships and local directions" {
+    var diagram = Structural.parseText(
+        "erDiagram\n" ++
+            "direction LR\n" ++
+            "subgraph sales [Sales Domain]\n" ++
+            "direction TB\n" ++
+            "CUSTOMER ||--o{ ORDER : places\n" ++
+            "subgraph fulfillment\n" ++
+            "SHIPMENT ||--|{ ITEM : contains\n" ++
+            "end\n" ++
+            "end\n" ++
+            "subgraph support\n" ++
+            "AGENT\n" ++
+            "end\n" ++
+            "sales ||--|| support : collaborates\n" ++
+            "support ||--o{ ITEM : handles\n",
+    ).?;
+    const computed = Layout.compute(&diagram, 120).?;
+    const sales = computed.bounds[diagram.groups[0].node];
+    const fulfillment = computed.bounds[diagram.groups[1].node];
+    const support = computed.bounds[diagram.groups[2].node];
+    try testing.expect(sales.x1 < fulfillment.x1 and fulfillment.x2 < sales.x2);
+    try testing.expect(sales.y1 < fulfillment.y1 and fulfillment.y2 < sales.y2);
+    try testing.expect(sales.x1 < support.x1);
+    try testing.expect(computed.bounds[1].y1 < computed.bounds[2].y1);
+    try testing.expect(computed.bounds[4].y1 < computed.bounds[5].y1);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(computed.rows), .cols = 120, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &diagram, 0, 0, 120).?;
+    try testing.expectEqualStrings("┌", win.readCell(@intCast(sales.x1), @intCast(sales.y1)).?.char.grapheme);
+    try testing.expect(win.readCell(@intCast(sales.x1), @intCast(sales.y1)).?.style.dim);
+    try testing.expect(findGlyph(win, "1") != null);
+    try testing.expect(findGlyph(win, "*") != null);
 }
 
 test "structural diagrams fall back when empty or wider than the viewport" {
