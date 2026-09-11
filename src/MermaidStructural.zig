@@ -8,7 +8,7 @@ pub const max_group_depth = 8;
 
 pub const Family = enum { class, state, er };
 pub const Direction = enum { tb, bt, lr, rl };
-pub const NodeKind = enum { class, state, entity, start, end, choice, fork, join, composite };
+pub const NodeKind = enum { class, state, entity, start, end, choice, fork, join, composite, namespace };
 pub const DetailKind = enum { annotation, attribute, operation, field, note };
 pub const LineStyle = enum { solid, dotted };
 pub const Marker = enum {
@@ -187,9 +187,16 @@ const Parser = struct {
 
     fn feedClass(self: *Parser, line: []const u8) void {
         if (self.feedDirection(line) or ignoreStyle(line)) return;
-        if (stripKeyword(line, "namespace") != null or stripKeyword(line, "note") != null or
-            stripKeyword(line, "click") != null or stripKeyword(line, "link") != null or
-            stripKeyword(line, "callback") != null)
+        if (mem.eql(u8, line, "}")) {
+            self.closeGroup();
+            return;
+        }
+        if (stripKeyword(line, "namespace")) |declaration| {
+            self.namespaceDeclaration(declaration);
+            return;
+        }
+        if (stripKeyword(line, "note") != null or stripKeyword(line, "click") != null or
+            stripKeyword(line, "link") != null or stripKeyword(line, "callback") != null)
         {
             self.supported = false;
             return;
@@ -247,6 +254,24 @@ const Parser = struct {
         self.addDetail(node, member, if (mem.indexOfScalar(u8, member, '(') != null) .operation else .attribute);
     }
 
+    fn namespaceDeclaration(self: *Parser, raw: []const u8) void {
+        var declaration = mem.trim(u8, raw, " \t");
+        if (!mem.endsWith(u8, declaration, "{")) {
+            self.supported = false;
+            return;
+        }
+        declaration = mem.trim(u8, declaration[0 .. declaration.len - 1], " \t");
+        const name = parseName(declaration) orelse {
+            self.supported = false;
+            return;
+        };
+        if (mem.indexOfScalar(u8, name.id, '.') != null) {
+            self.supported = false;
+            return;
+        }
+        self.openGroup(name.id, name.label, .namespace, true);
+    }
+
     fn classDeclaration(self: *Parser, raw: []const u8) void {
         var declaration = mem.trim(u8, raw, " \t");
         const opens = mem.endsWith(u8, declaration, "{");
@@ -272,11 +297,7 @@ const Parser = struct {
     fn feedState(self: *Parser, line: []const u8) void {
         if (self.feedDirection(line) or ignoreStyle(line) or stripKeyword(line, "class") != null or metadataLine(line)) return;
         if (mem.eql(u8, line, "}")) {
-            if (self.group_stack_len == 0) {
-                self.supported = false;
-            } else {
-                self.group_stack_len -= 1;
-            }
+            self.closeGroup();
             return;
         }
         if (mem.eql(u8, line, "--")) {
@@ -353,7 +374,7 @@ const Parser = struct {
                 return;
             };
             if (opens) {
-                self.openComposite(name.id, declaration[1..close], true);
+                self.openGroup(name.id, declaration[1..close], .composite, true);
             } else {
                 _ = self.intern(name.id, declaration[1..close], .state, true);
             }
@@ -369,7 +390,7 @@ const Parser = struct {
                 self.supported = false;
                 return;
             }
-            self.openComposite(name.id, name.label, !mem.eql(u8, name.id, name.label));
+            self.openGroup(name.id, name.label, .composite, !mem.eql(u8, name.id, name.label));
             return;
         }
         var kind: NodeKind = .state;
@@ -450,22 +471,36 @@ const Parser = struct {
         return true;
     }
 
-    fn openComposite(self: *Parser, id: []const u8, label: []const u8, label_explicit: bool) void {
+    fn openGroup(
+        self: *Parser,
+        id: []const u8,
+        label: []const u8,
+        kind: NodeKind,
+        label_explicit: bool,
+    ) void {
         if (self.diagram.group_count >= max_groups or self.group_stack_len >= self.group_stack.len) {
             self.diagram.degraded = true;
             return;
         }
-        const node = self.intern(id, label, .composite, label_explicit) orelse return;
+        const node = self.intern(id, label, kind, label_explicit) orelse return;
         if (self.diagram.groupForNode(node) != null) {
             self.supported = false;
             return;
         }
-        self.diagram.nodes[node].kind = .composite;
+        self.diagram.nodes[node].kind = kind;
         const group = self.diagram.group_count;
         self.diagram.groups[group] = .{ .node = node };
         self.diagram.group_count += 1;
         self.group_stack[self.group_stack_len] = group;
         self.group_stack_len += 1;
+    }
+
+    fn closeGroup(self: *Parser) void {
+        if (self.group_stack_len == 0) {
+            self.supported = false;
+        } else {
+            self.group_stack_len -= 1;
+        }
     }
 
     fn currentGroup(self: *const Parser) ?usize {
@@ -474,12 +509,21 @@ const Parser = struct {
     }
 
     fn intern(self: *Parser, id: []const u8, label: []const u8, kind: NodeKind, explicit: bool) ?usize {
-        const group = if (self.diagram.family == .state) self.currentGroup() else null;
+        const group = if (self.diagram.family == .er) null else self.currentGroup();
         for (self.diagram.nodes[0..self.diagram.node_count], 0..) |*node, index| {
-            if (node.group != group or !idsEqual(node.id, id)) continue;
+            const matches = switch (self.diagram.family) {
+                .state => node.group == group and idsEqual(node.id, id),
+                .class => if (kind == .namespace)
+                    node.kind == .namespace and node.group == group and idsEqual(node.id, id)
+                else
+                    node.kind != .namespace and idsEqual(node.id, id),
+                .er => idsEqual(node.id, id),
+            };
+            if (!matches) continue;
             if (explicit) {
                 node.label = label;
-                if (node.kind != .composite) node.kind = kind;
+                if (node.kind != .composite and node.kind != .namespace) node.kind = kind;
+                if (self.diagram.family == .class and kind != .namespace) node.group = group;
             }
             return index;
         }
@@ -933,6 +977,33 @@ test "class relationship forms map endpoint markers" {
     }
 }
 
+test "class diagrams parse nested labeled namespaces" {
+    const diagram = parseText(
+        "classDiagram\n" ++
+            "Animal <|-- Duck\n" ++
+            "namespace Models[\"Domain Models\"] {\n" ++
+            "class Animal {\n" ++
+            "+String name\n" ++
+            "}\n" ++
+            "namespace Water {\n" ++
+            "class Duck {\n" ++
+            "+swim()\n" ++
+            "}\n" ++
+            "}\n" ++
+            "}\n",
+    ).?;
+    try testing.expectEqual(@as(usize, 2), diagram.group_count);
+    try testing.expectEqual(@as(usize, 4), diagram.node_count);
+    try testing.expectEqual(@as(usize, 2), diagram.detail_count);
+    try testing.expectEqualStrings("Domain Models", diagram.nodes[diagram.groups[0].node].label);
+    try testing.expectEqual(@as(?usize, 0), diagram.nodes[0].group);
+    try testing.expectEqual(@as(?usize, 1), diagram.nodes[1].group);
+    try testing.expect(diagram.nodes[diagram.groups[0].node].group == null);
+    try testing.expectEqual(@as(?usize, 0), diagram.nodes[diagram.groups[1].node].group);
+    try testing.expectEqual(@as(usize, 0), diagram.relations[0].src);
+    try testing.expectEqual(@as(usize, 1), diagram.relations[0].dst);
+}
+
 test "quoted state descriptions do not parse as transitions" {
     const diagram = parseText("stateDiagram-v2\nstate \"A --> B\" as Between\n").?;
     try testing.expectEqual(@as(usize, 1), diagram.node_count);
@@ -1032,6 +1103,7 @@ test "er cardinality forms map endpoint markers" {
 test "structural parser rejects unsupported blocks and unclosed bodies" {
     try testing.expect(parseText("pie\ntitle Pets\n") == null);
     try testing.expect(parseText("classDiagram\nnamespace Models {\n") == null);
+    try testing.expect(parseText("classDiagram\nnamespace Company.Engineering {\nclass A\n}\n") == null);
     try testing.expect(parseText("stateDiagram-v2\nstate Parent {\n") == null);
     try testing.expect(parseText("stateDiagram-v2\nstate Parent {\nA\n--\nB\n}\n") == null);
     try testing.expect(parseText("erDiagram\nCUSTOMER {\nstring id\n") == null);

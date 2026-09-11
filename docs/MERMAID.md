@@ -69,13 +69,15 @@ Supported:
 - Solid and dotted inheritance, realization, composition, aggregation,
   association, dependency, two-way inheritance, and lollipop relationships
 - Relationship labels and endpoint cardinalities
+- Labeled and nested namespaces with relationships across namespace boundaries
 - `TB`, `TD`, `BT`, `LR`, and `RL` directions
 - `style`, `classDef`, and `cssClass` declarations accepted using the active terminal theme
 - `%%` comments, frontmatter, and configuration directives
 
 Falls back:
 
-- Namespaces, notes, interactions, callbacks, and links
+- Dot-notation namespace expansion
+- Notes, interactions, callbacks, and links
 - Inline member bodies and semicolon-separated statements
 
 ## State diagrams
@@ -119,6 +121,7 @@ A supported flowchart falls back above 64 nodes, 128 edges, 16 subgraphs, or
 8 nested subgraphs. A supported sequence falls back above 32 participants,
 128 messages, 32 notes, 16 fragments, 8 nested fragments, 64 activations, or
 16 participant boxes. Class, state, and ER diagrams fall back above 64 nodes,
-256 detail lines, or 128 relationships; state diagrams also allow 16 composite
-states nested 8 levels deep. All diagrams fall back when they exceed
-200 terminal rows, a route cannot be placed, or the result does not fit the viewport.
+256 detail lines, or 128 relationships. Class namespaces and state composites
+are limited to 16 groups nested 8 levels deep. All diagrams fall back when they
+exceed 200 terminal rows, a route cannot be placed, or the result does not fit
+the viewport.

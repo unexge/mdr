@@ -98,9 +98,14 @@ title: Service exchange
 ```mermaid
 classDiagram
 direction LR
-class User {
-  +String name
-  +login()
+namespace Services["Application Services"] {
+  class User {
+    +String name
+    +login()
+  }
+  namespace Runtime {
+    class Session
+  }
 }
 User "1" --> "*" Session : opens
 ```

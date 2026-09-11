@@ -140,12 +140,12 @@ const Layout = struct {
 
     fn measureNode(self: *Layout, index: usize, parent_direction: Structural.Direction) ?Size {
         const node = self.diagram.nodes[index];
-        const size = if (node.kind == .composite) composite: {
+        const size = if (isGroupKind(node.kind)) group_size: {
             const group = self.diagram.groupForNode(index) orelse return null;
             const direction = self.diagram.groups[group].direction orelse parent_direction;
             self.group_directions[group] = direction;
             const content = self.measureItems(group, direction) orelse return null;
-            break :composite Size{
+            break :group_size Size{
                 .width = @max(@max(content.width + 3, cells.maxLineWidth(node.label) + 4), self.selfLabelWidth(index) + 2),
                 .height = content.height + 4,
             };
@@ -171,7 +171,7 @@ const Layout = struct {
             .fork, .join => return .{ .width = @max(self_label_width + 2, 7), .height = 1 },
             .choice => return .{ .width = @max(@max(cells.maxLineWidth(node.label) + 4, self_label_width + 2), 5), .height = 3 },
             .class, .state, .entity => {},
-            .composite => unreachable,
+            .composite, .namespace => unreachable,
         }
         var box_width = @max(@max(cells.maxLineWidth(node.label) + 4, self_label_width + 2), 5);
         var detail_rows: usize = 0;
@@ -220,7 +220,7 @@ const Layout = struct {
                 .x2 = x + self.widths[index] - 1,
                 .y2 = y + self.heights[index] - 1,
             };
-            if (node.kind == .composite) {
+            if (isGroupKind(node.kind)) {
                 const group = self.diagram.groupForNode(index) orelse unreachable;
                 self.placeItems(group, self.group_directions[group], .{
                     .x1 = x + 1,
@@ -411,10 +411,10 @@ const Layout = struct {
     fn draw(self: *const Layout, win: vaxis.Window, start_row: usize, skip: usize) void {
         for (self.diagram.groupList()) |group| {
             const node = self.diagram.nodes[group.node];
-            drawGroupFrame(win, self.bounds[group.node], node.label, start_row, skip);
+            drawGroupFrame(win, self.bounds[group.node], node.label, node.kind, start_row, skip);
         }
         for (self.diagram.nodeList(), 0..) |node, index| {
-            if (node.kind != .composite) self.drawNode(win, index, node, start_row, skip);
+            if (!isGroupKind(node.kind)) self.drawNode(win, index, node, start_row, skip);
         }
         for (self.diagram.relationList()) |*relation| {
             const path = self.route(relation) orelse continue;
@@ -448,7 +448,7 @@ const Layout = struct {
                 return;
             },
             .class, .state, .entity, .choice => {},
-            .composite => return,
+            .composite, .namespace => return,
         }
         for (0..bounds.height()) |row| {
             for (0..bounds.width()) |column| cells.putRaw(win, bounds.y1 + row, bounds.x1 + column, start_row, skip, " ", .{});
@@ -457,7 +457,7 @@ const Layout = struct {
             .state => cells.round,
             .choice => cells.diamond,
             .class, .entity => cells.square,
-            .start, .end, .fork, .join, .composite => unreachable,
+            .start, .end, .fork, .join, .composite, .namespace => unreachable,
         };
         drawBoxFrame(win, bounds, corners, start_row, skip);
         const title_width = cells.maxLineWidth(node.label);
@@ -510,6 +510,10 @@ const Layout = struct {
     }
 };
 
+fn isGroupKind(kind: Structural.NodeKind) bool {
+    return kind == .composite or kind == .namespace;
+}
+
 fn isVertical(direction: Structural.Direction) bool {
     return direction == .tb or direction == .bt;
 }
@@ -552,14 +556,16 @@ fn drawGroupFrame(
     win: vaxis.Window,
     bounds: Bounds,
     label: []const u8,
+    kind: Structural.NodeKind,
     start_row: usize,
     skip: usize,
 ) void {
     const style: vaxis.Style = .{ .dim = true };
-    cells.putRaw(win, bounds.y1, bounds.x1, start_row, skip, "╭", style);
-    cells.putRaw(win, bounds.y1, bounds.x2, start_row, skip, "╮", style);
-    cells.putRaw(win, bounds.y2, bounds.x1, start_row, skip, "╰", style);
-    cells.putRaw(win, bounds.y2, bounds.x2, start_row, skip, "╯", style);
+    const corners = if (kind == .composite) cells.round else cells.square;
+    cells.putRaw(win, bounds.y1, bounds.x1, start_row, skip, corners[0], style);
+    cells.putRaw(win, bounds.y1, bounds.x2, start_row, skip, corners[1], style);
+    cells.putRaw(win, bounds.y2, bounds.x1, start_row, skip, corners[2], style);
+    cells.putRaw(win, bounds.y2, bounds.x2, start_row, skip, corners[3], style);
     for (bounds.x1 + 1..bounds.x2) |column| {
         cells.putRaw(win, bounds.y1, column, start_row, skip, "─", style);
         cells.putRaw(win, bounds.y2, column, start_row, skip, "─", style);
@@ -653,6 +659,40 @@ test "class diagrams render member compartments and inheritance" {
     try testing.expect(findGlyph(win, "*") != null);
     try testing.expect(findGlyph(win, "├") != null);
     try testing.expect(findGlyph(win, "s") != null);
+}
+
+test "nested class namespaces render labeled frames" {
+    var diagram = Structural.parseText(
+        "classDiagram\n" ++
+            "direction LR\n" ++
+            "Animal <|-- Duck\n" ++
+            "namespace Models[\"Domain Models\"] {\n" ++
+            "class Animal {\n" ++
+            "+String name\n" ++
+            "}\n" ++
+            "namespace Water {\n" ++
+            "class Duck {\n" ++
+            "+swim()\n" ++
+            "}\n" ++
+            "}\n" ++
+            "}\n",
+    ).?;
+    const computed = Layout.compute(&diagram, 80).?;
+    const outer = computed.bounds[diagram.groups[0].node];
+    const inner = computed.bounds[diagram.groups[1].node];
+    try testing.expect(outer.x1 < inner.x1 and inner.x2 < outer.x2);
+    try testing.expect(outer.y1 < inner.y1 and inner.y2 < outer.y2);
+    try testing.expect(computed.bounds[0].x1 < inner.x1);
+    try testing.expect(inner.x1 < computed.bounds[1].x1 and computed.bounds[1].x2 < inner.x2);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(computed.rows), .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win = window(&screen);
+    _ = layout(win, &diagram, 0, 0, 80).?;
+    try testing.expectEqualStrings("┌", win.readCell(@intCast(outer.x1), @intCast(outer.y1)).?.char.grapheme);
+    try testing.expect(win.readCell(@intCast(outer.x1), @intCast(outer.y1)).?.style.dim);
+    try testing.expect(findGlyph(win, "△") != null);
+    try testing.expect(findGlyph(win, "├") != null);
 }
 
 test "state diagrams render terminal states choices and backward transitions" {

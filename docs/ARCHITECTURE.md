@@ -57,8 +57,8 @@ result. Anything unsupported, over capacity, unrouteable, or wider than the
 viewport degrades back to the code card instead of failing. Acyclic flowcharts
 without subgraphs use ranked layout; subgraphs and cyclic flowcharts use a
 bounded hierarchy layout with obstacle detours. Class, state, and ER diagrams
-share a compartment-aware structural renderer; composite states use bounded
-recursive measurement and framed placement. Sequence
+share a compartment-aware structural renderer; class namespaces and composite
+states use bounded recursive measurement and framed placement. Sequence
 participant groups, lifecycle positions, activation stacks, numbering state,
 and message metadata are fixed parser state from which header and lifeline rows
 are derived. Diagram text streams into measured lines without allocating, so
