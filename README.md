@@ -40,8 +40,8 @@ mdr <file.md>
 - Fenced code blocks as cards with syntax highlighting for Bash, C, C++, Go,
   JSON, JavaScript/JSX, Python, Rust, TypeScript/TSX, and Zig; local images via Kitty graphics
 - A Mermaid subset rendered as unicode diagrams: `graph`/`flowchart` nodes
-  and edges plus `sequenceDiagram` participants, messages, notes,
-  `loop`/`alt`/`opt`/`par` fragments, activations, and autonumber
+  and edges, including cycles and self-links, plus `sequenceDiagram`
+  participants, messages, fragments, activations, and autonumber
 - Unsupported Mermaid syntax and unrenderable layouts fall back to the code card;
   see [`docs/MERMAID.md`](docs/MERMAID.md) for the support matrix
 

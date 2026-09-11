@@ -54,9 +54,10 @@ Mermaid fences dispatch twice: `Mermaid.parseBlock` (flowcharts) then
 `Mermaid.parseSequenceBlock` (sequences). Both parsers are zero-copy
 with bounded tables. They reject the whole diagram when a statement is
 unsupported instead of rendering a partial result. Anything unsupported,
-over capacity, cyclic, or wider than the viewport degrades back to the code
-card instead of failing. Flowcharts without subgraphs use ranked layout;
-subgraphs use a bounded recursive hierarchy layout with obstacle detours.
+over capacity, unrouteable, or wider than the viewport degrades back to the
+code card instead of failing. Acyclic flowcharts without subgraphs use ranked
+layout; subgraphs and cyclic flowcharts use a bounded recursive hierarchy
+layout with obstacle detours.
 Sequence
 participant groups, lifecycle positions, activation stacks, numbering state,
 and message metadata are fixed parser state from which header and lifeline rows

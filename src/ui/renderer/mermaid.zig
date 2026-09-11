@@ -27,7 +27,7 @@ const Bounds = struct {
 };
 
 pub fn layout(win: ?vaxis.Window, flow: *const Mermaid.Flowchart, start_row: usize, skip: usize, width: usize) ?usize {
-    if (flow.needsHierarchicalLayout()) {
+    if (flow.needsHierarchicalLayout() or hasCycle(flow)) {
         var hierarchy = Hierarchy.compute(flow, width) orelse return null;
         if (win == null) return start_row + hierarchy.rows;
         const w = win.?;
@@ -41,6 +41,37 @@ pub fn layout(win: ?vaxis.Window, flow: *const Mermaid.Flowchart, start_row: usi
     return start_row + @min(grid.rows -| skip, w.height -| start_row);
 }
 
+fn hasCycle(flow: *const Mermaid.Flowchart) bool {
+    var incoming = [_]usize{0} ** Mermaid.max_nodes;
+    var removed = [_]bool{false} ** Mermaid.max_nodes;
+    for (flow.edgeList()) |edge| {
+        const source = nodeIndex(flow, edge.src) orelse continue;
+        const destination = nodeIndex(flow, edge.dst) orelse continue;
+        if (source == destination) return true;
+        incoming[destination] += 1;
+    }
+    var removed_count: usize = 0;
+    while (removed_count < flow.node_count) {
+        var next: ?usize = null;
+        for (incoming[0..flow.node_count], 0..) |count, index| {
+            if (!removed[index] and count == 0) {
+                next = index;
+                break;
+            }
+        }
+        const source = next orelse return true;
+        removed[source] = true;
+        removed_count += 1;
+        for (flow.edgeList()) |edge| {
+            const edge_source = nodeIndex(flow, edge.src) orelse continue;
+            if (edge_source != source) continue;
+            const destination = nodeIndex(flow, edge.dst) orelse continue;
+            incoming[destination] -= 1;
+        }
+    }
+    return false;
+}
+
 const max_hierarchy_items = Mermaid.max_nodes + Mermaid.max_subgraphs;
 
 const Size = struct { width: usize, height: usize };
@@ -52,6 +83,7 @@ const HierarchyItem = union(enum) {
 
 const HierarchyEndpoint = struct {
     bounds: Bounds,
+    order: usize,
     node: ?usize = null,
 };
 
@@ -117,6 +149,11 @@ const Hierarchy = struct {
         for (flow.nodeList(), 0..) |node, index| {
             hierarchy.node_widths[index] = cells.maxLineWidth(node.label) + 4;
             hierarchy.node_heights[index] = cells.lineCount(node.label) + 2;
+        }
+        for (flow.edgeList()) |edge| {
+            if (!mem.eql(u8, edge.src, edge.dst) or edge.label == null) continue;
+            const index = nodeIndex(flow, edge.src) orelse continue;
+            hierarchy.node_widths[index] = @max(hierarchy.node_widths[index], cells.maxLineWidth(edge.label.?) + 4);
         }
         const root_size = hierarchy.measureItems(null, flow.direction) orelse return null;
         hierarchy.rows = root_size.height + 2;
@@ -259,8 +296,15 @@ const Hierarchy = struct {
     }
 
     fn endpoint(self: *const Hierarchy, id: []const u8) ?HierarchyEndpoint {
-        if (nodeIndex(self.flow, id)) |index| return .{ .bounds = self.node_bounds[index], .node = index };
-        if (self.flow.subgraphIndex(id)) |index| return .{ .bounds = self.subgraph_bounds[index] };
+        if (nodeIndex(self.flow, id)) |index| return .{
+            .bounds = self.node_bounds[index],
+            .order = self.flow.nodes[index].order,
+            .node = index,
+        };
+        if (self.flow.subgraphIndex(id)) |index| return .{
+            .bounds = self.subgraph_bounds[index],
+            .order = self.flow.subgraphs[index].order,
+        };
         return null;
     }
 
@@ -268,7 +312,14 @@ const Hierarchy = struct {
         const source = self.endpoint(edge.src) orelse return null;
         const destination = self.endpoint(edge.dst) orelse return null;
         if (source.bounds.x1 == destination.bounds.x1 and source.bounds.y1 == destination.bounds.y1 and
-            source.bounds.x2 == destination.bounds.x2 and source.bounds.y2 == destination.bounds.y2) return null;
+            source.bounds.x2 == destination.bounds.x2 and source.bounds.y2 == destination.bounds.y2)
+        {
+            return self.routeSelf(edge, source);
+        }
+        if (destination.order <= source.order) {
+            const vertical = self.flow.direction == .tb or self.flow.direction == .bt;
+            return self.routeDetour(edge, source, destination, vertical);
+        }
         const source_center = CellPos{ .r = (source.bounds.y1 + source.bounds.y2) / 2, .c = (source.bounds.x1 + source.bounds.x2) / 2 };
         const destination_center = CellPos{ .r = (destination.bounds.y1 + destination.bounds.y2) / 2, .c = (destination.bounds.x1 + destination.bounds.x2) / 2 };
         const dx = if (source_center.c > destination_center.c) source_center.c - destination_center.c else destination_center.c - source_center.c;
@@ -332,6 +383,30 @@ const Hierarchy = struct {
         return false;
     }
 
+    fn routeSelf(self: *const Hierarchy, edge: *const Mermaid.Edge, target: HierarchyEndpoint) ?HierarchyPath {
+        const bounds = target.bounds;
+        const center = CellPos{ .r = (bounds.y1 + bounds.y2) / 2, .c = (bounds.x1 + bounds.x2) / 2 };
+        const source = CellPos{ .r = bounds.y2 + 1, .c = center.c };
+        const destination = CellPos{ .r = center.r, .c = bounds.x2 + 1 };
+        if (source.r >= self.rows or destination.c >= self.cols) return null;
+        var path: HierarchyPath = undefined;
+        path.count = 0;
+        path.src_at = source;
+        path.dst_at = destination;
+        path.src_arrow = "▲";
+        path.dst_arrow = "◄";
+        path.src_line = "│";
+        path.dst_line = "─";
+        path.label = if (edge.label) |label| .{
+            .r = source.r,
+            .c = bounds.x1 + 1,
+            .text = label,
+        } else null;
+        path.add(.{ .r1 = source.r, .c1 = source.c, .r2 = source.r, .c2 = destination.c, .glyph = "─" });
+        path.add(.{ .r1 = destination.r, .c1 = destination.c, .r2 = source.r, .c2 = destination.c, .glyph = "│" });
+        return path;
+    }
+
     fn routeDetour(
         self: *const Hierarchy,
         edge: *const Mermaid.Edge,
@@ -345,9 +420,8 @@ const Hierarchy = struct {
         path.count = 0;
         path.label = null;
         if (vertical) {
-            const down = destination_center.r > source_center.r;
-            const src_at = CellPos{ .r = if (down) source.bounds.y2 + 1 else source.bounds.y1 - 1, .c = source_center.c };
-            const dst_at = CellPos{ .r = if (down) destination.bounds.y1 - 1 else destination.bounds.y2 + 1, .c = destination_center.c };
+            const src_at = CellPos{ .r = source_center.r, .c = source.bounds.x2 + 1 };
+            const dst_at = CellPos{ .r = destination_center.r, .c = destination.bounds.x2 + 1 };
             const detour = self.cols - 1;
             path.src_at = src_at;
             path.dst_at = dst_at;
@@ -355,18 +429,17 @@ const Hierarchy = struct {
             path.dst_arrow = "◄";
             path.src_line = "─";
             path.dst_line = "─";
-            path.add(.{ .r1 = src_at.r, .c1 = @min(src_at.c, detour), .r2 = src_at.r, .c2 = @max(src_at.c, detour), .glyph = "─" });
+            path.add(.{ .r1 = src_at.r, .c1 = src_at.c, .r2 = src_at.r, .c2 = detour, .glyph = "─" });
             path.add(.{ .r1 = @min(src_at.r, dst_at.r), .c1 = detour, .r2 = @max(src_at.r, dst_at.r), .c2 = detour, .glyph = "│" });
-            path.add(.{ .r1 = dst_at.r, .c1 = @min(dst_at.c, detour), .r2 = dst_at.r, .c2 = @max(dst_at.c, detour), .glyph = "─" });
+            path.add(.{ .r1 = dst_at.r, .c1 = dst_at.c, .r2 = dst_at.r, .c2 = detour, .glyph = "─" });
             if (edge.label) |label| {
                 const width = cells.maxLineWidth(label);
-                if (src_at.c + 1 + width >= detour) return null;
+                if (src_at.c + 1 + width > detour) return null;
                 path.label = .{ .r = src_at.r, .c = src_at.c + 1, .text = label };
             }
         } else {
-            const right = destination_center.c > source_center.c;
-            const src_at = CellPos{ .r = source_center.r, .c = if (right) source.bounds.x2 + 1 else source.bounds.x1 - 1 };
-            const dst_at = CellPos{ .r = destination_center.r, .c = if (right) destination.bounds.x1 - 1 else destination.bounds.x2 + 1 };
+            const src_at = CellPos{ .r = source.bounds.y2 + 1, .c = source_center.c };
+            const dst_at = CellPos{ .r = destination.bounds.y2 + 1, .c = destination_center.c };
             const detour = self.rows - 1;
             path.src_at = src_at;
             path.dst_at = dst_at;
@@ -374,9 +447,9 @@ const Hierarchy = struct {
             path.dst_arrow = "▲";
             path.src_line = "│";
             path.dst_line = "│";
-            path.add(.{ .r1 = @min(src_at.r, detour), .c1 = src_at.c, .r2 = @max(src_at.r, detour), .c2 = src_at.c, .glyph = "│" });
+            path.add(.{ .r1 = src_at.r, .c1 = src_at.c, .r2 = detour, .c2 = src_at.c, .glyph = "│" });
             path.add(.{ .r1 = detour, .c1 = @min(src_at.c, dst_at.c), .r2 = detour, .c2 = @max(src_at.c, dst_at.c), .glyph = "─" });
-            path.add(.{ .r1 = @min(dst_at.r, detour), .c1 = dst_at.c, .r2 = @max(dst_at.r, detour), .c2 = dst_at.c, .glyph = "│" });
+            path.add(.{ .r1 = dst_at.r, .c1 = dst_at.c, .r2 = detour, .c2 = dst_at.c, .glyph = "│" });
             if (edge.label) |label| {
                 const width = cells.maxLineWidth(label);
                 const start = @min(src_at.c, dst_at.c);
@@ -1749,13 +1822,28 @@ test "overlapping labels stack on separate rows" {
     try expectGlyph(win, 10, 6, "▼");
 }
 
+test "cyclic and self edges render through outer routes" {
+    var vertical = Mermaid.parseText("graph TD\nA-->B\nB-->|retry|A\nA-->A\n").?;
+    const vertical_rows = layout(null, &vertical, 0, 0, 40).?;
+    var vertical_screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(vertical_rows), .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer vertical_screen.deinit(testing.allocator);
+    const vertical_win = window(&vertical_screen);
+    _ = layout(vertical_win, &vertical, 0, 0, 40).?;
+    try testing.expect(findGlyph(vertical_win, "▼") != null);
+    try testing.expect(findGlyph(vertical_win, "◄") != null);
+    try testing.expect(findGlyph(vertical_win, "r") != null);
+
+    var horizontal = Mermaid.parseText("graph LR\nA-->B\nB-->A\n").?;
+    const horizontal_rows = layout(null, &horizontal, 0, 0, 40).?;
+    var horizontal_screen = try vaxis.Screen.init(testing.allocator, .{ .rows = @intCast(horizontal_rows), .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer horizontal_screen.deinit(testing.allocator);
+    const horizontal_win = window(&horizontal_screen);
+    _ = layout(horizontal_win, &horizontal, 0, 0, 40).?;
+    try testing.expect(findGlyph(horizontal_win, "►") != null);
+    try testing.expect(findGlyph(horizontal_win, "▲") != null);
+}
+
 test "unrenderable diagrams fall back" {
-    var cyclic = Mermaid.parseText("graph TD\nA-->B\nB-->A\n").?;
-    try testing.expect(layout(null, &cyclic, 0, 0, 40) == null);
-
-    var self_edge = Mermaid.parseText("graph TD\nA-->A\n").?;
-    try testing.expect(layout(null, &self_edge, 0, 0, 40) == null);
-
     var empty = Mermaid.parseText("graph TD\n").?;
     try testing.expect(layout(null, &empty, 0, 0, 40) == null);
 

@@ -20,6 +20,7 @@ Supported:
 - Link labels, edge IDs, requested minimum lengths, chained links, and
   `A & B --> C & D` multi-node links
 - Labeled and nested subgraphs with local directions and edges to subgraph IDs
+- Cycles, backward edges, and self-links using outer or local routes
 - Multiline Markdown node labels, class assignments, style declarations, and
   semicolon-separated statements; terminal rendering uses the active theme
 - `%%` comments
@@ -63,4 +64,4 @@ Other Mermaid diagram families, including class, state, ER, Gantt, pie, Git,
 mindmap, and timeline diagrams, fall back to the code card.
 
 A supported diagram also falls back when it exceeds the bounded parser tables,
-contains a cycle the layout cannot place, or does not fit the viewport.
+a route cannot be placed, or the result does not fit the viewport.

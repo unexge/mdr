@@ -54,6 +54,8 @@ re`"]
 end
 subgraph result [Result]
 C{choice} <--> D(((done))):::terminal
+D -->|retry| C
+D --> D
 end
 process --> result
 classDef terminal fill:red
