@@ -68,6 +68,14 @@ function outlineOpen(): boolean {
   return terminal.current.lines.some((line) => line.includes("┌─Contents"));
 }
 
+function commentingOpen(): boolean {
+  return terminal.current.lines.some((line) => line.includes("COMMENT "));
+}
+
+function commentEditorOpen(): boolean {
+  return terminal.current.lines.some((line) => line.includes("Comment"));
+}
+
 export const remainsRunning = always(() => terminal.current.exitStatus === null);
 
 export const rendersDocument = always(() =>
@@ -78,6 +86,8 @@ export const homeShowsStart = always(() =>
   !lastInputIs("g", "\x1b[H") ||
   searchOpen() ||
   outlineOpen() ||
+  commentingOpen() ||
+  commentEditorOpen() ||
   markerVisible(startMarker),
 );
 
@@ -85,6 +95,8 @@ export const endShowsEnd = always(() =>
   !lastInputIs("G", "\x1b[F") ||
   searchOpen() ||
   outlineOpen() ||
+  commentingOpen() ||
+  commentEditorOpen() ||
   markerVisible(endMarker),
 );
 
@@ -106,6 +118,8 @@ export const loneTagsNeverRender = always(() =>
 export const searchBarAppearsAfterSlash = always(() =>
   !lastInputIs("/") ||
   outlineOpen() ||
+  commentingOpen() ||
+  commentEditorOpen() ||
   terminal.current.bottomLine.startsWith("/"),
 );
 
@@ -113,9 +127,25 @@ export const escapeClearsSearchBar = always(() =>
   !lastInputIs("\x1b") || !terminal.current.bottomLine.startsWith("/"),
 );
 
+export const commentStatusShowsCounter = always(() => {
+  if (!commentingOpen() || commentEditorOpen()) return true;
+  return terminal.current.lines.some((line) => /COMMENT \d+\/\d+/.test(line));
+});
+
+export const commentEditorHasSaveHint = always(() =>
+  !commentEditorOpen() ||
+  terminal.current.lines.some((line) => line.includes("save")),
+);
+
+export const commentEditorHasTitle = always(() =>
+  !commentEditorOpen() ||
+  terminal.current.lines.some((line) => line.includes("Comment")),
+);
+
 const navigation = typeFromSet(CharSet.fromLiterals(
   "j",
   "k",
+  "c",
   "t",
   "f",
   "b",
@@ -157,6 +187,7 @@ const ignoredUnicode = typeFromSet(CharSet.union(
 const searchInput = typeFromSet(CharSet.fromLiterals(
   "/",
   "a",
+  "c",
   "e",
   "i",
   "o",

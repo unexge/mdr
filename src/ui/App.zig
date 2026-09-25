@@ -113,7 +113,14 @@ toc_top: usize = 0,
 toc_return: usize = 0,
 toc_built: bool = false,
 toc_list_h: usize = 10,
-
+comments: Comments = .{},
+commenting: bool = false,
+comment_selected: usize = 0,
+editor: CommentEditor = .{},
+editor_open: bool = false,
+editor_top: usize = 0,
+comment_status_buf: [32]u8 = undefined,
+comment_status_len: usize = 0,
 pub fn init(gpa: mem.Allocator, doc: *Document) App {
     return .{ .gpa = gpa, .doc = doc };
 }
@@ -126,6 +133,7 @@ pub fn deinit(self: *App) void {
     for (self.entries.items) |*entry| entry.syntax.deinit(self.gpa);
     self.entries.deinit(self.gpa);
     self.toc_entries.deinit(self.gpa);
+    self.comments.deinit(self.gpa);
     self.syntax_cache.deinit();
     self.* = undefined;
 }
@@ -206,6 +214,10 @@ fn handleKey(self: *App, io: Io, vx: *vaxis.Vaxis, key: vaxis.Key, loop: *vaxis.
         self.quit = true;
         return;
     }
+    if (self.editor_open) {
+        try self.handleEditorKey(key);
+        return;
+    }
     if (self.search.open) {
         try self.handleSearchKey(io, key, loop, search_tasks);
         return;
@@ -214,8 +226,14 @@ fn handleKey(self: *App, io: Io, vx: *vaxis.Vaxis, key: vaxis.Key, loop: *vaxis.
         try self.handleTocKey(key);
         return;
     }
+    if (self.commenting) {
+        try self.handleCommentKey(key);
+        return;
+    }
     if (key.matches('q', .{})) {
         self.quit = true;
+    } else if (key.matches('c', .{})) {
+        try self.enterCommenting();
     } else if (key.matches('/', .{})) {
         self.search.activate();
     } else if (key.matches(vaxis.Key.escape, .{}) and self.search.len > 0) {
@@ -427,6 +445,212 @@ fn tocRestore(self: *App) void {
     self.toc_open = false;
 }
 
+fn enterCommenting(self: *App) !void {
+    try self.ensureVisible(self.scroll + self.viewport + 1);
+    if (self.entries.items.len == 0) return;
+    self.commenting = true;
+    self.editor_open = false;
+    self.comment_selected = self.topVisibleEntry();
+    self.scroll = self.rowTop(self.comment_selected);
+    self.clampScroll();
+}
+
+fn exitCommenting(self: *App) void {
+    self.commenting = false;
+    self.editor_open = false;
+}
+
+fn handleCommentKey(self: *App, key: vaxis.Key) !void {
+    if (key.matches(vaxis.Key.escape, .{})) {
+        self.exitCommenting();
+    } else if (key.matches('c', .{})) {
+        self.exitCommenting();
+    } else if (key.matches('q', .{})) {
+        self.quit = true;
+    } else if (key.matches('/', .{})) {
+        self.exitCommenting();
+        self.search.activate();
+    } else if (key.matches('t', .{})) {
+        self.exitCommenting();
+        try self.openToc();
+    } else if (key.matches(vaxis.Key.enter, .{})) {
+        self.openEditor();
+    } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+        try self.moveComment(-1);
+    } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+        try self.moveComment(1);
+    } else if (key.matches(vaxis.Key.home, .{}) or key.matches('g', .{})) {
+        try self.goComment(0);
+    } else if (key.matches(vaxis.Key.end, .{}) or key.matches('G', .{})) {
+        try self.ensureVisible(math.maxInt(usize));
+        if (self.entries.items.len > 0) try self.goComment(self.entries.items.len - 1);
+    }
+}
+
+fn moveComment(self: *App, step: isize) !void {
+    if (self.entries.items.len == 0 and self.fully_parsed) return;
+    const next: isize = @as(isize, @intCast(self.comment_selected)) + step;
+    try self.goComment(@intCast(@max(0, next)));
+}
+
+/// Moves the selection, parsing ahead lazily, and scrolls only when the
+/// selected entry is not fully visible.
+fn goComment(self: *App, index: usize) !void {
+    while (index >= self.entries.items.len and !self.fully_parsed) {
+        try self.ensureVisible(self.total_height + 1);
+    }
+    if (self.entries.items.len == 0) return;
+    self.comment_selected = @min(index, self.entries.items.len - 1);
+    while (self.comment_selected >= self.measured) {
+        try self.ensureVisible(self.total_height + 1);
+    }
+    const top = self.rowTop(self.comment_selected);
+    const height = self.entries.items[self.comment_selected].height;
+    if (top < self.scroll) {
+        self.scroll = top;
+    } else if (top + height > self.scroll + self.viewport) {
+        if (height >= self.viewport) {
+            self.scroll = top;
+        } else {
+            self.scroll = top + height -| self.viewport;
+        }
+    }
+    self.clampScroll();
+}
+
+fn topVisibleEntry(self: *const App) usize {
+    var skip = self.scroll;
+    for (self.entries.items, 0..) |entry, i| {
+        if (entry.height == 0) return i;
+        if (skip >= entry.height) {
+            skip -= entry.height;
+            continue;
+        }
+        return i;
+    }
+    return self.entries.items.len -| 1;
+}
+
+fn rowTop(self: *const App, index: usize) usize {
+    var row: usize = 0;
+    for (self.entries.items[0..@min(index, self.entries.items.len)]) |entry| row += entry.height;
+    return row;
+}
+
+fn commentRange(self: *const App, index: usize) struct { start: usize, end: usize } {
+    const end = self.entries.items[index].source_end;
+    const start = if (index == 0) 0 else self.entries.items[index - 1].source_end;
+    return .{ .start = start, .end = end };
+}
+
+fn hasCommentForEntry(self: *const App, index: usize) bool {
+    if (index >= self.entries.items.len) return false;
+    const range = self.commentRange(index);
+    return self.comments.has(range.start, range.end);
+}
+
+fn openEditor(self: *App) void {
+    if (self.comment_selected >= self.entries.items.len) return;
+    const range = self.commentRange(self.comment_selected);
+    self.editor.load(self.comments.get(range.start, range.end) orelse "");
+    self.editor_top = 0;
+    self.editor_open = true;
+}
+
+fn saveEditor(self: *App) !void {
+    if (self.comment_selected >= self.entries.items.len) {
+        self.editor_open = false;
+        return;
+    }
+    const range = self.commentRange(self.comment_selected);
+    try self.comments.set(self.gpa, range.start, range.end, self.editor.text());
+    self.editor_open = false;
+}
+
+fn handleEditorKey(self: *App, key: vaxis.Key) !void {
+    if (key.matches(vaxis.Key.escape, .{})) {
+        self.editor_open = false;
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{ .ctrl = true }) or key.matches('s', .{ .ctrl = true })) {
+        try self.saveEditor();
+        return;
+    }
+    // Shifted and Alt-modified Enter insert a newline; plain Enter saves.
+    // Exact matching matters here because the text fallback in `matches`
+    // ignores Shift and would conflate the two.
+    if (key.matchExact(vaxis.Key.enter, .{ .shift = true }) or
+        key.matchExact(vaxis.Key.enter, .{ .alt = true }))
+    {
+        _ = self.editor.insertNewline();
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{})) {
+        try self.saveEditor();
+        return;
+    }
+    if (key.matches(vaxis.Key.backspace, .{ .ctrl = true }) or
+        key.matches(vaxis.Key.backspace, .{ .alt = true }))
+    {
+        self.editor.clear();
+        return;
+    }
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        _ = self.editor.backspace();
+        return;
+    }
+    if (key.matches(vaxis.Key.delete, .{})) {
+        _ = self.editor.deleteAt();
+        return;
+    }
+    if (key.matches(vaxis.Key.left, .{})) {
+        self.editor.moveLeft();
+        return;
+    }
+    if (key.matches(vaxis.Key.right, .{})) {
+        self.editor.moveRight();
+        return;
+    }
+    if (key.matches(vaxis.Key.up, .{})) {
+        self.editor.moveUp();
+        return;
+    }
+    if (key.matches(vaxis.Key.down, .{})) {
+        self.editor.moveDown();
+        return;
+    }
+    if (key.matches(vaxis.Key.home, .{})) {
+        self.editor.cursor = self.editor.lineStart(self.editor.cursor);
+        return;
+    }
+    if (key.matches(vaxis.Key.end, .{})) {
+        self.editor.cursor = self.editor.lineEnd(self.editor.cursor);
+        return;
+    }
+    if (key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.meta) return;
+    if (key.text) |txt| {
+        _ = self.editor.insert(txt);
+        return;
+    }
+    if (key.codepoint >= 32 and key.codepoint < 127) {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(key.codepoint), &buf) catch return;
+        _ = self.editor.insert(buf[0..n]);
+    }
+}
+
+/// Writes all comments in source order as `Lfirst-Llast: body` lines.
+/// No output when there are no comments.
+pub fn printComments(self: *App, io: Io) !void {
+    if (self.comments.count() == 0) return;
+    var out_buffer: [4096]u8 = undefined;
+    var writer: Io.File.Writer = .init(.stdout(), io, &out_buffer);
+    for (self.comments.list.items) |c| {
+        try Comments.formatComment(&writer.interface, self.doc.text, c.start, c.end, c.text);
+    }
+    try writer.interface.flush();
+}
+
 fn ensureToc(self: *App) !void {
     if (self.toc_built) return;
     const list = try Toc.collect(self.gpa, self.doc.text);
@@ -518,9 +742,10 @@ fn draw(
     }
     const win = vx.window();
     const bar_rows: u16 = if (self.search.open) 1 else 0;
+    const gutter_w: usize = if (self.commenting) comment_gutter_cols else 0;
     const content = win.child(.{
-        .x_off = 0,
-        .width = @intCast(contentWidth(win.width)),
+        .x_off = @intCast(gutter_w),
+        .width = @intCast(contentWidth(win.width) -| gutter_w),
         .height = win.height -| bar_rows,
     });
     const cell_size_changed = self.syncCellSize(content);
@@ -538,7 +763,11 @@ fn draw(
     win.clear();
     self.virtual_placement_count = 0;
     self.next_stable_placement_count = 0;
-    try self.renderViewport(content);
+    const gutter: ?vaxis.Window = if (gutter_w == 0) null else win.child(.{
+        .width = @intCast(gutter_w),
+        .height = content.height,
+    });
+    try self.renderViewport(content, gutter);
     if (bar_rows > 0) {
         self.drawScrollbar(win.child(.{ .height = win.height -| 1 }));
         self.drawSearchBar(win);
@@ -547,6 +776,8 @@ fn draw(
     }
     self.drawSearchCount(win);
     if (self.toc_open) self.drawToc(win);
+    self.drawCommentStatus(win);
+    if (self.editor_open) self.drawCommentEditor(win);
     if (self.placement_mode == .unicode and self.virtual_placement_count > 0) {
         try Kitty.defineVirtualPlacements(tty, self.virtual_placements[0..self.virtual_placement_count]);
     }
@@ -695,6 +926,247 @@ fn drawSearchCount(self: *App, win: vaxis.Window) void {
     }
 }
 
+fn drawCommentStatus(self: *App, win: vaxis.Window) void {
+    if (!self.commenting or self.editor_open) return;
+    if (win.height == 0 or win.width < 14) return;
+    const total = self.entries.items.len;
+    const text = std.fmt.bufPrint(&self.comment_status_buf, "COMMENT {d}/{d}", .{ self.comment_selected + 1, total }) catch return;
+    self.comment_status_len = text.len;
+    const body = self.comment_status_buf[0..self.comment_status_len];
+    if (body.len + 2 > win.width) return;
+    var col: usize = win.width - 1 - body.len;
+    var iter = unicode.graphemeIterator(body);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(body);
+        if (col >= win.width) break;
+        win.writeCell(@intCast(col), 0, .{
+            .char = .{ .grapheme = bytes, .width = 1 },
+            .style = .{ .fg = Theme.gold, .bg = Theme.panel, .bold = true },
+        });
+        col += 1;
+    }
+}
+
+fn drawCommentEditor(self: *App, win: vaxis.Window) void {
+    // The popup stays usable at the smallest reachable windows so the
+    // editor is never open but invisible while it consumes keys.
+    if (win.width < 12 or win.height < 5) return;
+    const w = @min(win.width -| 4, 64);
+    const inner_w = w -| 4;
+    if (inner_w < 4) return;
+    const wrapped = self.editorWrappedRows(inner_w);
+    const h = @min(@max(wrapped.count, 1) + 4, win.height);
+    if (h < 5) return;
+    const list_h = h - 4;
+    const x = (win.width -| w) / 2;
+    const y = (win.height -| h) / 2;
+    const frame: vaxis.Window = win.child(.{
+        .x_off = @intCast(x),
+        .y_off = @intCast(y),
+        .width = @intCast(w),
+        .height = @intCast(h),
+    });
+    const panel: vaxis.Style = .{ .bg = Theme.panel };
+    var r: usize = 0;
+    while (r < h) : (r += 1) {
+        var c: usize = 0;
+        while (c < w) : (c += 1) {
+            frame.writeCell(@intCast(c), @intCast(r), .{
+                .char = .{ .grapheme = " ", .width = 1 },
+                .style = panel,
+            });
+        }
+    }
+    const border: vaxis.Style = .{ .fg = Theme.muted, .bg = Theme.panel };
+    var c: usize = 1;
+    while (c + 1 < w) : (c += 1) {
+        frame.writeCell(@intCast(c), 0, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = border });
+        frame.writeCell(@intCast(c), @intCast(h - 1), .{ .char = .{ .grapheme = "─", .width = 1 }, .style = border });
+    }
+    frame.writeCell(0, 0, .{ .char = .{ .grapheme = "┌", .width = 1 }, .style = border });
+    frame.writeCell(@intCast(w - 1), 0, .{ .char = .{ .grapheme = "┐", .width = 1 }, .style = border });
+    frame.writeCell(0, @intCast(h - 1), .{ .char = .{ .grapheme = "└", .width = 1 }, .style = border });
+    frame.writeCell(@intCast(w - 1), @intCast(h - 1), .{ .char = .{ .grapheme = "┘", .width = 1 }, .style = border });
+    var side: usize = 1;
+    while (side + 1 < h) : (side += 1) {
+        frame.writeCell(0, @intCast(side), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = border });
+        frame.writeCell(@intCast(w - 1), @intCast(side), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = border });
+    }
+    _ = putTocCells(frame, 2, 0, "Comment", .{ .fg = Theme.code, .bg = Theme.panel, .bold = true }, w -| 4);
+    if (self.editor_top > wrapped.count) self.editor_top = wrapped.count;
+    if (wrapped.cursor_row < self.editor_top) self.editor_top = wrapped.cursor_row;
+    if (wrapped.cursor_row >= self.editor_top + list_h) self.editor_top = wrapped.cursor_row - list_h + 1;
+    self.drawEditorRows(frame, inner_w, self.editor_top, list_h, wrapped.cursor_row, wrapped.cursor_col);
+    _ = putTocCells(
+        frame,
+        2,
+        h - 2,
+        if (w -| 4 >= full_hint.len) full_hint else short_hint,
+        .{ .fg = Theme.muted, .bg = Theme.panel },
+        w -| 4,
+    );
+}
+
+const full_hint: []const u8 = "Shift+Enter newline  Enter save  Esc cancel";
+const short_hint: []const u8 = "Enter save  Esc";
+
+const WrappedEditor = struct {
+    count: usize,
+    cursor_row: usize,
+    cursor_col: usize,
+};
+
+fn editorWrappedRows(self: *App, inner_w: usize) WrappedEditor {
+    var count: usize = 0;
+    var cursor_row: usize = 0;
+    var cursor_col: usize = 0;
+    var cursor_placed = false;
+    const body = self.editor.text();
+    const cursor = @min(self.editor.cursor, body.len);
+    if (body.len == 0) {
+        return .{ .count = 1, .cursor_row = 0, .cursor_col = 0 };
+    }
+    var pos: usize = 0;
+    while (pos <= body.len) {
+        const line_end = mem.indexOfScalarPos(u8, body, pos, '\n') orelse body.len;
+        var seg_start = pos;
+        var seg_w: usize = 0;
+        var rel = pos;
+        var it = unicode.graphemeIterator(body[pos..line_end]);
+        while (it.next()) |g| {
+            const gb = g.bytes(body[pos..line_end]);
+            const w = editorGraphemeWidth(gb);
+            if (seg_w + w > inner_w and seg_w > 0) {
+                if (!cursor_placed and cursor >= seg_start and cursor < rel) {
+                    cursor_row = count;
+                    cursor_col = editorSliceWidth(body[seg_start..cursor]);
+                    cursor_placed = true;
+                }
+                count += 1;
+                seg_start = rel;
+                seg_w = 0;
+            }
+            rel += gb.len;
+            seg_w += w;
+        }
+        if (!cursor_placed and cursor >= seg_start and cursor <= line_end) {
+            cursor_row = count;
+            cursor_col = editorSliceWidth(body[seg_start..cursor]);
+            cursor_placed = true;
+        }
+        count += 1;
+        if (line_end >= body.len) break;
+        pos = line_end + 1;
+    }
+    if (!cursor_placed) {
+        cursor_row = count -| 1;
+        cursor_col = 0;
+    }
+    return .{ .count = count, .cursor_row = cursor_row, .cursor_col = cursor_col };
+}
+
+/// Display width of one grapheme cluster inside the editor; never zero so
+/// combining marks still advance the cursor visibly, clamped so cell
+/// widths always fit.
+fn editorGraphemeWidth(grapheme: []const u8) usize {
+    return @min(@max(1, vaxis.gwidth.gwidth(grapheme, .unicode)), 4);
+}
+
+fn editorSliceWidth(slice: []const u8) usize {
+    var w: usize = 0;
+    var it = unicode.graphemeIterator(slice);
+    while (it.next()) |g| w += editorGraphemeWidth(g.bytes(slice));
+    return w;
+}
+
+/// Draws the visible slice of editor rows. Segmentation matches
+/// `editorWrappedRows` so cursor coordinates agree; graphemes are never
+/// split, so no replacement characters can appear.
+fn drawEditorRows(self: *App, frame: vaxis.Window, inner_w: usize, top: usize, list_h: usize, cursor_row: usize, cursor_col: usize) void {
+    const body = self.editor.text();
+    if (body.len == 0) {
+        if (list_h > 0) {
+            frame.writeCell(2, 1, .{
+                .char = .{ .grapheme = " ", .width = 1 },
+                .style = .{ .bg = Theme.panel, .reverse = true },
+            });
+        }
+        return;
+    }
+    var vi: usize = 0;
+    var drawn: usize = 0;
+    var pos: usize = 0;
+    while (pos <= body.len and drawn < list_h) {
+        const line_end = mem.indexOfScalarPos(u8, body, pos, '\n') orelse body.len;
+        var seg_start = pos;
+        var seg_w: usize = 0;
+        var rel = pos;
+        var it = unicode.graphemeIterator(body[pos..line_end]);
+        while (it.next()) |g| {
+            const gb = g.bytes(body[pos..line_end]);
+            const w = editorGraphemeWidth(gb);
+            if (seg_w + w > inner_w and seg_w > 0) {
+                self.drawEditorRow(frame, body, seg_start, rel, inner_w, vi, top, list_h, &drawn, cursor_row, cursor_col);
+                vi += 1;
+                if (drawn >= list_h) return;
+                seg_start = rel;
+                seg_w = 0;
+            }
+            rel += gb.len;
+            seg_w += w;
+        }
+        self.drawEditorRow(frame, body, seg_start, line_end, inner_w, vi, top, list_h, &drawn, cursor_row, cursor_col);
+        vi += 1;
+        if (drawn >= list_h) return;
+        if (line_end >= body.len) break;
+        pos = line_end + 1;
+    }
+}
+
+fn drawEditorRow(
+    self: *App,
+    frame: vaxis.Window,
+    body: []const u8,
+    s: usize,
+    e: usize,
+    inner_w: usize,
+    vi: usize,
+    top: usize,
+    list_h: usize,
+    drawn: *usize,
+    cursor_row: usize,
+    cursor_col: usize,
+) void {
+    _ = self;
+    if (vi < top or vi >= top + list_h) return;
+    const row: u16 = @intCast(vi - top + 1);
+    var col: usize = 2;
+    var dw: usize = 0;
+    var it = unicode.graphemeIterator(body[s..e]);
+    while (it.next()) |g| {
+        const gb = g.bytes(body[s..e]);
+        const w = editorGraphemeWidth(gb);
+        if (dw + w > inner_w) break;
+        const is_cursor = vi == cursor_row and dw == cursor_col;
+        frame.writeCell(@intCast(col), row, .{
+            .char = .{ .grapheme = gb, .width = @intCast(w) },
+            .style = if (is_cursor)
+                .{ .bg = Theme.panel, .reverse = true }
+            else
+                .{ .bg = Theme.panel },
+        });
+        col += w;
+        dw += w;
+    }
+    if (vi == cursor_row and cursor_col >= dw and col - 2 < inner_w) {
+        frame.writeCell(@intCast(col), row, .{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = .{ .bg = Theme.panel, .reverse = true },
+        });
+    }
+    drawn.* += 1;
+}
+
 /// Centered outline modal. Document cells behind stay as drawn; image
 /// placements are suppressed while open so graphics cannot leak through.
 fn drawToc(self: *App, win: vaxis.Window) void {
@@ -838,8 +1310,9 @@ fn contentWidth(full: usize) usize {
 }
 
 /// Draws the visible rows, skipping everything above `scroll` and stopping
-/// at the window bottom.
-fn renderViewport(self: *App, win: vaxis.Window) !void {
+/// at the window bottom. While commenting, `gutter` carries the selector
+/// rail and comment dots so the text itself stays untouched.
+fn renderViewport(self: *App, win: vaxis.Window, gutter: ?vaxis.Window) !void {
     var row: usize = 0;
     var skip = self.scroll;
     for (self.entries.items, 0..) |*entry, i| {
@@ -850,10 +1323,40 @@ fn renderViewport(self: *App, win: vaxis.Window) !void {
             continue;
         }
         Search.setEntryFocus(self.search.focus_entry == i, self.search.focus_local);
+        const start_row = row;
         row = try self.renderEntry(win, entry, row, skip);
+        if (gutter) |g| self.drawGutterEntry(g, win.height, i, start_row, row);
         skip = 0;
         row = @min(win.height, row + 1);
     }
+}
+
+/// Marks one entry's visible rows in the gutter: an accent rail for the
+/// selected entry, a muted rail otherwise, and a dot on the first visible
+/// row of commented entries. The trailing gap row keeps the rail only.
+fn drawGutterEntry(self: *const App, gutter: vaxis.Window, height: usize, index: usize, start_row: usize, end_row: usize) void {
+    const selected = self.commenting and index == self.comment_selected;
+    const dotted = self.hasCommentForEntry(index);
+    var r = start_row;
+    while (r < end_row and r < height and r < gutter.height) : (r += 1) {
+        self.drawGutterRow(gutter, r, selected, dotted and r == start_row);
+    }
+    if (end_row < height and end_row < gutter.height) {
+        self.drawGutterRow(gutter, end_row, selected, false);
+    }
+}
+
+fn drawGutterRow(self: *const App, gutter: vaxis.Window, row: usize, selected: bool, dotted: bool) void {
+    _ = self;
+    const crow: u16 = @intCast(row);
+    gutter.writeCell(0, crow, .{
+        .char = .{ .grapheme = if (selected) "▌" else "│", .width = 1 },
+        .style = .{ .fg = if (selected) Theme.code else Theme.muted },
+    });
+    gutter.writeCell(1, crow, .{
+        .char = .{ .grapheme = if (dotted) "●" else " ", .width = 1 },
+        .style = .{ .fg = Theme.code },
+    });
 }
 
 fn renderEntry(self: *App, win: vaxis.Window, entry: *Entry, row: usize, skip: usize) !usize {
@@ -864,9 +1367,9 @@ fn renderEntry(self: *App, win: vaxis.Window, entry: *Entry, row: usize, skip: u
             if (skip >= rows) return row;
             const visible_rows = rows - skip;
             const draw_rows = @min(visible_rows, win.height -| row);
-            // Behind the outline modal images keep their rows but emit no
+            // Behind modals images keep their rows but emit no
             // placements, so no graphics show through the panel.
-            if (self.toc_open) return row + draw_rows;
+            if (self.toc_open or self.editor_open) return row + draw_rows;
             if (self.placement_mode == .unicode) {
                 if ((entry.virtual_rows != rows or entry.virtual_cols != cols) and
                     self.virtual_placement_count < self.virtual_placements.len)
@@ -1279,10 +1782,15 @@ const Theme = @import("Theme.zig");
 const Media = @import("Media.zig");
 const Kitty = @import("Kitty.zig");
 const Toc = @import("Toc.zig");
+const Comments = @import("Comments.zig");
+const CommentEditor = @import("CommentEditor.zig");
 const unicode = vaxis.unicode;
 const Element = Document.Element;
 const ArrayList = std.ArrayList;
 const max_images = 8;
+
+/// Gutter columns shown while commenting: selector rail, comment dot, gap.
+const comment_gutter_cols: usize = 3;
 
 test "parses only what the viewport needs" {
     var doc = Document.init(lazy_text);
@@ -1524,19 +2032,19 @@ test "scrolling shifts content up" {
         .screen = &screen,
     };
 
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 0, 0, 'f');
     try expectCell(win, 0, 2, 's');
 
     win.clear();
     app.scroll = 1;
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 0, 0, ' ');
     try expectCell(win, 0, 1, 's');
 
     win.clear();
     app.scroll = 2;
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 0, 0, 's');
     try expectCell(win, 0, 2, 't');
 }
@@ -1750,7 +2258,7 @@ test "scrolling reaches the last line of a long document" {
     };
 
     app.scroll = app.maxScroll();
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 0, 1, 'd');
 }
 
@@ -1774,7 +2282,7 @@ test "code blocks render the info line above the content" {
         .screen = &screen,
     };
 
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 0, 0, 'z');
     try expectCell(win, 2, 0, 'g');
     try expectCell(win, 0, 1, 'h');
@@ -1802,7 +2310,7 @@ test "lists render markers and item content" {
         .screen = &screen,
     };
 
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 0, 0, '*');
     try expectCell(win, 2, 0, 'o');
     try expectCell(win, 0, 1, '*');
@@ -1830,7 +2338,7 @@ test "ordered and task markers" {
         .screen = &screen,
     };
 
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 0, 0, '3');
     try expectCell(win, 1, 0, '.');
     try expectCell(win, 3, 0, 'x');
@@ -1860,7 +2368,7 @@ test "block quotes render the bar and inset content" {
         .screen = &screen,
     };
 
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     const bar = win.readCell(0, 0) orelse return error.TestUnexpectedCell;
     try testing.expectEqualStrings("\u{2502}", bar.char.grapheme);
     try expectCell(win, 2, 0, 'h');
@@ -1888,7 +2396,7 @@ test "tables render inside block quotes" {
         .screen = &screen,
     };
 
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     const bar = win.readCell(0, 0) orelse return error.TestUnexpectedCell;
     try testing.expectEqualStrings("\u{2502}", bar.char.grapheme);
     try expectCell(win, 2, 0, '|');
@@ -1918,7 +2426,7 @@ test "reference links resolve and definitions are stripped" {
         .screen = &screen,
     };
 
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     const link = win.readCell(0, 0) orelse return error.TestUnexpectedCell;
     try testing.expectEqualStrings("c", link.char.grapheme);
     try testing.expect(link.style.ul_style == .single);
@@ -2019,7 +2527,7 @@ fn fuzzRender(_: void, smith: *testing.Smith) !void {
             .height = @intCast(viewport),
             .screen = &screen,
         };
-        try app.renderViewport(win);
+        try app.renderViewport(win, null);
 
         width = smith.valueRangeAtMost(u16, 8, 100);
     }
@@ -2264,7 +2772,7 @@ test "viewport marks the jumped-to match" {
         .height = 2,
         .screen = &screen,
     };
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 0, 1, 's');
     try testing.expect(win.readCell(0, 1).?.style.bg.eql(Theme.accent));
 }
@@ -2300,7 +2808,7 @@ test "n moves focus within one block" {
         .height = 2,
         .screen = &screen,
     };
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try testing.expect(win.readCell(0, 0).?.style.bg.eql(Theme.gold));
     try testing.expect(win.readCell(3, 0).?.style.bg.eql(Theme.accent));
 }
@@ -2450,7 +2958,7 @@ test "toc jump from a partial parse lands on the section" {
         .height = 4,
         .screen = &screen,
     };
-    try app.renderViewport(win);
+    try app.renderViewport(win, null);
     try expectCell(win, 2, 1, 'G');
 }
 
@@ -2560,4 +3068,322 @@ test "toc modal suppresses image placements" {
     app.toc_open = false;
     _ = try app.renderEntry(win, &entry, 0, 0);
     try testing.expectEqual(@as(usize, 1), app.virtual_placement_count);
+}
+
+test "comment moves keep a steady scroll while visible" {
+    var doc = Document.init("first\n\nsecond\n\nthird");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 6;
+    try app.ensureVisible(math.maxInt(usize));
+    app.scroll = 0;
+
+    try app.enterCommenting();
+    try testing.expect(app.commenting);
+    try testing.expectEqual(@as(usize, 0), app.comment_selected);
+
+    try app.moveComment(1);
+    try testing.expectEqual(@as(usize, 1), app.comment_selected);
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+
+    try app.moveComment(1);
+    try testing.expectEqual(@as(usize, 2), app.comment_selected);
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+
+    try app.moveComment(1);
+    try testing.expectEqual(@as(usize, 2), app.comment_selected);
+    try app.moveComment(-5);
+    try testing.expectEqual(@as(usize, 0), app.comment_selected);
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+}
+
+test "comment moves scroll only to reveal the selection" {
+    var doc = Document.init("first\n\nsecond\n\nthird");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    app.scroll = 0;
+
+    try app.enterCommenting();
+    try app.moveComment(1);
+    try testing.expectEqual(@as(usize, 1), app.comment_selected);
+    try testing.expectEqual(@as(usize, 2), app.scroll);
+
+    try app.moveComment(-1);
+    try testing.expectEqual(@as(usize, 0), app.comment_selected);
+    try testing.expectEqual(@as(usize, 0), app.scroll);
+}
+
+test "c toggles commenting and escape exits" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    const io: Io = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop: vaxis.Loop(Event) = undefined;
+    var tasks: Io.Group = .init;
+
+    try app.handleKey(io, &vx, .{ .codepoint = 'c' }, &loop, &tasks);
+    try testing.expect(app.commenting);
+    try app.handleKey(io, &vx, .{ .codepoint = vaxis.Key.down }, &loop, &tasks);
+    try testing.expectEqual(@as(usize, 1), app.comment_selected);
+    try app.handleKey(io, &vx, .{ .codepoint = 'c' }, &loop, &tasks);
+    try testing.expect(!app.commenting);
+
+    try app.handleKey(io, &vx, .{ .codepoint = 'c' }, &loop, &tasks);
+    try testing.expect(app.commenting);
+    try app.handleKey(io, &vx, .{ .codepoint = vaxis.Key.escape }, &loop, &tasks);
+    try testing.expect(!app.commenting);
+}
+
+test "slash and t leave commenting for search and outline" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    const io: Io = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop: vaxis.Loop(Event) = undefined;
+    var tasks: Io.Group = .init;
+
+    try app.handleKey(io, &vx, .{ .codepoint = 'c' }, &loop, &tasks);
+    try testing.expect(app.commenting);
+    try app.handleKey(io, &vx, .{ .codepoint = '/' }, &loop, &tasks);
+    try testing.expect(!app.commenting);
+    try testing.expect(app.search.open);
+
+    app.search.cancel();
+    try app.handleKey(io, &vx, .{ .codepoint = 'c' }, &loop, &tasks);
+    try testing.expect(app.commenting);
+    try app.handleKey(io, &vx, .{ .codepoint = 't' }, &loop, &tasks);
+    try testing.expect(!app.commenting);
+    try testing.expect(app.toc_open);
+}
+
+test "enter opens editor, ctrl+s saves and empty deletes" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    try app.enterCommenting();
+
+    app.openEditor();
+    try testing.expect(app.editor_open);
+    try testing.expect(app.editor.insert("line one"));
+    try testing.expect(app.editor.insertNewline());
+    try testing.expect(app.editor.insert("line two"));
+    try app.saveEditor();
+    try testing.expect(!app.editor_open);
+    const range = app.commentRange(0);
+    try testing.expectEqualStrings("line one\nline two", app.comments.get(range.start, range.end).?);
+
+    app.openEditor();
+    try testing.expectEqualStrings("line one\nline two", app.editor.text());
+    try app.handleEditorKey(.{ .codepoint = vaxis.Key.escape });
+    try testing.expect(!app.editor_open);
+    try testing.expectEqualStrings("line one\nline two", app.comments.get(range.start, range.end).?);
+
+    app.openEditor();
+    app.editor.clear();
+    try app.saveEditor();
+    try testing.expect(app.comments.get(range.start, range.end) == null);
+}
+
+test "enter saves, shift+enter and alt+enter insert newlines" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    try app.enterCommenting();
+    app.openEditor();
+    try app.handleEditorKey(.{ .codepoint = 'a', .text = "a" });
+    try app.handleEditorKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .shift = true } });
+    try app.handleEditorKey(.{ .codepoint = 'b', .text = "b" });
+    try testing.expectEqualStrings("a\nb", app.editor.text());
+    try testing.expect(app.editor_open);
+    try app.handleEditorKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .alt = true } });
+    try testing.expectEqualStrings("a\nb\n", app.editor.text());
+    try app.handleEditorKey(.{ .codepoint = vaxis.Key.enter });
+    try testing.expect(!app.editor_open);
+    const range = app.commentRange(0);
+    try testing.expectEqualStrings("a\nb\n", app.comments.get(range.start, range.end).?);
+}
+
+test "comment gutter marks selection and commented entries" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 4;
+    try app.ensureVisible(math.maxInt(usize));
+    const first = app.commentRange(0);
+    try app.comments.set(testing.allocator, first.start, first.end, "note");
+    try app.enterCommenting();
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 4, .cols = 23, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 3,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 4,
+        .screen = &screen,
+    };
+    const gutter: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 3,
+        .height = 4,
+        .screen = &screen,
+    };
+    try app.renderViewport(win, gutter);
+    // Selected entry: blue rail over content and gap rows, blue dot on top.
+    try testing.expectEqualStrings("▌", gutter.readCell(0, 0).?.char.grapheme);
+    try testing.expect(gutter.readCell(0, 0).?.style.fg.eql(Theme.code));
+    try testing.expectEqualStrings("▌", gutter.readCell(0, 1).?.char.grapheme);
+    try testing.expectEqualStrings("●", gutter.readCell(1, 0).?.char.grapheme);
+    try testing.expect(gutter.readCell(1, 0).?.style.fg.eql(Theme.code));
+    // Unselected entry: muted rail, no dot.
+    try testing.expectEqualStrings("│", gutter.readCell(0, 2).?.char.grapheme);
+    try testing.expectEqualStrings(" ", gutter.readCell(1, 2).?.char.grapheme);
+    // Text itself stays untouched: no reverse, content intact.
+    try testing.expect(!win.readCell(0, 0).?.style.reverse);
+    try expectCell(win, 0, 0, 'f');
+}
+
+test "commenting shows a status counter" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 4;
+    try app.ensureVisible(math.maxInt(usize));
+    try app.enterCommenting();
+    try testing.expect(app.commenting);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 6, .cols = 30, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 30,
+        .height = 6,
+        .screen = &screen,
+    };
+    app.drawCommentStatus(win);
+    try expectCell(win, 18, 0, 'C');
+    try expectCell(win, 19, 0, 'O');
+    try expectCell(win, 28, 0, '2');
+    try testing.expect(win.readCell(18, 0).?.style.fg.eql(Theme.gold));
+}
+
+test "comment editor keeps wide graphemes intact" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 40;
+    app.viewport = 4;
+    try app.ensureVisible(math.maxInt(usize));
+    try app.enterCommenting();
+    app.openEditor();
+    try testing.expect(app.editor.insert("a😀b"));
+
+    const wrapped = app.editorWrappedRows(30);
+    try testing.expectEqual(@as(usize, 1), wrapped.count);
+    try testing.expectEqual(@as(usize, 0), wrapped.cursor_row);
+    try testing.expectEqual(@as(usize, 4), wrapped.cursor_col);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 10, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 10,
+        .screen = &screen,
+    };
+    app.drawCommentEditor(win);
+    var intact = false;
+    var r: usize = 0;
+    while (r < win.height) : (r += 1) {
+        var c: usize = 0;
+        while (c < win.width) : (c += 1) {
+            const cell = win.readCell(@intCast(c), @intCast(r)) orelse continue;
+            if (mem.eql(u8, cell.char.grapheme, "😀")) intact = true;
+            // No cell may hold a split UTF-8 continuation byte.
+            if (cell.char.grapheme.len == 1 and cell.char.grapheme[0] & 0xC0 == 0x80) {
+                try testing.expect(false);
+            }
+        }
+    }
+    try testing.expect(intact);
+}
+
+test "comment editor popup renders at the smallest window" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 4;
+    try app.ensureVisible(math.maxInt(usize));
+    try app.enterCommenting();
+    app.openEditor();
+    try testing.expect(app.editor.insert("hi"));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 5, .cols = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 5,
+        .screen = &screen,
+    };
+    app.drawCommentEditor(win);
+    try expectCell(win, 4, 0, 'C');
+    try expectCell(win, 4, 1, 'h');
+    try expectCell(win, 5, 1, 'i');
+    try expectCell(win, 4, 3, 'E');
+    try expectCell(win, 10, 3, 's');
+}
+
+test "printComments emits source order with line numbers" {
+    var doc = Document.init("first\n\nsecond\n\nthird");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+    const second = app.commentRange(1);
+    const first = app.commentRange(0);
+    try app.comments.set(testing.allocator, second.start, second.end, "b\nb2");
+    try app.comments.set(testing.allocator, first.start, first.end, "a");
+
+    var buf: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    for (app.comments.list.items) |c| {
+        try Comments.formatComment(&writer, app.doc.text, c.start, c.end, c.text);
+    }
+    try testing.expectEqualStrings("L1: a\nL3: b\n  b2\n", writer.buffered());
 }

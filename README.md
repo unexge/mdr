@@ -51,6 +51,12 @@ For other platforms, download the matching archive from the [latest release](htt
 | `n` / `N`                                    | Next / previous match (`1/3` counter top right)      |
 | `t`                                          | Table of contents, `Up` / `Down` jump between headings |
 | `Enter` / `Esc` in table of contents         | Stay at heading / return to previous position          |
+| `c`                                          | Commenting mode, gutter selector, `Up` / `Down` moves (scroll follows as needed) |
+| `Enter` in commenting                        | Open comment editor for selected block                 |
+| `/` / `t` in commenting                      | Leave commenting, open search / outline                |
+| `Enter` in editor                            | Save comment (`Esc` cancels, empty saves delete)       |
+| `Shift+Enter` in editor                      | Newline (`Alt+Enter` too; `Ctrl-s` also saves)         |
+| `Esc` in commenting / editor                 | Close editor / exit commenting                         |
 | `Ctrl-Backspace` / `Alt-Backspace` in search | Clear the query                                      |
 | `Ctrl-l`                                     | Redraw                                               |
 | `q`, `Ctrl-c`                                | Quit                                                 |
