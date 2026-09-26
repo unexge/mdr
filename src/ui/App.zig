@@ -592,7 +592,7 @@ fn handleEditorKey(self: *App, key: vaxis.Key) !void {
     if (key.matches(vaxis.Key.backspace, .{ .ctrl = true }) or
         key.matches(vaxis.Key.backspace, .{ .alt = true }))
     {
-        self.editor.clear();
+        _ = self.editor.deleteWord();
         return;
     }
     if (key.matches(vaxis.Key.backspace, .{})) {
@@ -3267,6 +3267,23 @@ test "tab key indents with spaces" {
     try app.handleEditorKey(.{ .codepoint = 'b', .text = "b" });
     try testing.expectEqualStrings("a    b", app.editor.text());
     try testing.expect(app.editor_open);
+}
+
+test "ctrl+backspace deletes the previous word" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    try app.enterCommenting();
+    app.openEditor();
+    try testing.expect(app.editor.insert("foo bar"));
+    try app.handleEditorKey(.{ .codepoint = vaxis.Key.backspace, .mods = .{ .ctrl = true } });
+    try testing.expectEqualStrings("foo ", app.editor.text());
+    try testing.expect(app.editor_open);
+    try app.handleEditorKey(.{ .codepoint = vaxis.Key.backspace, .mods = .{ .alt = true } });
+    try testing.expectEqualStrings("", app.editor.text());
 }
 
 test "comment gutter marks selection and commented entries" {

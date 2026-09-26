@@ -91,6 +91,26 @@ pub fn deleteAt(self: *Editor) bool {
     return true;
 }
 
+/// Deletes back to the previous whitespace like a line editor: eats any
+/// whitespace before the cursor, then the word itself. ASCII-only
+/// comparisons are safe on UTF-8 since whitespace bytes never appear
+/// inside multibyte sequences.
+pub fn deleteWord(self: *Editor) bool {
+    if (self.cursor == 0) return false;
+    var start = self.cursor;
+    while (start > 0 and isSpace(self.buf[start - 1])) start -= 1;
+    while (start > 0 and !isSpace(self.buf[start - 1])) start -= 1;
+    const n = self.cursor - start;
+    mem.copyForwards(u8, self.buf[start..][0 .. self.len - self.cursor], self.buf[self.cursor..self.len]);
+    self.len -= n;
+    self.cursor = start;
+    return true;
+}
+
+fn isSpace(b: u8) bool {
+    return b == ' ' or b == '\t' or b == '\n';
+}
+
 pub fn moveLeft(self: *Editor) void {
     if (self.cursor == 0) return;
     self.cursor -= 1;
@@ -227,6 +247,37 @@ test "insert respects capacity" {
     try t.expect(!e.insert("ab"));
     try t.expect(e.insert("a"));
     try t.expectEqual(max_len, e.len);
+}
+
+test "deleteWord kills to the previous whitespace" {
+    const t = std.testing;
+    var e: Editor = .{};
+    try t.expect(e.insert("foo bar"));
+    try t.expect(e.deleteWord());
+    try t.expectEqualStrings("foo ", e.text());
+    try t.expectEqual(@as(usize, 4), e.cursor);
+    try t.expect(e.deleteWord());
+    try t.expectEqualStrings("", e.text());
+    try t.expect(!e.deleteWord());
+
+    var f: Editor = .{};
+    try t.expect(f.insert("foo bar   "));
+    try t.expect(f.deleteWord());
+    try t.expectEqualStrings("foo ", f.text());
+
+    var g: Editor = .{};
+    try t.expect(g.insert("foobar"));
+    g.cursor = 3;
+    try t.expect(g.deleteWord());
+    try t.expectEqualStrings("bar", g.text());
+    try t.expectEqual(@as(usize, 0), g.cursor);
+
+    var h: Editor = .{};
+    try t.expect(h.insert("a\nb"));
+    try t.expect(h.deleteWord());
+    try t.expectEqualStrings("a\n", h.text());
+    try t.expect(h.deleteWord());
+    try t.expectEqualStrings("", h.text());
 }
 
 test "backspace deletes across newline" {
