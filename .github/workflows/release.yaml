@@ -47,8 +47,11 @@ jobs:
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast --summary all
       - name: Smoke test
         run: |
-          output="$(./zig-out/bin/mdr 2>&1)"
-          test "$output" = "usage: mdr <file>"
+          expected="$(printf 'usage: mdr <file>\n       mdr - | <cmd> | mdr')"
+          output="$(./zig-out/bin/mdr --help 2>&1)"
+          test "$output" = "$expected"
+          output="$(./zig-out/bin/mdr -h 2>&1)"
+          test "$output" = "$expected"
       - name: Package
         run: |
           archive="mdr-${{ matrix.asset }}"

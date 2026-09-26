@@ -5,12 +5,19 @@ pub fn main(init: std.process.Init) !void {
     const arena: mem.Allocator = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
+    if (args.len >= 2 and isHelp(args[1])) {
+        var out_buffer: [256]u8 = undefined;
+        var out_writer: Io.File.Writer = .init(.stdout(), io, &out_buffer);
+        try out_writer.interface.writeAll(usage);
+        try out_writer.interface.flush();
+        return;
+    }
     const stdin = Io.File.stdin();
     const stdin_is_tty = stdin.isTty(io) catch false;
     const input = resolveInput(args, stdin_is_tty) orelse {
         var stderr_buffer: [256]u8 = undefined;
         var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
-        try stderr_writer.interface.writeAll("usage: mdr <file>\n       mdr - | <cmd> | mdr\n");
+        try stderr_writer.interface.writeAll(usage);
         try stderr_writer.interface.flush();
         return;
     };
@@ -53,6 +60,12 @@ const Input = union(enum) {
     stdin,
 };
 
+const usage = "usage: mdr <file>\n       mdr - | <cmd> | mdr\n";
+
+fn isHelp(arg: [:0]const u8) bool {
+    return mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help");
+}
+
 fn resolveInput(args: []const [:0]const u8, stdin_is_tty: bool) ?Input {
     if (args.len >= 2) {
         if (mem.eql(u8, args[1], "-")) return .stdin;
@@ -84,6 +97,14 @@ test resolveInput {
     const bare_args = [_][:0]const u8{prog};
     try t.expect(resolveInput(&bare_args, true) == null);
     try t.expect(resolveInput(&bare_args, false).? == .stdin);
+}
+
+test isHelp {
+    const t = std.testing;
+    try t.expect(isHelp("--help"));
+    try t.expect(isHelp("-h"));
+    try t.expect(!isHelp("notes.md"));
+    try t.expect(!isHelp("-"));
 }
 
 test {
