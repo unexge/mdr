@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
             defer app.deinit();
 
             try app.run(io, init.environ_map);
-            try app.printComments(io);
+            try app.printComments(io, path);
         },
         .stdin => {
             var reader_buffer: [4096]u8 = undefined;
@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
             defer app.deinit();
 
             try app.run(io, init.environ_map);
-            try app.printComments(io);
+            try app.printComments(io, null);
         },
     }
 }

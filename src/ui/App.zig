@@ -647,14 +647,40 @@ fn handleEditorKey(self: *App, key: vaxis.Key) !void {
 
 /// Writes all comments in source order as `Lfirst-Llast: body` lines.
 /// No output when there are no comments.
-pub fn printComments(self: *App, io: Io) !void {
+pub fn printComments(self: *App, io: Io, file_path: ?[]const u8) !void {
     if (self.comments.count() == 0) return;
     var out_buffer: [4096]u8 = undefined;
     var writer: Io.File.Writer = .init(.stdout(), io, &out_buffer);
-    for (self.comments.list.items) |c| {
-        try Comments.formatComment(&writer.interface, self.doc.text, c.start, c.end, c.text);
-    }
+    try self.writeComments(&writer.interface, file_path);
     try writer.interface.flush();
+}
+
+fn writeComments(self: *App, writer: *Io.Writer, file_path: ?[]const u8) !void {
+    if (self.comments.count() == 0) return;
+    var title_buf: [256]u8 = undefined;
+    const name = self.feedbackName(file_path, &title_buf);
+    try writer.print("# Feedback for {s}\n", .{name});
+    for (self.comments.list.items) |c| {
+        try Comments.formatComment(writer, self.doc.text, c.start, c.end, c.text);
+    }
+}
+
+/// Name for the feedback header: the file path when given, else the
+/// document's first level-1 heading, else a generic fallback.
+fn feedbackName(self: *App, file_path: ?[]const u8, buf: []u8) []const u8 {
+    if (file_path) |p| return p;
+    var probe = Document.init(self.doc.text);
+    while (probe.next()) |elem| {
+        const header = switch (elem) {
+            .header => |h| h,
+            else => continue,
+        };
+        if (header.level != 1) continue;
+        const flat = Toc.flatten(header.content, &self.doc.refs, buf);
+        if (flat.len == 0) break;
+        return flat;
+    }
+    return "the inline document";
 }
 
 fn ensureToc(self: *App) !void {
@@ -3424,6 +3450,80 @@ test "comment editor popup renders at the smallest window" {
     try expectCell(win, 5, 1, 'i');
     try expectCell(win, 4, 3, 'E');
     try expectCell(win, 10, 3, 's');
+}
+
+test "feedback header names the file" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+    const first = app.commentRange(0);
+    try app.comments.set(testing.allocator, first.start, first.end, "a");
+
+    var buf: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try app.writeComments(&writer, "notes.md");
+    try testing.expectEqualStrings("# Feedback for notes.md\nL1: a\n", writer.buffered());
+}
+
+test "feedback header falls back to the document title" {
+    var doc = Document.init("# My Title\n\nfirst\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+    const second = app.commentRange(1);
+    try app.comments.set(testing.allocator, second.start, second.end, "b");
+
+    var buf: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try app.writeComments(&writer, null);
+    try testing.expectEqualStrings("# Feedback for My Title\nL3: b\n", writer.buffered());
+}
+
+test "feedback header flattens formatted titles" {
+    var doc = Document.init("Title\n=====\n\nfirst");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+    const first = app.commentRange(0);
+    try app.comments.set(testing.allocator, first.start, first.end, "a");
+
+    var buf: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try app.writeComments(&writer, null);
+    try testing.expectEqualStrings("# Feedback for Title\nL1-L2: a\n", writer.buffered());
+}
+
+test "feedback header falls back for untitled documents" {
+    var doc = Document.init("## Not a title\n\nfirst");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+    const first = app.commentRange(1);
+    try app.comments.set(testing.allocator, first.start, first.end, "a");
+
+    var buf: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try app.writeComments(&writer, null);
+    try testing.expectEqualStrings("# Feedback for the inline document\nL3: a\n", writer.buffered());
+}
+
+test "feedback stays silent without comments" {
+    var doc = Document.init("# My Title\n\nfirst");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    try app.ensureVisible(math.maxInt(usize));
+
+    var buf: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try app.writeComments(&writer, "notes.md");
+    try app.writeComments(&writer, null);
+    try testing.expectEqualStrings("", writer.buffered());
 }
 
 test "printComments emits source order with line numbers" {
