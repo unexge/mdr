@@ -627,6 +627,12 @@ fn handleEditorKey(self: *App, key: vaxis.Key) !void {
         self.editor.cursor = self.editor.lineEnd(self.editor.cursor);
         return;
     }
+    // Tab without text (e.g. plain terminal keypress) indents; text input
+    // containing tabs funnels through insert below, which expands them.
+    if (key.text == null and key.matches(vaxis.Key.tab, .{})) {
+        _ = self.editor.insert("\t");
+        return;
+    }
     if (key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.meta) return;
     if (key.text) |txt| {
         _ = self.editor.insert(txt);
@@ -3221,6 +3227,22 @@ test "enter saves, shift+enter and alt+enter insert newlines" {
     try testing.expectEqualStrings("a\nb\n", app.comments.get(range.start, range.end).?);
 }
 
+test "tab key indents with spaces" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 20;
+    app.viewport = 2;
+    try app.ensureVisible(math.maxInt(usize));
+    try app.enterCommenting();
+    app.openEditor();
+    try app.handleEditorKey(.{ .codepoint = 'a', .text = "a" });
+    try app.handleEditorKey(.{ .codepoint = vaxis.Key.tab });
+    try app.handleEditorKey(.{ .codepoint = 'b', .text = "b" });
+    try testing.expectEqualStrings("a    b", app.editor.text());
+    try testing.expect(app.editor_open);
+}
+
 test "comment gutter marks selection and commented entries" {
     var doc = Document.init("first\n\nsecond");
     var app = App.init(testing.allocator, &doc);
@@ -3337,6 +3359,41 @@ test "comment editor keeps wide graphemes intact" {
         }
     }
     try testing.expect(intact);
+}
+
+test "comment editor never emits control characters" {
+    var doc = Document.init("first\n\nsecond");
+    var app = App.init(testing.allocator, &doc);
+    defer app.deinit();
+    app.width = 40;
+    app.viewport = 4;
+    try app.ensureVisible(math.maxInt(usize));
+    try app.enterCommenting();
+    app.openEditor();
+    try testing.expect(app.editor.insert("a\tb\nc😀d\te"));
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 14, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 14,
+        .screen = &screen,
+    };
+    app.drawCommentEditor(win);
+    var r: usize = 0;
+    while (r < win.height) : (r += 1) {
+        var c: usize = 0;
+        while (c < win.width) : (c += 1) {
+            const cell = win.readCell(@intCast(c), @intCast(r)) orelse continue;
+            for (cell.char.grapheme) |b| {
+                try testing.expect(b >= 32 and b != 127);
+            }
+        }
+    }
 }
 
 test "comment editor popup renders at the smallest window" {

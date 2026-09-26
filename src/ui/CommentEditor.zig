@@ -39,13 +39,32 @@ fn allowed(byte: u8) bool {
 pub fn insert(self: *Editor, bytes: []const u8) bool {
     if (bytes.len == 0) return false;
     for (bytes) |c| if (!allowed(c)) return false;
-    if (self.len + bytes.len > self.buf.len) return false;
-    mem.copyBackwards(u8, self.buf[self.cursor + bytes.len ..][0 .. self.len - self.cursor], self.buf[self.cursor..self.len]);
-    @memcpy(self.buf[self.cursor..][0..bytes.len], bytes);
-    self.len += bytes.len;
-    self.cursor += bytes.len;
+    var tabs: usize = 0;
+    for (bytes) |c| {
+        if (c == '\t') tabs += 1;
+    }
+    const expanded = bytes.len + tabs * (tab_spaces - 1);
+    if (self.len + expanded > self.buf.len) return false;
+    mem.copyBackwards(u8, self.buf[self.cursor + expanded ..][0 .. self.len - self.cursor], self.buf[self.cursor..self.len]);
+    var w = self.cursor;
+    for (bytes) |c| {
+        if (c == '\t') {
+            @memset(self.buf[w..][0..tab_spaces], ' ');
+            w += tab_spaces;
+        } else {
+            self.buf[w] = c;
+            w += 1;
+        }
+    }
+    self.len += expanded;
+    self.cursor += expanded;
     return true;
 }
+
+/// Tabs expand to spaces on insert so no control character ever reaches
+/// a cell; terminal grids cannot hold C0 controls and show them as
+/// replacement characters.
+pub const tab_spaces = 4;
 
 pub fn insertNewline(self: *Editor) bool {
     return self.insert("\n");
@@ -176,6 +195,28 @@ test "insert accepts newlines and rejects controls" {
     try t.expect(!e.insert("\x01"));
     try t.expect(!e.insert(&[_]u8{127}));
     try t.expectEqualStrings("hi\nthere", e.text());
+}
+
+test "insert expands tabs to spaces" {
+    const t = std.testing;
+    var e: Editor = .{};
+    try t.expect(e.insert("a\tb"));
+    try t.expectEqualStrings("a    b", e.text());
+    try t.expectEqual(@as(usize, 6), e.cursor);
+    e.moveLeft();
+    e.moveLeft();
+    try t.expect(e.insert("\t"));
+    try t.expectEqualStrings("a        b", e.text());
+}
+
+test "insert capacity accounts for expansion" {
+    const t = std.testing;
+    var e: Editor = .{};
+    e.len = max_len - tab_spaces;
+    e.cursor = e.len;
+    try t.expect(!e.insert("\t\t"));
+    try t.expect(e.insert("\t"));
+    try t.expectEqual(max_len, e.len);
 }
 
 test "insert respects capacity" {
